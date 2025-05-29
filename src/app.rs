@@ -31,13 +31,12 @@ impl VoyagerApp {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("WAV", &["wav"])
             .pick_file()
+            .and_then(|path| WavReader::from_file(&path).ok())
         {
-            if let Ok(reader) = WavReader::from_file(&path) {
-                self.waveform = reader.get_waveform_preview(1024);
-                self.wav_reader = Some(reader);
-                self.image_texture = None;
-                self.last_decoded = None;
-            }
+            self.waveform = path.get_waveform_preview(1024);
+            self.wav_reader = Some(path);
+            self.image_texture = None;
+            self.last_decoded = None;
         }
     }
 
