@@ -19,9 +19,9 @@ impl SstvDecoder {
         Self
     }
 
-    pub fn decode(&self, samples: &[f32], params: &DecoderParams) -> Vec<u8> {
+    pub fn decode(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Vec<u8> {
         let samples_per_line = (params.line_duration_ms as f32 / 1000.0
-            * 44100.0) // Assuming fixed rate for now
+            * sample_rate as f32)
             .round() as usize;
 
         let mut image: Vec<u8> = Vec::new();
