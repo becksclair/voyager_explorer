@@ -42,6 +42,9 @@ impl VoyagerApp {
     fn handle_decode(&mut self, ctx: &egui::Context) {
         if let Some(reader) = &self.wav_reader {
             let samples = reader.get_samples(self.selected_channel);
+
+            self.video_decoder.detect_sync(samples.to_vec());
+
             let pixels = self.video_decoder.decode(samples, &self.params, reader.sample_rate);
             let img = image_from_pixels(&pixels);
             self.image_texture = Some(ctx.load_texture("decoded", img, Default::default()));

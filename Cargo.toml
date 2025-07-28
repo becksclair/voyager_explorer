@@ -24,5 +24,6 @@ image = { version = "0.25", features = [
   "jpeg",
   "png",
 ] }
+realfft = { version = "3.5.0", features = ["avx", "neon", "sse", "wasm_simd"] }
 rfd = "0.15.4"
 rodio = "0.21.1"
