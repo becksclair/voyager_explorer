@@ -6,9 +6,10 @@ use eframe::egui;
 mod app;
 use app::VoyagerApp;
 
-mod audio;
-mod sstv;
-mod image_output;
+pub mod audio;
+pub mod image_output;
+pub mod sstv;
+pub mod utils;
 
 fn main() -> eframe::Result {
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).

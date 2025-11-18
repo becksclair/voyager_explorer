@@ -1,15 +1,23 @@
 [package]
 name = "voyager_explorer"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+
+[[bin]]
+name = "voyager_explorer"
+path = "src/main.rs"
+
+[lib]
+name = "voyager_explorer"
+path = "src/lib.rs"
 
 [dependencies]
-eframe = { version = "0.32.0", features = [
+eframe = { version = "0.33", features = [
   "default",
 ] }
-egui = "0.32.0"
+egui = "0.33"
 
-egui_extras = { version = "0.32.0", features = [
+egui_extras = { version = "0.33", features = [
   "default",
   "all_loaders",
 ] }
@@ -26,4 +34,11 @@ image = { version = "0.25", features = [
 ] }
 realfft = { version = "3.5.0", features = ["avx", "neon", "sse", "wasm_simd"] }
 rfd = "0.15.4"
-rodio = "0.21.1"
+rodio = { version = "0.21.1", optional = true, default-features = false, features = ["playback"] }
+
+[dev-dependencies]
+tempfile = "3.23"
+
+[features]
+default = ["audio_playback"]
+audio_playback = ["rodio"]
