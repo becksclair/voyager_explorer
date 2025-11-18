@@ -204,8 +204,8 @@ fn test_stereo_wav_generation() {
     // Interleave for stereo
     let mut stereo_samples = Vec::with_capacity(left_signal.len() * 2);
     for i in 0..left_signal.len() {
-        stereo_samples.push((left_signal[i] * i16::MAX as f32) as i16);
-        stereo_samples.push((right_signal[i] * i16::MAX as f32) as i16);
+        stereo_samples.push((left_signal[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+        stereo_samples.push((right_signal[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
     }
 
     // TODO: Add proper stereo WAV test when we have interleaving helper

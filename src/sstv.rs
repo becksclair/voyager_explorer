@@ -19,13 +19,8 @@ impl Default for DecoderParams {
     }
 }
 
+#[derive(Default)]
 pub struct SstvDecoder;
-
-impl Default for SstvDecoder {
-    fn default() -> Self {
-        Self
-    }
-}
 
 impl SstvDecoder {
     pub fn new() -> Self {

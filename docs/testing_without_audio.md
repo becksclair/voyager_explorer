@@ -225,7 +225,7 @@ let positions = decoder.find_sync_positions(&short, 44100);
 
 ## The Test Results
 
-```
+```console
 running 80 tests
 
 audio_state tests:     5 passed ✅

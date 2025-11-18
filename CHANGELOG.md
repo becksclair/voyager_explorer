@@ -254,15 +254,15 @@ Modified:
 - Visual-only playback simulation when audio_playback feature is disabled
 
 **Technical:**
-- `AudioBufferSource` implements `rodio::Source` trait for custom audio playback
+- AudioBufferSource implements rodio::Source trait for custom audio playback
 - Mono channel playback (after user channel selection)
 - Position tracking synchronized between visual and audio playback
 - All 29 tests pass with and without audio_playback feature
 
 **Fixed:**
-- Deprecated `screen_rect()` replaced with `input(|i| i.viewport().inner_rect...)`
-- `samples.len() > 0` changed to `!samples.is_empty()` for clippy compliance
-- Added `Default` implementation for `SstvDecoder`
+- Deprecated screen_rect() replaced with input(|i| i.viewport().inner_rect...)
+- samples.len() > 0 changed to !samples.is_empty() for clippy compliance
+- Added Default implementation for SstvDecoder
 
 ---
 

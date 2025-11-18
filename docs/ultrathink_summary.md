@@ -22,7 +22,7 @@ Additionally, you requested cross-platform audio considerations (which led to cl
 
 A comprehensive state machine diagram and architecture document:
 
-```
+```text
 States: Uninitialized → Ready → Playing → Paused → Error
          ↑                 ↓        ↓         ↓       ↓
          └─────────── stop() ──────────────────────────┘
@@ -187,6 +187,7 @@ Comprehensive tracking document showing:
 ## Key Differences From Original Approach
 
 ### Before (Milestone 1)
+
 ❌ Dove straight into code
 ❌ No test infrastructure
 ❌ Implicit state (Option checks)
@@ -196,6 +197,7 @@ Comprehensive tracking document showing:
 ❌ Couldn't test without real audio hardware
 
 ### After (This Refactoring)
+
 ✅ **Design first** - complete state machine diagram
 ✅ **Test fixtures** - synthetic audio, no binaries
 ✅ **Explicit state** - clear enum with predicates
@@ -236,9 +238,10 @@ Comprehensive tracking document showing:
 
 **Before this refactoring**: 29 tests total (25 unit + 4 integration)
 
-**After this refactoring**: 41 tests total
+**After this refactoring**: 54 tests total
 - 25 existing unit tests (unchanged)
 - 4 existing integration tests (unchanged)
+- 13 new audio_playback tests (synthetic playback validations)
 - 7 new test fixture tests (generators)
 - 5 new audio_state tests (state machine)
 
@@ -320,7 +323,7 @@ println!("{}", metrics.summary());
 
 ## Files Changed
 
-```
+```text
 M  Cargo.toml                        # Added test_fixtures feature
 A  docs/audio_playback_design.md     # Complete design doc (350 lines)
 A  docs/refactoring_progress.md      # Tracking document (350 lines)
