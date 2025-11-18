@@ -5,6 +5,7 @@ use std::f32::consts::PI;
 const TARGET_FREQ_HZ: f32 = 1200.0;
 const CHUNK_SIZE: usize = 2048;
 
+#[derive(Debug, Clone, Copy)]
 pub struct DecoderParams {
     pub line_duration_ms: f32,
     pub threshold: f32,
