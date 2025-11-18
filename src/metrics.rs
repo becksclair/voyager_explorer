@@ -30,6 +30,9 @@ pub struct AppMetrics {
     /// Total pixels decoded
     total_pixels_decoded: AtomicU64,
 
+    /// Worker thread restarts (due to panic or timeout)
+    worker_restarts: AtomicU64,
+
     /// Audio playback metrics
     #[cfg(feature = "audio_playback")]
     audio_metrics: AudioMetrics,
@@ -91,6 +94,9 @@ pub struct MetricsSummary {
     /// Total pixels decoded
     pub total_pixels: u64,
 
+    /// Worker thread restarts
+    pub worker_restarts: u64,
+
     /// Uptime in seconds
     pub uptime_secs: f64,
 }
@@ -119,6 +125,7 @@ impl AppMetrics {
             total_decode_success: AtomicU64::new(0),
             total_decode_errors: AtomicU64::new(0),
             total_pixels_decoded: AtomicU64::new(0),
+            worker_restarts: AtomicU64::new(0),
             #[cfg(feature = "audio_playback")]
             audio_metrics: AudioMetrics::default(),
             last_update: Instant::now(),
@@ -151,6 +158,11 @@ impl AppMetrics {
         if let Err(e) = self.frame_time_ms.record(ms) {
             tracing::warn!("Failed to record frame time: {}", e);
         }
+    }
+
+    /// Record a worker thread restart
+    pub fn record_worker_restart(&self) {
+        self.worker_restarts.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Update worker queue depth
@@ -191,6 +203,7 @@ impl AppMetrics {
             total_requests,
             success_rate,
             total_pixels: self.total_pixels_decoded.load(Ordering::Relaxed),
+            worker_restarts: self.worker_restarts.load(Ordering::Relaxed),
             uptime_secs: self.last_update.elapsed().as_secs_f64(),
         }
     }
@@ -203,6 +216,7 @@ impl AppMetrics {
         self.total_decode_success.store(0, Ordering::Relaxed);
         self.total_decode_errors.store(0, Ordering::Relaxed);
         self.total_pixels_decoded.store(0, Ordering::Relaxed);
+        self.worker_restarts.store(0, Ordering::Relaxed);
         self.last_update = Instant::now();
 
         #[cfg(feature = "audio_playback")]

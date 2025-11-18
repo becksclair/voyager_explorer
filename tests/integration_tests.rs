@@ -112,7 +112,8 @@ fn test_full_workflow_wav_to_image() {
     );
 
     // Test decoding
-    let decoded_pixels = decoder.decode(samples, &params, wav_reader.sample_rate)
+    let decoded_pixels = decoder
+        .decode(samples, &params, wav_reader.sample_rate)
         .expect("Decode should succeed");
     assert!(!decoded_pixels.is_empty(), "Should decode some pixels");
 
@@ -240,9 +241,11 @@ fn test_parameter_variations() {
         threshold: 0.3,
     };
 
-    let pixels_fast = decoder.decode(samples, &params_fast, wav_reader.sample_rate)
+    let pixels_fast = decoder
+        .decode(samples, &params_fast, wav_reader.sample_rate)
         .expect("Fast decode should succeed");
-    let pixels_slow = decoder.decode(samples, &params_slow, wav_reader.sample_rate)
+    let pixels_slow = decoder
+        .decode(samples, &params_slow, wav_reader.sample_rate)
         .expect("Slow decode should succeed");
 
     // Fast decoding should produce more lines (more pixels)
@@ -261,9 +264,11 @@ fn test_parameter_variations() {
         threshold: 0.9,
     };
 
-    let pixels_low = decoder.decode(samples, &params_low_thresh, wav_reader.sample_rate)
+    let pixels_low = decoder
+        .decode(samples, &params_low_thresh, wav_reader.sample_rate)
         .expect("Low threshold decode should succeed");
-    let pixels_high = decoder.decode(samples, &params_high_thresh, wav_reader.sample_rate)
+    let pixels_high = decoder
+        .decode(samples, &params_high_thresh, wav_reader.sample_rate)
         .expect("High threshold decode should succeed");
 
     assert_eq!(pixels_low.len(), pixels_high.len()); // Same number of pixels

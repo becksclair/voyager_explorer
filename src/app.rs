@@ -195,64 +195,90 @@ pub struct VoyagerApp {
     frame_start: Option<Instant>,
 }
 
+/// Spawn a background worker thread for non-blocking SSTV decoding.
+///
+/// Returns (decode_tx, decode_rx, worker_handle) tuple:
+/// - decode_tx: Channel to send DecodeRequest to worker
+/// - decode_rx: Channel to receive DecodeResult from worker
+/// - worker_handle: JoinHandle for health monitoring and cleanup
+///
+/// The worker thread runs until:
+/// - The main thread drops decode_tx (app shutdown)
+/// - The worker panics (requires restart)
+/// - The main thread drops decode_rx (app shutdown)
+fn spawn_decode_worker() -> (
+    Sender<DecodeRequest>,
+    Receiver<DecodeResult>,
+    JoinHandle<()>,
+) {
+    // Create bidirectional channels for request/response
+    let (decode_tx, result_rx) = channel();
+    let (result_tx, decode_rx) = channel();
+
+    // Spawn worker thread
+    let worker_handle = thread::spawn(move || {
+        // Worker has its own SstvDecoder instance to avoid sharing across threads
+        let decoder = SstvDecoder::new();
+
+        tracing::info!("Decode worker thread started");
+
+        // Process decode requests until channel is closed
+        while let Ok(request) = result_rx.recv() {
+            let DecodeRequest {
+                id,
+                samples,
+                start_offset,
+                params,
+                sample_rate,
+            } = request;
+
+            let decode_start = Instant::now();
+
+            // Extract decode window from shared buffer
+            let window_duration_secs = 2.0; // 2-second decode window
+            let window_samples = (window_duration_secs * sample_rate as f64) as usize;
+            let end_offset = (start_offset + window_samples).min(samples.len());
+            let decode_slice = &samples[start_offset..end_offset];
+
+            // Perform actual decoding (CPU-intensive FFT + pixel processing)
+            let (pixels, error) = match decoder.decode(decode_slice, &params, sample_rate) {
+                Ok(pixels) => {
+                    tracing::debug!(pixels = pixels.len(), "Decode completed successfully");
+                    (pixels, None)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Decode failed");
+                    (Vec::new(), Some(e.to_string()))
+                }
+            };
+
+            let decode_duration = decode_start.elapsed();
+
+            // Send result back to main thread
+            let result = DecodeResult {
+                id,
+                pixels,
+                decode_duration,
+                error,
+            };
+
+            // If send fails, main thread has dropped the receiver (app is closing)
+            if result_tx.send(result).is_err() {
+                tracing::info!("Main thread closed result channel, worker shutting down");
+                break;
+            }
+        }
+
+        tracing::info!("Decode worker thread exiting");
+    });
+
+    (decode_tx, decode_rx, worker_handle)
+}
+
 impl Default for VoyagerApp {
     fn default() -> Self {
-        // Create channels for background decoding worker
-        let (decode_tx, result_rx) = channel();
-        let (result_tx, decode_rx) = channel();
-
-        // Spawn background worker thread for non-blocking decoding
-        // This thread runs for the lifetime of the application
-        thread::spawn(move || {
-            // Worker has its own SstvDecoder instance to avoid sharing across threads
-            let decoder = SstvDecoder::new();
-
-            // Process decode requests until channel is closed
-            while let Ok(request) = result_rx.recv() {
-                let DecodeRequest {
-                    id,
-                    samples,
-                    start_offset,
-                    params,
-                    sample_rate,
-                } = request;
-
-                let decode_start = Instant::now();
-
-                // Extract decode window from shared buffer
-                let window_duration_secs = 2.0; // 2-second decode window
-                let window_samples = (window_duration_secs * sample_rate as f64) as usize;
-                let end_offset = (start_offset + window_samples).min(samples.len());
-                let decode_slice = &samples[start_offset..end_offset];
-
-                // Perform actual decoding (CPU-intensive FFT + pixel processing)
-                let (pixels, error) = match decoder.decode(decode_slice, &params, sample_rate) {
-                    Ok(pixels) => {
-                        tracing::debug!(pixels = pixels.len(), "Decode completed successfully");
-                        (pixels, None)
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Decode failed");
-                        (Vec::new(), Some(e.to_string()))
-                    }
-                };
-
-                let decode_duration = decode_start.elapsed();
-
-                // Send result back to main thread
-                let result = DecodeResult {
-                    id,
-                    pixels,
-                    decode_duration,
-                    error,
-                };
-
-                // If send fails, main thread has dropped the receiver (app is closing)
-                if result_tx.send(result).is_err() {
-                    break;
-                }
-            }
-        });
+        // Spawn background decoding worker
+        let (decode_tx, decode_rx, worker_handle) = spawn_decode_worker();
 
         // Load configuration from file or use defaults
         let config = AppConfig::load_or_default(AppConfig::default_path());
@@ -288,7 +314,7 @@ impl Default for VoyagerApp {
             decode_tx: Some(decode_tx),
             decode_rx: Some(decode_rx),
             next_decode_id: 0,
-            worker_handle: None, // Set later if needed
+            worker_handle: Some(worker_handle),
             worker_last_response: Instant::now(),
             metrics: AppMetrics::new(),
             error_message: None,
@@ -356,6 +382,67 @@ impl VoyagerApp {
                 }
             }
         }
+    }
+
+    /// Check if the worker thread is healthy and responsive.
+    ///
+    /// Returns true if the worker is healthy, false if it needs restart.
+    ///
+    /// Health checks:
+    /// 1. Thread has not panicked (checked via JoinHandle::is_finished())
+    /// 2. No response timeout (worker_last_response within max_unresponsive_ms)
+    fn check_worker_health(&mut self) -> bool {
+        let Some(handle) = &self.worker_handle else {
+            tracing::warn!("Worker handle is None, needs restart");
+            return false;
+        };
+
+        // Check if thread has panicked or exited
+        if handle.is_finished() {
+            tracing::error!("Worker thread has exited/panicked, needs restart");
+            return false;
+        }
+
+        // Check for response timeout
+        let elapsed = self.worker_last_response.elapsed();
+        let timeout_threshold = Duration::from_millis(self.config.worker.max_unresponsive_ms);
+
+        if elapsed > timeout_threshold {
+            tracing::warn!(
+                elapsed_ms = elapsed.as_millis(),
+                threshold_ms = timeout_threshold.as_millis(),
+                "Worker thread unresponsive, needs restart"
+            );
+            return false;
+        }
+
+        true
+    }
+
+    /// Restart the worker thread after a crash or timeout.
+    ///
+    /// This recreates the channels and spawns a new worker thread.
+    /// Any pending decode requests in the old channels are lost.
+    fn restart_worker(&mut self) {
+        tracing::warn!("Restarting worker thread");
+
+        // Drop old channels and handle to clean up resources
+        self.decode_tx = None;
+        self.decode_rx = None;
+        self.worker_handle = None;
+
+        // Spawn new worker with fresh channels
+        let (decode_tx, decode_rx, worker_handle) = spawn_decode_worker();
+
+        self.decode_tx = Some(decode_tx);
+        self.decode_rx = Some(decode_rx);
+        self.worker_handle = Some(worker_handle);
+        self.worker_last_response = Instant::now();
+
+        // Record restart in metrics
+        self.metrics.record_worker_restart();
+
+        tracing::info!("Worker thread restarted successfully");
     }
 
     #[cfg(feature = "audio_playback")]
@@ -721,6 +808,13 @@ impl eframe::App for VoyagerApp {
             self.metrics.record_frame_time(start.elapsed());
         }
         self.frame_start = Some(Instant::now());
+
+        // Check worker health and restart if needed
+        if self.config.worker.auto_restart_on_panic && !self.check_worker_health() {
+            self.error_message =
+                Some("Worker thread crashed or timed out, restarting...".to_string());
+            self.restart_worker();
+        }
 
         // Poll for decode results from background worker (non-blocking)
         if let Some(decode_rx) = &self.decode_rx {
