@@ -70,7 +70,7 @@ mod tests {
         // Create a 2-line image (1024 pixels)
         let mut pixels = Vec::new();
         for line in 0..2 {
-            for col in 0..512 {
+            for _col in 0..512 {
                 let value = if line == 0 { 100 } else { 200 };
                 pixels.push(value);
             }

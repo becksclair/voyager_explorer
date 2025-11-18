@@ -130,10 +130,7 @@ pub fn generate_sync_pattern(sample_rate: u32) -> Vec<f32> {
     ));
 
     // Silence 1
-    signal.extend(vec![
-        0.0;
-        (silence_duration * sample_rate as f32) as usize
-    ]);
+    signal.extend(vec![0.0; (silence_duration * sample_rate as f32) as usize]);
 
     // Sync 2
     signal.extend(generate_sine_wave(
@@ -144,10 +141,7 @@ pub fn generate_sync_pattern(sample_rate: u32) -> Vec<f32> {
     ));
 
     // Silence 2
-    signal.extend(vec![
-        0.0;
-        (silence_duration * sample_rate as f32) as usize
-    ]);
+    signal.extend(vec![0.0; (silence_duration * sample_rate as f32) as usize]);
 
     signal
 }

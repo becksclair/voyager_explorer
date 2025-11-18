@@ -526,7 +526,12 @@ impl eframe::App for VoyagerApp {
 
         // Left panel for decoded image
         egui::SidePanel::left("image_panel")
-            .default_width(ctx.input(|i| i.viewport().inner_rect.map(|r| r.width() * 0.6).unwrap_or(800.0)))
+            .default_width(ctx.input(|i| {
+                i.viewport()
+                    .inner_rect
+                    .map(|r| r.width() * 0.6)
+                    .unwrap_or(800.0)
+            }))
             .show(ctx, |ui| {
                 ui.heading("Decoded Image");
                 ui.separator();

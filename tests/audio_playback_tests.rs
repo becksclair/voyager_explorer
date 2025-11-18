@@ -30,7 +30,10 @@ fn test_wav_loading_with_synthetic_tone() {
         .iter()
         .map(|&s| s.abs())
         .fold(0.0f32, f32::max);
-    assert!((max_amplitude - 0.6).abs() < 0.05, "Amplitude should be ~0.6");
+    assert!(
+        (max_amplitude - 0.6).abs() < 0.05,
+        "Amplitude should be ~0.6"
+    );
 }
 
 #[test]
@@ -127,11 +130,7 @@ fn test_audio_state_transitions() {
     state = AudioPlaybackState::Error(AudioError::DeviceDisconnected);
     assert!(state.is_error());
     assert_eq!(state.status_icon(), "⚠️");
-    assert!(state
-        .error()
-        .unwrap()
-        .user_action()
-        .contains("Reconnect"));
+    assert!(state.error().unwrap().user_action().contains("Reconnect"));
 }
 
 #[test]
