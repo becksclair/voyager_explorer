@@ -21,9 +21,15 @@ impl Default for DecoderParams {
 
 pub struct SstvDecoder;
 
+impl Default for SstvDecoder {
+    fn default() -> Self {
+        Self
+    }
+}
+
 impl SstvDecoder {
     pub fn new() -> Self {
-        Self
+        Self::default()
     }
 
     fn hann_window(size: usize) -> Vec<f32> {

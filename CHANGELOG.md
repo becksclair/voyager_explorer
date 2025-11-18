@@ -211,15 +211,49 @@ Modified:
 
 ## Future Releases
 
-### [0.3.0] - Planned
-- **Real rodio audio playback** with actual sound output
+### [0.3.0] - In Progress
+
+#### **Milestone 1: Real Audio Playback (COMPLETED)**
+
+**Added:**
+- **Real rodio audio playback** with actual sound output (feature-gated)
+- Feature-gated `audio_stream` field in `VoyagerApp` for `OutputStream` and `OutputStreamHandle`
+- `ensure_audio_stream()` helper for lazy initialization of rodio stream
+- `make_buffer_source_from_current_position()` to create playback sources from current position
+- `restart_audio_from_current_position()` for seamless seeking during playback
+- Proper play/pause/resume support with rodio `Sink` integration
+- Audio restart on seek operations (waveform click, skip to next sync)
+
+**Changed:**
+- `toggle_playback()` now integrates with rodio for real audio output when feature is enabled
+- `stop_playback()` properly cleans up rodio resources
+- All rodio-related code properly feature-gated with `#[cfg(feature = "audio_playback")]`
+- Application builds and runs correctly both with and without `audio_playback` feature
+- Visual-only playback simulation when audio_playback feature is disabled
+
+**Technical:**
+- `AudioBufferSource` implements `rodio::Source` trait for custom audio playback
+- Mono channel playback (after user channel selection)
+- Position tracking synchronized between visual and audio playback
+- All 29 tests pass with and without audio_playback feature
+
+**Fixed:**
+- Deprecated `screen_rect()` replaced with `input(|i| i.viewport().inner_rect...)`
+- `samples.len() > 0` changed to `!samples.is_empty()` for clippy compliance
+- Added `Default` implementation for `SstvDecoder`
+
+---
+
+### [0.4.0] - Planned (Future Milestones 2-6)
+- **Non-blocking decoding** with background worker thread
+- **Sync detection logging fixes** and code cleanup
 - **Color image decoding** with YUV/RGB channel support
 - **Parameter presets** for different Voyager image types
+- **Session state persistence** with project file support
 - **Export functionality** (PNG, TIFF, raw pixel data)
 
-### [0.4.0] - Planned
+### [0.5.0] - Planned
 - **Tiled image system** for high-resolution viewing beyond GPU limits
-- **Session state persistence** with project file support
 - **Advanced signal analysis** tools (spectrum analyzer, noise reduction)
 - **Batch processing** capabilities for multiple files
 
