@@ -1,8 +1,9 @@
 use realfft::{RealFftPlanner, RealToComplex};
 use std::f32::consts::PI;
 
-// const TARGET_FREQ_HZ: f32 = 3500.0;
+/// Target sync frequency in Hz (Voyager Golden Record standard)
 const TARGET_FREQ_HZ: f32 = 1200.0;
+/// FFT chunk size for frequency analysis
 const CHUNK_SIZE: usize = 2048;
 
 #[derive(Debug, Clone, Copy)]
@@ -62,7 +63,16 @@ impl SstvDecoder {
         peak > (avg * 10.0) // Simple threshold, tweak as needed
     }
 
-    pub fn detect_sync(&self, samples: Vec<f32>, sample_rate: u32) {
+    /// Detect presence of sync tone in audio samples.
+    ///
+    /// This method performs a simple detection pass through the samples,
+    /// stopping at the first detected sync. For more comprehensive sync
+    /// analysis, use `find_sync_positions()` or `find_next_sync()`.
+    ///
+    /// # Performance Note
+    /// This method processes chunks sequentially until a sync is found.
+    /// Consider using `find_sync_positions()` for batch analysis.
+    pub fn detect_sync(&self, samples: Vec<f32>, sample_rate: u32) -> bool {
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(CHUNK_SIZE);
         let window = Self::hann_window(CHUNK_SIZE);
@@ -73,11 +83,10 @@ impl SstvDecoder {
             }
             let sync_detected = Self::detect_sync_tone(chunk, &*fft, &window, sample_rate as f32);
             if sync_detected {
-                println!("Sync tone detected!");
-                break;
+                return true;
             }
         }
-        println!("Sync tone not detected!");
+        false
     }
 
     /// Find all sync signal positions in the audio samples

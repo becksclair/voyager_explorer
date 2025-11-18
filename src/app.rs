@@ -275,8 +275,17 @@ impl VoyagerApp {
         if let Some(reader) = &self.wav_reader {
             let samples = reader.get_samples(self.selected_channel);
 
-            self.video_decoder
-                .detect_sync(samples.to_vec(), reader.sample_rate);
+            // Detect sync presence (logged only in debug builds)
+            #[cfg(debug_assertions)]
+            {
+                let sync_detected = self
+                    .video_decoder
+                    .detect_sync(samples.to_vec(), reader.sample_rate);
+                println!(
+                    "Sync detection result: {}",
+                    if sync_detected { "found" } else { "not found" }
+                );
+            }
 
             let pixels = self
                 .video_decoder
