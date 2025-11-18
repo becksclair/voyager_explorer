@@ -15,8 +15,10 @@ use std::f32::consts::PI;
 ///
 /// # Example
 /// ```
+/// use voyager_explorer::test_fixtures::generate_sine_wave;
 /// // Generate 1 second of A4 (440Hz) at half volume
 /// let tone = generate_sine_wave(440.0, 1.0, 44100, 0.5);
+/// assert_eq!(tone.len(), 44100);
 /// ```
 pub fn generate_sine_wave(
     frequency: f32,
@@ -177,7 +179,7 @@ pub fn generate_composite_signal(sample_rate: u32) -> Vec<f32> {
 /// Create a complete WAV file in memory for testing
 ///
 /// Returns a temporary file handle that can be used with WavReader.
-#[cfg(test)]
+/// Available in tests and when test_fixtures feature is enabled.
 pub fn create_test_wav_file(
     samples: &[f32],
     sample_rate: u32,
