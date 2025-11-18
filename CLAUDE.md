@@ -10,14 +10,14 @@ Voyager Golden Record Explorer is a sophisticated Rust + Egui desktop applicatio
 
 **Currently implemented (as of v0.2.x):**
 - WAV loading and normalization via `WavReader` with mono/stereo support.
-- Visual “playback” using `is_playing`, `playback_start_time`, and `current_position_samples` (no rodio audio output is wired yet).
+- Visual playback using `is_playing`, `playback_start_time`, and `current_position_samples`, with optional rodio-based audio output behind the `audio_playback` feature.
 - Interactive waveform visualization with hover, click-to-seek, and position indicator.
 - SSTV-style binary grayscale decoding (`SstvDecoder::decode`) and sync detection (`find_sync_positions`, `find_next_sync`).
 - Image rendering via `image_output::image_from_pixels` into `egui::ColorImage`.
-- Unit and integration tests covering the WAV → decode → image pipeline.
+- Unit and integration tests (including audio playback tests) covering the WAV → decode → image pipeline.
 
 **Planned / in-progress (see `specs/implementation.md`):**
-- Real rodio-based audio playback behind the `audio_playback` feature, connected to `VoyagerApp` playback controls.
+- Further refinement of rodio-based audio playback (buffering, mixer integration, spectrum view) connected to `VoyagerApp` playback controls.
 - Moving decode work off the UI thread via a background worker and message passing.
 - Color decoding modes and decoder presets for different Voyager image types.
 - Session persistence (saving/loading parameters, positions, and file paths).
@@ -39,7 +39,7 @@ cargo build --release        # Build optimized release version
 ### Testing and Quality
 
 ```bash
-cargo test                   # Run all tests (29 total: 25 unit + 4 integration)
+cargo test                   # Run all tests (lib, bin, integration, audio playback, doc)
 cargo test --lib             # Run unit tests only
 cargo test --test integration_tests # Run integration tests only
 cargo clippy                 # Run linter
@@ -218,6 +218,8 @@ Real-time waveform rendering with full mouse interaction support.
 
 ## Development Guidelines
 
+See [Debugging Guidelines](#debugging-guidelines) below for troubleshooting steps and command-suite checks.
+
 ### Performance Considerations
 
 **Real-time Requirements:**
@@ -321,6 +323,22 @@ match WavReader::from_file(&path) {
 5. Test interactive features with mouse/keyboard input
 6. Document all public APIs and complex algorithms
 7. Update this CLAUDE.md file for architectural changes
+
+### Handling external API changes (e.g. rodio)
+
+- Check `Cargo.toml` for the exact crate name and version before editing.
+- Use `cargo doc --open` or docs.rs for that version and look up the structs/functions you're touching.
+- Align function signatures and types with docs instead of guessing from memory.
+- For borrow checker issues in UI code, separate immutable read/draw from mutating calls (e.g. compute `pending_seek`, finish drawing, then call `restart_audio_from_current_position`).
+- For feature-gated modules like `test_fixtures` or `audio_playback`, run tests with the relevant features enabled (e.g. `cargo test --features test_fixtures`) and, for IDEs, enable those features via `rust-analyzer.cargo.features`.
+
+### Command suite after non-trivial changes
+
+- `cargo fmt`
+- `cargo test --features test_fixtures`
+- `cargo clippy --all-targets --features test_fixtures`
+- `cargo check --all-targets --features test_fixtures`
+- Optional smoke: `cargo run --features audio_playback` or `RUST_LOG=debug cargo run --features audio_playback`
 
 **Performance Testing:**
 - Test with various audio file sizes (1MB to 100MB+)

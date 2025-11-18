@@ -19,6 +19,7 @@ impl Default for DecoderParams {
     }
 }
 
+#[derive(Default)]
 pub struct SstvDecoder;
 
 impl SstvDecoder {
@@ -188,9 +189,8 @@ mod tests {
 
     #[test]
     fn test_decoder_creation() {
-        let decoder = SstvDecoder::new();
+        let _decoder = SstvDecoder::new();
         // Test that decoder can be created without panicking
-        assert!(true);
     }
 
     #[test]
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn test_sync_detection_positive() {
-        let decoder = SstvDecoder::new();
+        let _decoder = SstvDecoder::new();
         let sample_rate = 44100;
 
         // Generate a signal with the target sync frequency
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn test_sync_detection_negative() {
-        let decoder = SstvDecoder::new();
+        let _decoder = SstvDecoder::new();
         let sample_rate = 44100;
 
         // Generate noise that shouldn't trigger sync detection
@@ -279,7 +279,7 @@ mod tests {
         let mut test_samples = Vec::new();
         for i in 0..(samples_per_line * 3) {
             // 3 lines worth
-            let value = if (i / samples_per_line) % 2 == 0 {
+            let value = if (i / samples_per_line).is_multiple_of(2) {
                 0.5
             } else {
                 -0.5

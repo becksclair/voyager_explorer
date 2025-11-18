@@ -36,15 +36,20 @@ It is written for a coding agent working on this project **for the first time**.
     - Playback state (`is_playing`, `current_position_samples`, `playback_start_time`).
     - Real-time decoding (`decode_at_position`).
     - UI layout and waveform drawing.
-  - Contains **rodio-related scaffolding**:
+  - Contains **rodio-based playback path** behind the `audio_playback` feature:
     - `AudioBufferSource` implementing `rodio::Source`.
-    - `audio_sink: Option<Sink>` field **currently unused**.
+    - `audio_stream` / `audio_sink` fields for managing `OutputStream` and `Sink`.
 
 - `src/audio.rs`
   - `WavReader` wraps `hound::WavReader`.
   - Normalizes `i16` samples to `f32` in `[-1.0, 1.0]`.
   - Handles mono → dual-channel duplication and stereo splitting.
   - `WaveformChannel` enum (`Left`, `Right`) and `get_samples` API.
+
+- `src/audio_state.rs`
+  - `AudioPlaybackState` and `AudioError` enums for explicit audio state tracking.
+  - `AudioMetrics` struct for playback observability (play/seek counts, errors, total time).
+  - Currently exercised from tests; not yet fully wired into `VoyagerApp`.
 
 - `src/sstv.rs`
   - `SstvDecoder` and `DecoderParams` (line duration and threshold).
@@ -58,9 +63,16 @@ It is written for a coding agent working on this project **for the first time**.
 - `src/utils.rs`
   - `format_duration` formats seconds as `MM:SS.SS`.
 
+- `src/test_fixtures.rs`
+  - Synthetic audio generators and helpers (tones, chirps, noise, sync patterns, composite signals).
+  - `create_test_wav_file` builds temporary WAVs from in-memory samples.
+
 - `tests/integration_tests.rs`
   - End-to-end tests for WAV → decode → image.
   - Tests channel selection, decoder parameter effects, and empty audio handling.
+
+- `tests/audio_playback_tests.rs`
+  - Uses `test_fixtures` and `audio_state` to validate WAV loading, sync detection, decoder determinism, and audio playback state transitions without requiring real audio hardware.
 
 ### 0.3. Documentation & Style References
 
@@ -69,6 +81,10 @@ Agents should read these before making non-trivial changes:
 - `README.md` – feature list, architecture overview, commands, roadmap.
 - `CLAUDE.md` – detailed architecture & development guidelines.
 - `AGENTS.md` – project-specific rules (prototype/MVP bias, commands to run after changes).
+- `docs/audio_playback_design.md` – detailed rodio/audio playback state-machine design.
+- `docs/refactoring_progress.md` – current status and next steps for the audio playback refactor.
+- `docs/testing_without_audio.md` – strategy for testing audio logic with synthetic fixtures.
+- `docs/ultrathink_summary.md` – high-level reflection and roadmap for audio work.
 
 ### 0.4. Commands & Quality Gates
 
@@ -119,19 +135,53 @@ All milestones that require audio for tests or manual QA should use **synthetic 
 - Prefer short, deterministic signals (sync tones, noise+sync, alternating stripe patterns, stereo differentiation) so tests remain fast and self-explanatory.
 - If a fixed "golden" signal is needed, embed raw `i16` samples as a `const` array and wrap them into a temporary WAV via the existing helpers.
 
+### 0.7. Current Implementation Status (2025-11-18)
+
+- **Milestone 1 – Real Audio Playback via rodio**
+  - Implemented:
+    - `AudioBufferSource`, `audio_stream`, and `audio_sink` fields in `VoyagerApp` behind the `audio_playback` feature.
+    - Synthetic audio fixtures in `src/test_fixtures.rs` and audio-focused tests in `tests/audio_playback_tests.rs`.
+    - `audio_state.rs` and `AudioMetrics` providing an explicit playback state machine and observability primitives.
+  - Still missing / misaligned:
+    - `VoyagerApp` continues to track playback with a bare `is_playing: bool` and does not yet use `AudioPlaybackState` / `AudioMetrics`.
+    - Rodio integration needs to be aligned with `rodio` 0.21 APIs (`OutputStreamBuilder`, `OutputStreamHandle`, and `Sink::try_new`).
+    - `AudioBufferSource` still clones `Vec<f32>` on seek instead of using shared `Arc<[f32]>` buffers, which limits large-file performance.
+
+- **Milestone 2 – Non-blocking Decoding & Performance**
+  - `decode_at_position` runs entirely on the UI thread, and there is no background decoding worker or message-passing yet.
+  - `DecodeRequest` / `DecodeResult` structs and `decode_tx` / `decode_rx` fields on `VoyagerApp` have not been implemented.
+
+- **Milestone 3 – Sync Detection Logging & Minor Fixes**
+  - `SstvDecoder::detect_sync` still prints `"Sync tone not detected!"` unconditionally at the end, even when a sync was found earlier.
+  - A clippy/cleanup pass is still needed to reconcile imports and scaffolding now that additional tests and modules exist.
+
+- **Milestone 4 – Color Image Decoding**
+  - Not started. `DecoderParams` has no mode field and decoding remains binary grayscale only.
+
+- **Milestone 5 – Presets, Session Persistence, and Export**
+  - Not started in code. The `image` crate is wired in and `image_from_pixels` is tested, but there are no presets, session state, or export options in the UI yet.
+
+- **Milestone 6 – Advanced Signal Analysis & Batch Processing**
+  - Not started; only design-level notes exist.
+
+Use this status section together with `TODO.md` when deciding what to implement next.
+
 ---
 
 ## Milestone 1 – Real Audio Playback via rodio
 
 ### 1.1. Problem Statement
 
-Currently, playback in `VoyagerApp` is **visual only**:
+Originally, playback in `VoyagerApp` was **visual only**.
 
-- `is_playing`, `playback_start_time`, and `current_position_samples` drive waveform position and real-time decoding.
-- No actual audio is played.
-- `AudioBufferSource` and `audio_sink: Option<Sink>` exist but are unused.
+As of the current codebase, there is an experimental `rodio` playback path behind the `audio_playback` feature, plus an explicit `AudioPlaybackState` / `AudioMetrics` layer in `audio_state.rs`. However, these pieces are not yet fully aligned with the design below or fully integrated into `VoyagerApp`.
 
-Goal: Implement **real audio playback** using `rodio` while preserving existing visual behavior and respecting the `audio_playback` feature.
+Today:
+
+- `is_playing`, `playback_start_time`, and `current_position_samples` still drive waveform position and real-time decoding.
+- `AudioBufferSource`, `audio_stream`, and `audio_sink: Option<Sink>` provide a basic audio path, but the `OutputStream` / `Sink` wiring and state-machine integration need refinement.
+
+Goal: Implement **robust real audio playback** using `rodio` while preserving existing visual behavior and respecting the `audio_playback` feature.
 
 ### 1.2. Design Overview
 
