@@ -42,3 +42,4 @@ tempfile = "3.23"
 [features]
 default = ["audio_playback"]
 audio_playback = ["rodio"]
+test_fixtures = []  # Enable synthetic audio generation for testing
