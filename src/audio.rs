@@ -1,3 +1,4 @@
+use crate::error::{AudioError, Result};
 use hound::WavReader as HoundReader;
 use std::path::Path;
 use std::sync::Arc;
@@ -38,18 +39,60 @@ pub struct WavReader {
 }
 
 impl WavReader {
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
-        let mut reader = HoundReader::open(path).map_err(|e| format!("Failed to open WAV: {e}"))?;
+    /// Load and decode a WAV file with comprehensive error handling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::LoadFailed`] if the file cannot be opened or read.
+    /// Returns [`AudioError::UnsupportedChannels`] for files with > 2 channels.
+    /// Returns [`AudioError::InvalidSampleRate`] for sample rates outside 8kHz-192kHz.
+    /// Returns [`AudioError::EmptyFile`] if the file contains no audio samples.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use voyager_explorer::audio::WavReader;
+    ///
+    /// let reader = WavReader::from_file("audio.wav")?;
+    /// println!("Loaded {} samples at {} Hz", reader.left_channel.len(), reader.sample_rate);
+    /// # Ok::<(), voyager_explorer::error::VoyagerError>(())
+    /// ```
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let path_buf = path.to_path_buf();
+
+        let mut reader = HoundReader::open(path).map_err(|source| AudioError::LoadFailed {
+            path: path_buf.clone(),
+            source,
+        })?;
+
         let spec = reader.spec();
 
+        // Validate sample rate
+        if !(8000..=192_000).contains(&spec.sample_rate) {
+            return Err(AudioError::InvalidSampleRate {
+                rate: spec.sample_rate,
+            }
+            .into());
+        }
+
+        // Validate channel count
         if spec.channels != 1 && spec.channels != 2 {
-            return Err("Only mono and stereo WAV files are supported.".into());
+            return Err(AudioError::UnsupportedChannels {
+                channels: spec.channels,
+            }
+            .into());
         }
 
         let samples: Vec<f32> = reader
             .samples::<i16>()
             .map(|s| s.unwrap_or(0) as f32 / i16::MAX as f32)
             .collect();
+
+        // Check for empty file
+        if samples.is_empty() {
+            return Err(AudioError::EmptyFile { path: path_buf }.into());
+        }
 
         let (left_channel, right_channel) = match spec.channels {
             1 => {
@@ -71,6 +114,14 @@ impl WavReader {
             }
             _ => unreachable!(),
         };
+
+        tracing::info!(
+            path = %path.display(),
+            sample_rate = spec.sample_rate,
+            channels = spec.channels,
+            samples = left_channel.len(),
+            "Successfully loaded WAV file"
+        );
 
         Ok(Self {
             left_channel,
