@@ -2,10 +2,38 @@ use hound::WavReader as HoundReader;
 use std::path::Path;
 use std::sync::Arc;
 
+/// WAV file reader with normalized f32 samples and zero-copy buffer sharing.
+///
+/// # Architecture Decision: Arc<[f32]> vs Vec<f32>
+///
+/// This struct uses `Arc<[f32]>` instead of `Vec<f32>` for the audio buffers to enable
+/// efficient zero-copy sharing with audio playback components.
+///
+/// **Key benefit**: When seeking during playback, we can create new `AudioBufferSource`
+/// instances that share the same underlying buffer via `Arc::clone()`, which only
+/// increments a reference count (O(1)) rather than copying megabytes of sample data (O(n)).
+///
+/// **Memory impact**: For a 100MB audio file with frequent seeking:
+/// - With `Vec<f32>`: Each seek allocates 50MB average (half the file)
+/// - With `Arc<[f32]>`: Each seek allocates 16 bytes (Arc pointer + metadata)
+///
+/// **Trade-off**: Arc adds 16 bytes of overhead vs Vec, but this is negligible compared
+/// to the sample data size (millions of f32 values).
+///
+/// # Sample Normalization
+///
+/// All samples are normalized to f32 in the range `[-1.0, 1.0]` for consistent
+/// processing regardless of the input WAV format (8-bit, 16-bit, 24-bit, etc.).
 pub struct WavReader {
+    /// Left channel samples (or mono channel for mono files).
+    /// Shared via Arc for zero-copy playback.
     pub left_channel: Arc<[f32]>,
+    /// Right channel samples (duplicated from left for mono files).
+    /// Shared via Arc for zero-copy playback.
     pub right_channel: Arc<[f32]>,
+    /// Original sample rate in Hz (e.g., 44100, 48000).
     pub sample_rate: u32,
+    /// Number of channels in the original file (1 for mono, 2 for stereo).
     pub channels: u16,
 }
 
@@ -127,7 +155,10 @@ mod tests {
             .collect();
 
         assert_eq!(reader.left_channel.as_ref(), expected_normalized.as_slice());
-        assert_eq!(reader.right_channel.as_ref(), expected_normalized.as_slice()); // Mono duplicated to both channels
+        assert_eq!(
+            reader.right_channel.as_ref(),
+            expected_normalized.as_slice()
+        ); // Mono duplicated to both channels
     }
 
     #[test]
