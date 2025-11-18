@@ -431,4 +431,163 @@ mod tests {
         // Should return None if no sync found
         assert!(next_sync.is_none());
     }
+
+    // Property-based tests using proptest
+    #[cfg(test)]
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Generate valid decoder parameters for property testing
+        fn valid_decoder_params() -> impl Strategy<Value = DecoderParams> {
+            (1.0f32..=100.0, 0.0f32..=1.0).prop_map(|(line_duration_ms, threshold)| DecoderParams {
+                line_duration_ms,
+                threshold,
+            })
+        }
+
+        /// Generate valid sample rates for property testing
+        fn valid_sample_rate() -> impl Strategy<Value = u32> {
+            prop::sample::select(vec![8000, 11025, 16000, 22050, 44100, 48000, 96000])
+        }
+
+        /// Generate random audio samples in valid range
+        fn random_samples(
+            min_samples: usize,
+            max_samples: usize,
+        ) -> impl Strategy<Value = Vec<f32>> {
+            prop::collection::vec(-1.0f32..=1.0f32, min_samples..=max_samples)
+        }
+
+        proptest! {
+            /// Property: Decoder never panics with valid inputs
+            #[test]
+            fn prop_decode_never_panics(
+                samples in random_samples(1000, 100_000),
+                params in valid_decoder_params(),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+                let _ = decoder.decode(&samples, &params, sample_rate);
+                // Test passes if no panic occurs
+            }
+
+            /// Property: Decoded output width is always 512 pixels
+            #[test]
+            fn prop_decode_width_always_512(
+                samples in random_samples(1000, 50_000),
+                params in valid_decoder_params(),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+                if let Ok(pixels) = decoder.decode(&samples, &params, sample_rate) {
+                    if !pixels.is_empty() {
+                        // All pixels should be multiples of 512
+                        prop_assert_eq!(pixels.len() % 512, 0);
+                    }
+                }
+            }
+
+            /// Property: Decoder is deterministic (same input always produces same output)
+            #[test]
+            fn prop_decode_is_deterministic(
+                samples in random_samples(1000, 20_000),
+                params in valid_decoder_params(),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+
+                let result1 = decoder.decode(&samples, &params, sample_rate);
+                let result2 = decoder.decode(&samples, &params, sample_rate);
+
+                // Both should succeed or both should fail
+                prop_assert_eq!(result1.is_ok(), result2.is_ok());
+
+                // If successful, outputs should be identical
+                if let (Ok(pixels1), Ok(pixels2)) = (result1, result2) {
+                    prop_assert_eq!(pixels1, pixels2);
+                }
+            }
+
+            /// Property: All output pixels are binary (0 or 255)
+            #[test]
+            fn prop_pixels_are_binary(
+                samples in random_samples(1000, 20_000),
+                params in valid_decoder_params(),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+                if let Ok(pixels) = decoder.decode(&samples, &params, sample_rate) {
+                    for &pixel in &pixels {
+                        prop_assert!(pixel == 0 || pixel == 255,
+                            "Expected 0 or 255, got {}", pixel);
+                    }
+                }
+            }
+
+            /// Property: Invalid line duration returns error
+            #[test]
+            fn prop_invalid_line_duration_errors(
+                samples in random_samples(1000, 10_000),
+                invalid_duration in prop::num::f32::ANY.prop_filter(
+                    "Not in valid range",
+                    |&d| d < 1.0 || d > 100.0 || d.is_nan()
+                ),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+                let params = DecoderParams {
+                    line_duration_ms: invalid_duration,
+                    threshold: 0.5,
+                };
+
+                let result = decoder.decode(&samples, &params, sample_rate);
+                prop_assert!(result.is_err());
+            }
+
+            /// Property: Invalid threshold returns error
+            #[test]
+            fn prop_invalid_threshold_errors(
+                samples in random_samples(1000, 10_000),
+                invalid_threshold in prop::num::f32::ANY.prop_filter(
+                    "Not in valid range",
+                    |&t| t < 0.0 || t > 1.0 || t.is_nan()
+                ),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+                let params = DecoderParams {
+                    line_duration_ms: 10.0,
+                    threshold: invalid_threshold,
+                };
+
+                let result = decoder.decode(&samples, &params, sample_rate);
+                prop_assert!(result.is_err());
+            }
+
+            /// Property: Output size grows with more input samples
+            #[test]
+            fn prop_output_grows_with_input(
+                base_samples in random_samples(5000, 10_000),
+                params in valid_decoder_params(),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+
+                // Decode with base samples
+                let result1 = decoder.decode(&base_samples, &params, sample_rate);
+
+                // Extend samples and decode again
+                let mut extended_samples = base_samples.clone();
+                extended_samples.extend(vec![0.0; 10_000]);
+                let result2 = decoder.decode(&extended_samples, &params, sample_rate);
+
+                // Both should succeed
+                if let (Ok(pixels1), Ok(pixels2)) = (result1, result2) {
+                    // Extended should have more or equal pixels
+                    prop_assert!(pixels2.len() >= pixels1.len());
+                }
+            }
+        }
+    }
 }
