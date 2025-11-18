@@ -10,6 +10,14 @@
 - Run `cargo test` (all), `cargo test --lib` (unit), `cargo test --test integration_tests`; single-test shorthand `cargo test audio::tests::test_mono_wav_loading`.
 - Coverage/regressions only when needed via `cargo tarpaulin --out html`.
 
+## External APIs & docs
+
+- On external crate errors (rodio, etc.), first inspect `Cargo.toml` for the crate and version.
+- Use `cargo doc --open` or docs.rs for that version and look up the exact types/functions you're touching.
+- Don't guess APIs from memory; align signatures/types to the docs and then refactor.
+- For borrow checker issues in UI code, split immutable reading/drawing from mutating calls by using flags like `pending_seek` and calling the mutating method afterwards.
+- For feature-gated modules (`test_fixtures`, `audio_playback`), run tests with `--features test_fixtures` and configure `rust-analyzer.cargo.features` accordingly for good IDE hints.
+
 ## Architecture
 
 - `src/main.rs` starts eframe, installs egui image loaders, and instantiates `VoyagerApp`.

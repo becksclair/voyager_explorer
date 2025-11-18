@@ -174,7 +174,10 @@ fn test_chirp_signal_properties() {
     assert_eq!(chirp.len(), 44100, "Should be 1 second at 44.1kHz");
 
     // Amplitude should stay within expected range
-    let max_amp = chirp.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+    let max_amp = chirp
+        .iter()
+        .map(|&s| s.abs())
+        .fold::<f32, _>(0.0f32, f32::max);
     assert!(
         (max_amp - 0.7).abs() < 0.05,
         "Chirp amplitude should be ~0.7"
@@ -184,8 +187,8 @@ fn test_chirp_signal_properties() {
     let first_quarter = &chirp[0..11025];
     let last_quarter = &chirp[33075..44100];
 
-    let avg_first: f32 = first_quarter.iter().map(|&s| s.abs()).sum::<f32>() / 11025.0;
-    let avg_last: f32 = last_quarter.iter().map(|&s| s.abs()).sum::<f32>() / 11025.0;
+    let avg_first: f32 = first_quarter.iter().map(|s| s.abs()).sum::<f32>() / 11025.0;
+    let avg_last: f32 = last_quarter.iter().map(|s| s.abs()).sum::<f32>() / 11025.0;
 
     // Both should have significant energy (not silence)
     assert!(avg_first > 0.1, "First quarter should have energy");
@@ -227,14 +230,14 @@ fn test_white_noise_is_not_silent() {
     assert_eq!(noise.len(), 22050); // 0.5s * 44100
 
     // Calculate RMS (root mean square) energy
-    let rms: f32 = (noise.iter().map(|&s| s * s).sum::<f32>() / noise.len() as f32).sqrt();
+    let rms: f32 = (noise.iter().map(|s| s * s).sum::<f32>() / noise.len() as f32).sqrt();
 
     // RMS should be significant (not silence)
     assert!(rms > 0.05, "Noise should have energy, RMS: {}", rms);
 
     // Should have both positive and negative values
-    let positive_count = noise.iter().filter(|&&s| s > 0.0).count();
-    let negative_count = noise.iter().filter(|&&s| s < 0.0).count();
+    let positive_count = noise.iter().filter(|&&s| s > 0.0f32).count();
+    let negative_count = noise.iter().filter(|&&s| s < 0.0f32).count();
 
     assert!(
         positive_count > 1000,
@@ -359,8 +362,8 @@ fn test_composite_signal_structure() {
     );
 
     // Should have both positive and negative samples
-    let pos_count = composite.iter().filter(|&&s| s > 0.1).count();
-    let neg_count = composite.iter().filter(|&&s| s < -0.1).count();
+    let pos_count = composite.iter().filter(|&&s| s > 0.1f32).count();
+    let neg_count = composite.iter().filter(|&&s| s < -0.1f32).count();
 
     assert!(pos_count > 1000, "Should have positive samples");
     assert!(neg_count > 1000, "Should have negative samples");

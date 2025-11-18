@@ -1,0 +1,3 @@
+{
+    "rust-analyzer.cargo.features": ["test_fixtures"] // expose synthetic audio fixtures so IDEs can resolve tests
+}

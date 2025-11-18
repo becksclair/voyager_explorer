@@ -2,6 +2,13 @@
 
 ## Now (Milestone 2 - Non-blocking Decoding)
 
+- [ ] Milestone 1 follow-up: rodio/audio_state alignment (src/app.rs + src/audio_state.rs)
+  - [ ] Integrate `AudioPlaybackState` and `AudioMetrics` into `VoyagerApp` (replace bare `is_playing` / manual counters).
+  - [ ] Update rodio wiring to use `OutputStreamBuilder::open_default_stream()` returning `(OutputStream, OutputStreamHandle)` and `Sink::try_new(&handle)` (TODO: confirm the exact `rodio` crate version in `Cargo.toml` and verify these function signatures against the docs before changing code).
+  - [ ] Switch `AudioBufferSource` to use shared `Arc<[f32]>` (zero-copy seeks) instead of cloning `Vec<f32>` for each seek (TODO: confirm this layout works with the current seeking implementation and any downstream consumers of the audio buffer).
+  - [ ] Add a basic audio status indicator in the debug panel using `AudioPlaybackState::status_icon` / `status_message` (TODO: ensure these methods are implemented as part of the integration task above before wiring up the UI).
+  - [ ] Run QA: `cargo test`, `cargo fmt`, `cargo clippy`, `cargo check`, and manual smoke with `cargo run --features audio_playback` (reminder: run the API verification TODOs above before coding).
+
 - [ ] Milestone 2: Non-blocking decoding & performance (src/app.rs)
   - [ ] Define `DecodeRequest` and `DecodeResult` message structs
   - [ ] Add channels (`decode_tx`, `decode_rx`) to VoyagerApp
