@@ -1,13 +1,16 @@
 use crate::audio::{WavReader, WaveformChannel};
-use crate::audio_state::{AudioMetrics, AudioPlaybackState};
+use crate::audio_state::{AudioMetrics as OldAudioMetrics, AudioPlaybackState};
+use crate::config::AppConfig;
+use crate::error::VoyagerError;
 use crate::image_output::image_from_pixels;
+use crate::metrics::AppMetrics;
 use crate::sstv::{DecoderParams, SstvDecoder};
 use crate::utils::format_duration;
 use eframe::egui;
 use egui::TextureHandle;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "audio_playback")]
@@ -54,10 +57,12 @@ struct DecodeResult {
     /// Request ID (matches DecodeRequest.id) - currently unused but reserved for future features
     #[allow(dead_code)]
     id: u64,
-    /// Decoded image data (grayscale pixels, 512px width)
+    /// Decoded image data (grayscale pixels, 512px width), or empty on error
     pixels: Vec<u8>,
     /// Time taken to decode (for performance monitoring)
     decode_duration: Duration,
+    /// Error message if decode failed
+    error: Option<String>,
 }
 
 #[cfg(feature = "audio_playback")]
@@ -155,15 +160,20 @@ impl Source for AudioBufferSource {
 }
 
 pub struct VoyagerApp {
+    // Configuration
+    config: AppConfig,
+
+    // Audio data
     wav_reader: Option<WavReader>,
     video_decoder: SstvDecoder,
     image_texture: Option<TextureHandle>,
     params: DecoderParams,
     last_decoded: Option<Vec<u8>>,
     selected_channel: WaveformChannel,
+
     // Audio playback state
     audio_state: AudioPlaybackState,
-    audio_metrics: AudioMetrics,
+    old_audio_metrics: OldAudioMetrics, // Keep for compatibility, will migrate
     #[cfg(feature = "audio_playback")]
     audio_stream: Option<(OutputStream, OutputStreamHandle)>,
     #[cfg(feature = "audio_playback")]
@@ -171,10 +181,18 @@ pub struct VoyagerApp {
     current_position_samples: usize,
     waveform_hover_position: Option<f32>,
     playback_start_time: Option<Instant>,
+
     // Background decoding worker
     decode_tx: Option<Sender<DecodeRequest>>,
     decode_rx: Option<Receiver<DecodeResult>>,
     next_decode_id: u64,
+    worker_handle: Option<JoinHandle<()>>,
+    worker_last_response: Instant,
+
+    // Metrics and errors
+    metrics: AppMetrics,
+    error_message: Option<String>,
+    frame_start: Option<Instant>,
 }
 
 impl Default for VoyagerApp {
@@ -208,7 +226,16 @@ impl Default for VoyagerApp {
                 let decode_slice = &samples[start_offset..end_offset];
 
                 // Perform actual decoding (CPU-intensive FFT + pixel processing)
-                let pixels = decoder.decode(decode_slice, &params, sample_rate);
+                let (pixels, error) = match decoder.decode(decode_slice, &params, sample_rate) {
+                    Ok(pixels) => {
+                        tracing::debug!(pixels = pixels.len(), "Decode completed successfully");
+                        (pixels, None)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Decode failed");
+                        (Vec::new(), Some(e.to_string()))
+                    }
+                };
 
                 let decode_duration = decode_start.elapsed();
 
@@ -217,6 +244,7 @@ impl Default for VoyagerApp {
                     id,
                     pixels,
                     decode_duration,
+                    error,
                 };
 
                 // If send fails, main thread has dropped the receiver (app is closing)
@@ -226,15 +254,30 @@ impl Default for VoyagerApp {
             }
         });
 
+        // Load configuration from file or use defaults
+        let config = AppConfig::load_or_default(AppConfig::default_path());
+
+        tracing::info!(
+            config_path = %AppConfig::default_path().display(),
+            "Application configuration loaded"
+        );
+
+        // Initialize decoder params from config
+        let params = DecoderParams {
+            line_duration_ms: config.decoder.default_line_duration_ms,
+            threshold: config.decoder.default_threshold,
+        };
+
         Self {
+            config: config.clone(),
             wav_reader: None,
             video_decoder: SstvDecoder::new(),
             image_texture: None,
-            params: DecoderParams::default(),
+            params,
             last_decoded: None,
             selected_channel: WaveformChannel::Left,
             audio_state: AudioPlaybackState::Uninitialized,
-            audio_metrics: AudioMetrics::default(),
+            old_audio_metrics: OldAudioMetrics::default(),
             #[cfg(feature = "audio_playback")]
             audio_stream: None,
             #[cfg(feature = "audio_playback")]
@@ -245,6 +288,11 @@ impl Default for VoyagerApp {
             decode_tx: Some(decode_tx),
             decode_rx: Some(decode_rx),
             next_decode_id: 0,
+            worker_handle: None, // Set later if needed
+            worker_last_response: Instant::now(),
+            metrics: AppMetrics::new(),
+            error_message: None,
+            frame_start: None,
         }
     }
 }
@@ -257,15 +305,24 @@ impl VoyagerApp {
         {
             match WavReader::from_file(&path) {
                 Ok(reader) => {
+                    tracing::info!(path = %path.display(), "WAV file loaded successfully");
                     self.wav_reader = Some(reader);
                     self.image_texture = None;
                     self.last_decoded = None;
                     // Update audio state to Ready when WAV is loaded
                     self.audio_state = AudioPlaybackState::Ready;
+                    // Clear any previous error
+                    self.error_message = None;
                 }
                 Err(e) => {
-                    eprintln!("Failed to load WAV file: {}", e);
+                    tracing::error!(path = %path.display(), error = %e, "Failed to load WAV file");
                     self.audio_state = AudioPlaybackState::Uninitialized;
+
+                    // Extract user-friendly error message
+                    self.error_message = Some(match e {
+                        VoyagerError::Audio(audio_err) => audio_err.user_message(),
+                        _ => format!("Failed to load audio file: {}", e),
+                    });
                 }
             }
         }
@@ -275,24 +332,29 @@ impl VoyagerApp {
         if let Some(reader) = &self.wav_reader {
             let samples = reader.get_samples(self.selected_channel);
 
-            // Detect sync presence (logged only in debug builds)
-            #[cfg(debug_assertions)]
-            {
-                let sync_detected = self
-                    .video_decoder
-                    .detect_sync(samples.to_vec(), reader.sample_rate);
-                println!(
-                    "Sync detection result: {}",
-                    if sync_detected { "found" } else { "not found" }
-                );
-            }
-
-            let pixels = self
+            // Detect sync presence
+            let sync_detected = self
                 .video_decoder
-                .decode(samples, &self.params, reader.sample_rate);
-            let img = image_from_pixels(&pixels);
-            self.image_texture = Some(ctx.load_texture("decoded", img, Default::default()));
-            self.last_decoded = Some(pixels);
+                .detect_sync(samples.to_vec(), reader.sample_rate);
+            tracing::debug!(sync_detected, "Sync detection completed");
+
+            // Perform decode with error handling
+            match self
+                .video_decoder
+                .decode(samples, &self.params, reader.sample_rate)
+            {
+                Ok(pixels) => {
+                    tracing::info!(pixels = pixels.len(), "Decode completed successfully");
+                    let img = image_from_pixels(&pixels);
+                    self.image_texture = Some(ctx.load_texture("decoded", img, Default::default()));
+                    self.last_decoded = Some(pixels);
+                    self.error_message = None; // Clear any previous error
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Decode failed");
+                    self.error_message = Some(format!("Decode failed: {}", e));
+                }
+            }
         }
     }
 
@@ -306,9 +368,9 @@ impl VoyagerApp {
                     Some(handle)
                 }
                 Err(e) => {
-                    eprintln!("Failed to initialize audio stream: {}", e);
+                    tracing::error!("Failed to initialize audio stream: {}", e);
                     self.audio_state = AudioPlaybackState::Error(AudioError::StreamInitFailed);
-                    self.audio_metrics.record_device_error();
+                    self.old_audio_metrics.record_device_error();
                     None
                 }
             }
@@ -328,8 +390,8 @@ impl VoyagerApp {
                         sink.pause();
                     }
                     self.audio_state = AudioPlaybackState::Paused;
-                    self.audio_metrics.record_pause();
-                    println!("Pausing playback...");
+                    self.old_audio_metrics.record_pause();
+                    tracing::info!("Pausing playback");
                 }
                 AudioPlaybackState::Paused => {
                     // Resume playback
@@ -337,8 +399,8 @@ impl VoyagerApp {
                         sink.play();
                         self.audio_state = AudioPlaybackState::Playing;
                         self.playback_start_time = Some(Instant::now());
-                        self.audio_metrics.record_play();
-                        println!("Resuming playback...");
+                        self.old_audio_metrics.record_play();
+                        tracing::info!("Resuming playback");
                     }
                 }
                 AudioPlaybackState::Ready => {
@@ -362,23 +424,23 @@ impl VoyagerApp {
                                 self.audio_sink = Some(sink);
                                 self.audio_state = AudioPlaybackState::Playing;
                                 self.playback_start_time = Some(Instant::now());
-                                self.audio_metrics.record_play();
-                                println!("Starting playback...");
+                                self.old_audio_metrics.record_play();
+                                tracing::info!("Starting playback");
                             } else {
-                                eprintln!("No audio samples available to start playback");
+                                tracing::error!("No audio samples available to start playback");
                             }
                         }
                         Err(e) => {
-                            eprintln!("Failed to create audio sink: {}", e);
+                            tracing::error!("Failed to create audio sink: {}", e);
                             self.audio_state =
                                 AudioPlaybackState::Error(AudioError::SinkCreationFailed);
-                            self.audio_metrics.record_device_error();
+                            self.old_audio_metrics.record_device_error();
                         }
                     }
                 }
                 AudioPlaybackState::Uninitialized | AudioPlaybackState::Error(_) => {
                     // Can't play in these states
-                    println!("Cannot play: {}", self.audio_state);
+                    tracing::warn!("Cannot play: {}", self.audio_state);
                 }
             }
         }
@@ -390,13 +452,13 @@ impl VoyagerApp {
                 AudioPlaybackState::Ready | AudioPlaybackState::Paused => {
                     self.audio_state = AudioPlaybackState::Playing;
                     self.playback_start_time = Some(Instant::now());
-                    self.audio_metrics.record_play();
-                    println!("Starting visual playback...");
+                    self.old_audio_metrics.record_play();
+                    tracing::info!("Starting visual playback");
                 }
                 AudioPlaybackState::Playing => {
                     self.audio_state = AudioPlaybackState::Paused;
-                    self.audio_metrics.record_pause();
-                    println!("Pausing visual playback...");
+                    self.old_audio_metrics.record_pause();
+                    tracing::info!("Pausing visual playback");
                 }
                 _ => {}
             }
@@ -418,10 +480,10 @@ impl VoyagerApp {
         } else {
             self.audio_state = AudioPlaybackState::Uninitialized;
         }
-        self.audio_metrics.record_stop();
+        self.old_audio_metrics.record_stop();
         self.current_position_samples = 0;
         self.playback_start_time = None;
-        println!("Stopping playback...");
+        tracing::info!("Stopping playback");
     }
 
     /// Enqueue a non-blocking decode request at the given sample position.
@@ -430,7 +492,7 @@ impl VoyagerApp {
     ///
     /// **OLD approach (blocking):**
     /// ```ignore
-    /// let pixels = self.video_decoder.decode(segment, &params, sample_rate);
+    /// let pixels = self.video_decoder.decode(segment, &params, sample_rate)?;
     /// // UI frozen for 100-500ms during FFT + pixel processing
     /// ```
     ///
@@ -474,7 +536,7 @@ impl VoyagerApp {
                 // Send to worker thread (non-blocking, returns immediately)
                 // If worker is busy, request queues up in channel
                 if decode_tx.send(request).is_err() {
-                    eprintln!("Warning: decode worker thread has terminated");
+                    tracing::warn!("Decode worker thread has terminated");
                 }
             }
         }
@@ -491,7 +553,7 @@ impl VoyagerApp {
 
             if let Some(sync_position) = next_sync {
                 self.current_position_samples = sync_position;
-                println!("Seeking to next sync at sample: {}", sync_position);
+                tracing::info!(sync_position, "Seeking to next sync");
 
                 // If playing, restart audio from new position
                 #[cfg(feature = "audio_playback")]
@@ -502,7 +564,7 @@ impl VoyagerApp {
                     self.playback_start_time = Some(Instant::now());
                 }
             } else {
-                println!("No more sync signals found");
+                tracing::info!("No more sync signals found");
             }
         }
     }
@@ -560,15 +622,15 @@ impl VoyagerApp {
                     sink.play();
                     self.audio_sink = Some(sink);
                     self.playback_start_time = Some(Instant::now());
-                    self.audio_metrics.record_seek();
+                    self.old_audio_metrics.record_seek();
                 } else {
-                    eprintln!("No audio samples available after seek");
+                    tracing::error!("No audio samples available after seek");
                 }
             }
             Err(e) => {
-                eprintln!("Failed to create audio sink after seek: {}", e);
+                tracing::error!("Failed to create audio sink after seek: {}", e);
                 self.audio_state = AudioPlaybackState::Error(AudioError::SinkCreationFailed);
-                self.audio_metrics.record_device_error();
+                self.old_audio_metrics.record_device_error();
             }
         }
     }
@@ -654,6 +716,12 @@ impl VoyagerApp {
 
 impl eframe::App for VoyagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Record frame time for performance metrics
+        if let Some(start) = self.frame_start {
+            self.metrics.record_frame_time(start.elapsed());
+        }
+        self.frame_start = Some(Instant::now());
+
         // Poll for decode results from background worker (non-blocking)
         if let Some(decode_rx) = &self.decode_rx {
             // try_recv() returns immediately without blocking the UI thread
@@ -663,18 +731,35 @@ impl eframe::App for VoyagerApp {
                     id: _,
                     pixels,
                     decode_duration,
+                    error,
                 } = result;
 
-                // Log performance metrics
-                #[cfg(debug_assertions)]
-                println!(
-                    "Decode completed in {:.2}ms ({} pixels)",
-                    decode_duration.as_secs_f64() * 1000.0,
-                    pixels.len()
-                );
+                let success = error.is_none();
 
-                // Update texture with decoded image
-                if !pixels.is_empty() {
+                // Log performance metrics and record in metrics system
+                if success {
+                    tracing::debug!(
+                        duration_ms = decode_duration.as_millis(),
+                        pixels = pixels.len(),
+                        "Decode completed successfully"
+                    );
+                } else {
+                    tracing::warn!(
+                        duration_ms = decode_duration.as_millis(),
+                        error = error.as_deref().unwrap_or("unknown"),
+                        "Decode failed"
+                    );
+                }
+
+                // Record metrics (track both success and failure)
+                self.metrics
+                    .record_decode(decode_duration, pixels.len(), success);
+                self.worker_last_response = Instant::now();
+
+                // Handle error or update texture
+                if let Some(err_msg) = error {
+                    self.error_message = Some(format!("Decode failed: {}", err_msg));
+                } else if !pixels.is_empty() {
                     let img = image_from_pixels(&pixels);
                     self.image_texture =
                         Some(ctx.load_texture("decoded_realtime", img, Default::default()));
@@ -723,6 +808,23 @@ impl eframe::App for VoyagerApp {
                     self.handle_decode(ctx);
                 }
             });
+
+            // Display error message if present
+            let mut dismiss_error = false;
+            if let Some(error) = &self.error_message {
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 100, 100),
+                        format!("⚠️ {}", error),
+                    );
+                    if ui.button("✖").clicked() {
+                        dismiss_error = true;
+                    }
+                });
+            }
+            if dismiss_error {
+                self.error_message = None;
+            }
 
             ui.separator();
 
@@ -874,7 +976,10 @@ impl eframe::App for VoyagerApp {
                         let seek_sample = (relative_x * samples_len as f32) as usize;
                         self.current_position_samples =
                             seek_sample.min(samples_len.saturating_sub(1));
-                        println!("Seeking to sample: {}", self.current_position_samples);
+                        tracing::debug!(
+                            position = self.current_position_samples,
+                            "Seeking to sample"
+                        );
 
                         #[cfg(not(feature = "audio_playback"))]
                         if self.audio_state.is_playing() {

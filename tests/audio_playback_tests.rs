@@ -78,10 +78,10 @@ fn test_decoding_produces_consistent_output() {
     let signal = generate_square_wave(50.0, 0.5, 44100, 0.8);
 
     // Decode once
-    let pixels1 = decoder.decode(&signal, &params, 44100);
+    let pixels1 = decoder.decode(&signal, &params, 44100).expect("Decode should succeed");
 
     // Decode again with same input
-    let pixels2 = decoder.decode(&signal, &params, 44100);
+    let pixels2 = decoder.decode(&signal, &params, 44100).expect("Decode should succeed");
 
     // Should produce identical output
     assert_eq!(pixels1.len(), pixels2.len());
@@ -260,8 +260,8 @@ fn test_empty_audio_handling() {
     let empty: Vec<f32> = vec![];
     let result = decoder.decode(&empty, &params, 44100);
 
-    // Should return empty without crashing
-    assert!(result.is_empty());
+    // Should return error for empty input
+    assert!(result.is_err(), "Empty input should return error");
 
     // Find sync in empty - should return empty
     let positions = decoder.find_sync_positions(&empty, 44100);
@@ -295,8 +295,10 @@ fn test_parameter_variation_affects_output() {
         threshold: 0.3,
     };
 
-    let pixels_short = decoder.decode(&signal, &params_short, 44100);
-    let pixels_long = decoder.decode(&signal, &params_long, 44100);
+    let pixels_short = decoder.decode(&signal, &params_short, 44100)
+        .expect("Short duration decode should succeed");
+    let pixels_long = decoder.decode(&signal, &params_long, 44100)
+        .expect("Long duration decode should succeed");
 
     // Different line durations should produce different number of lines
     let lines_short = pixels_short.len() / 512;

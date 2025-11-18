@@ -1,3 +1,4 @@
+use crate::error::{DecoderError, Result, VoyagerError};
 use realfft::{RealFftPlanner, RealToComplex};
 use std::f32::consts::PI;
 
@@ -129,15 +130,66 @@ impl SstvDecoder {
         sync_positions.first().map(|&pos| start_position + pos)
     }
 
-    pub fn decode(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Vec<u8> {
+    /// Decode audio samples into SSTV image pixels with comprehensive error handling.
+    ///
+    /// # Arguments
+    ///
+    /// * `samples` - Audio samples normalized to [-1.0, 1.0]
+    /// * `params` - Decoder parameters (line duration, threshold)
+    /// * `sample_rate` - Audio sample rate in Hz (8kHz-192kHz)
+    ///
+    /// # Returns
+    ///
+    /// Grayscale pixels (0-255) in row-major order, width=512px
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecoderError::InvalidLineDuration`] if line duration is out of range 1-100ms.
+    /// Returns [`DecoderError::InvalidThreshold`] if threshold is out of range 0.0-1.0.
+    /// Returns [`DecoderError::InsufficientSamples`] if buffer is too short.
+    pub fn decode(
+        &self,
+        samples: &[f32],
+        params: &DecoderParams,
+        sample_rate: u32,
+    ) -> Result<Vec<u8>> {
+        // Validate parameters
+        if !(1.0..=100.0).contains(&params.line_duration_ms) {
+            return Err(VoyagerError::Decoder(DecoderError::InvalidLineDuration {
+                duration_ms: params.line_duration_ms,
+            }));
+        }
+
+        if !(0.0..=1.0).contains(&params.threshold) {
+            return Err(VoyagerError::Decoder(DecoderError::InvalidThreshold {
+                threshold: params.threshold,
+            }));
+        }
+
+        // Validate samples
         if samples.is_empty() {
-            return Vec::new();
+            return Err(VoyagerError::Decoder(DecoderError::InsufficientSamples {
+                needed: 1,
+                actual: 0,
+            }));
         }
 
         let samples_per_line =
             (params.line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
         if samples_per_line == 0 {
-            return Vec::new();
+            return Err(VoyagerError::Decoder(DecoderError::InvalidParams {
+                reason: format!(
+                    "Calculated samples_per_line is 0 (line_duration={}, sample_rate={})",
+                    params.line_duration_ms, sample_rate
+                ),
+            }));
+        }
+
+        if samples.len() < samples_per_line {
+            return Err(VoyagerError::Decoder(DecoderError::InsufficientSamples {
+                needed: samples_per_line,
+                actual: samples.len(),
+            }));
         }
 
         let width = 512;
@@ -162,7 +214,13 @@ impl SstvDecoder {
             lines_decoded += 1;
         }
 
-        image
+        tracing::debug!(
+            lines_decoded,
+            pixels = image.len(),
+            "Decode operation completed"
+        );
+
+        Ok(image)
     }
 }
 
@@ -271,7 +329,11 @@ mod tests {
         let empty_samples = Vec::new();
 
         let result = decoder.decode(&empty_samples, &params, 44100);
-        assert!(result.is_empty());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            VoyagerError::Decoder(DecoderError::InsufficientSamples { .. })
+        ));
     }
 
     #[test]
@@ -297,7 +359,9 @@ mod tests {
             test_samples.push(value);
         }
 
-        let result = decoder.decode(&test_samples, &params, sample_rate);
+        let result = decoder
+            .decode(&test_samples, &params, sample_rate)
+            .expect("Decode should succeed");
 
         assert!(!result.is_empty());
         assert_eq!(result.len() % 512, 0); // Should be multiples of width
