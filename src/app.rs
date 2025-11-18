@@ -1,4 +1,5 @@
 use crate::audio::{WavReader, WaveformChannel};
+use crate::audio_state::{AudioMetrics, AudioPlaybackState};
 use crate::image_output::image_from_pixels;
 use crate::sstv::{DecoderParams, SstvDecoder};
 use crate::utils::format_duration;
@@ -7,15 +8,21 @@ use egui::TextureHandle;
 use std::time::Instant;
 
 #[cfg(feature = "audio_playback")]
-use rodio::{Sink, Source};
+use crate::audio_state::AudioError;
+#[cfg(feature = "audio_playback")]
+use std::sync::Arc;
+
+#[cfg(feature = "audio_playback")]
+use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
 
 #[cfg(feature = "audio_playback")]
 use std::time::Duration;
 
 #[cfg(feature = "audio_playback")]
-/// Audio source that plays from a buffer of f32 samples
+/// Audio source that plays from a shared buffer of f32 samples with zero-copy seeking
 struct AudioBufferSource {
-    samples: Vec<f32>,
+    buffer: Arc<[f32]>,
+    offset: usize,
     sample_rate: u32,
     channels: u16,
     position: usize,
@@ -23,9 +30,10 @@ struct AudioBufferSource {
 
 #[cfg(feature = "audio_playback")]
 impl AudioBufferSource {
-    fn new(samples: Vec<f32>, sample_rate: u32, channels: u16) -> Self {
+    fn new(buffer: Arc<[f32]>, offset: usize, sample_rate: u32, channels: u16) -> Self {
         Self {
-            samples,
+            buffer,
+            offset,
             sample_rate,
             channels,
             position: 0,
@@ -38,8 +46,9 @@ impl Iterator for AudioBufferSource {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.position < self.samples.len() {
-            let sample = self.samples[self.position];
+        let absolute_position = self.offset + self.position;
+        if absolute_position < self.buffer.len() {
+            let sample = self.buffer[absolute_position];
             self.position += 1;
             Some(sample)
         } else {
@@ -51,7 +60,7 @@ impl Iterator for AudioBufferSource {
 #[cfg(feature = "audio_playback")]
 impl Source for AudioBufferSource {
     fn current_span_len(&self) -> Option<usize> {
-        Some(self.samples.len() - self.position)
+        Some((self.buffer.len() - self.offset).saturating_sub(self.position))
     }
 
     fn channels(&self) -> u16 {
@@ -63,8 +72,9 @@ impl Source for AudioBufferSource {
     }
 
     fn total_duration(&self) -> Option<Duration> {
-        let total_samples = self.samples.len() as u64;
-        let duration_secs = total_samples as f64 / (self.sample_rate as f64 * self.channels as f64);
+        let remaining_samples = (self.buffer.len() - self.offset) as u64;
+        let duration_secs =
+            remaining_samples as f64 / (self.sample_rate as f64 * self.channels as f64);
         Some(Duration::from_secs_f64(duration_secs))
     }
 }
@@ -77,9 +87,12 @@ pub struct VoyagerApp {
     last_decoded: Option<Vec<u8>>,
     selected_channel: WaveformChannel,
     // Audio playback state
+    audio_state: AudioPlaybackState,
+    audio_metrics: AudioMetrics,
+    #[cfg(feature = "audio_playback")]
+    audio_stream: Option<(OutputStream, OutputStreamHandle)>,
     #[cfg(feature = "audio_playback")]
     audio_sink: Option<Sink>,
-    is_playing: bool,
     current_position_samples: usize,
     waveform_hover_position: Option<f32>,
     playback_start_time: Option<Instant>,
@@ -94,9 +107,12 @@ impl Default for VoyagerApp {
             params: DecoderParams::default(),
             last_decoded: None,
             selected_channel: WaveformChannel::Left,
+            audio_state: AudioPlaybackState::Uninitialized,
+            audio_metrics: AudioMetrics::default(),
+            #[cfg(feature = "audio_playback")]
+            audio_stream: None,
             #[cfg(feature = "audio_playback")]
             audio_sink: None,
-            is_playing: false,
             current_position_samples: 0,
             waveform_hover_position: None,
             playback_start_time: None,
@@ -115,9 +131,12 @@ impl VoyagerApp {
                     self.wav_reader = Some(reader);
                     self.image_texture = None;
                     self.last_decoded = None;
+                    // Update audio state to Ready when WAV is loaded
+                    self.audio_state = AudioPlaybackState::Ready;
                 }
                 Err(e) => {
                     eprintln!("Failed to load WAV file: {}", e);
+                    self.audio_state = AudioPlaybackState::Uninitialized;
                 }
             }
         }
@@ -139,44 +158,89 @@ impl VoyagerApp {
         }
     }
 
+    #[cfg(feature = "audio_playback")]
+    /// Ensure audio stream is initialized, return OutputStreamHandle if available
+    fn ensure_audio_stream(&mut self) -> Option<OutputStreamHandle> {
+        if self.audio_stream.is_none() {
+            match OutputStream::try_default() {
+                Ok((stream, handle)) => {
+                    self.audio_stream = Some((stream, handle.clone()));
+                    Some(handle)
+                }
+                Err(e) => {
+                    eprintln!("Failed to initialize audio stream: {}", e);
+                    self.audio_state = AudioPlaybackState::Error(AudioError::StreamInitFailed);
+                    self.audio_metrics.record_device_error();
+                    None
+                }
+            }
+        } else {
+            // Return cloned handle from existing stream
+            self.audio_stream.as_ref().map(|(_, handle)| handle.clone())
+        }
+    }
+
     fn toggle_playback(&mut self) {
         #[cfg(feature = "audio_playback")]
         {
-            if self.is_playing {
-                // Pause playback
-                if let Some(sink) = &self.audio_sink {
-                    sink.pause();
+            match self.audio_state {
+                AudioPlaybackState::Playing => {
+                    // Pause playback
+                    if let Some(sink) = &self.audio_sink {
+                        sink.pause();
+                    }
+                    self.audio_state = AudioPlaybackState::Paused;
+                    self.audio_metrics.record_pause();
+                    println!("Pausing playback...");
                 }
-                self.is_playing = false;
-                println!("Pausing playback...");
-            } else {
-                // Start or resume playback
-                if self.wav_reader.is_none() {
-                    return;
-                }
-
-                // If we already have a sink, just resume it
-                if let Some(sink) = &self.audio_sink {
-                    if sink.is_paused() {
+                AudioPlaybackState::Paused => {
+                    // Resume playback
+                    if let Some(sink) = &self.audio_sink {
                         sink.play();
-                        self.is_playing = true;
+                        self.audio_state = AudioPlaybackState::Playing;
                         self.playback_start_time = Some(Instant::now());
+                        self.audio_metrics.record_play();
                         println!("Resuming playback...");
-                        return;
                     }
                 }
+                AudioPlaybackState::Ready => {
+                    // Start fresh playback
+                    if self.wav_reader.is_none() {
+                        return;
+                    }
 
-                // Create a new sink and buffer source
-                let (sink, _output) = Sink::new();
-                if let Some(source) = self.make_buffer_source_from_current_position() {
-                    sink.append(source);
-                    sink.play();
-                    self.audio_sink = Some(sink);
-                    self.is_playing = true;
-                    self.playback_start_time = Some(Instant::now());
-                    println!("Starting playback...");
-                } else {
-                    eprintln!("No audio samples available to start playback");
+                    // Ensure audio stream is available
+                    let handle = match self.ensure_audio_stream() {
+                        Some(h) => h,
+                        None => return, // Error already logged in ensure_audio_stream
+                    };
+
+                    // Create sink with the handle
+                    match Sink::try_new(&handle) {
+                        Ok(sink) => {
+                            if let Some(source) = self.make_buffer_source_from_current_position() {
+                                sink.append(source);
+                                sink.play();
+                                self.audio_sink = Some(sink);
+                                self.audio_state = AudioPlaybackState::Playing;
+                                self.playback_start_time = Some(Instant::now());
+                                self.audio_metrics.record_play();
+                                println!("Starting playback...");
+                            } else {
+                                eprintln!("No audio samples available to start playback");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to create audio sink: {}", e);
+                            self.audio_state =
+                                AudioPlaybackState::Error(AudioError::SinkCreationFailed);
+                            self.audio_metrics.record_device_error();
+                        }
+                    }
+                }
+                AudioPlaybackState::Uninitialized | AudioPlaybackState::Error(_) => {
+                    // Can't play in these states
+                    println!("Cannot play: {}", self.audio_state);
                 }
             }
         }
@@ -184,12 +248,19 @@ impl VoyagerApp {
         #[cfg(not(feature = "audio_playback"))]
         {
             // Visual-only playback simulation
-            self.is_playing = !self.is_playing;
-            if self.is_playing {
-                self.playback_start_time = Some(Instant::now());
-                println!("Starting visual playback...");
-            } else {
-                println!("Pausing visual playback...");
+            match self.audio_state {
+                AudioPlaybackState::Ready | AudioPlaybackState::Paused => {
+                    self.audio_state = AudioPlaybackState::Playing;
+                    self.playback_start_time = Some(Instant::now());
+                    self.audio_metrics.record_play();
+                    println!("Starting visual playback...");
+                }
+                AudioPlaybackState::Playing => {
+                    self.audio_state = AudioPlaybackState::Paused;
+                    self.audio_metrics.record_pause();
+                    println!("Pausing visual playback...");
+                }
+                _ => {}
             }
         }
     }
@@ -204,7 +275,12 @@ impl VoyagerApp {
         }
 
         // Reset playback state
-        self.is_playing = false;
+        if self.wav_reader.is_some() {
+            self.audio_state = AudioPlaybackState::Ready;
+        } else {
+            self.audio_state = AudioPlaybackState::Uninitialized;
+        }
+        self.audio_metrics.record_stop();
         self.current_position_samples = 0;
         self.playback_start_time = None;
         println!("Stopping playback...");
@@ -256,7 +332,7 @@ impl VoyagerApp {
                 self.restart_audio_from_current_position();
 
                 #[cfg(not(feature = "audio_playback"))]
-                if self.is_playing {
+                if self.audio_state.is_playing() {
                     self.playback_start_time = Some(Instant::now());
                 }
             } else {
@@ -266,20 +342,24 @@ impl VoyagerApp {
     }
 
     #[cfg(feature = "audio_playback")]
-    /// Create an AudioBufferSource from the current position in the selected channel
+    /// Create an AudioBufferSource from the current position in the selected channel (zero-copy)
     fn make_buffer_source_from_current_position(&self) -> Option<AudioBufferSource> {
         let reader = self.wav_reader.as_ref()?;
-        let samples = reader.get_samples(self.selected_channel);
 
-        if self.current_position_samples >= samples.len() {
+        // Get the Arc buffer for the selected channel
+        let buffer = match self.selected_channel {
+            WaveformChannel::Left => Arc::clone(&reader.left_channel),
+            WaveformChannel::Right => Arc::clone(&reader.right_channel),
+        };
+
+        if self.current_position_samples >= buffer.len() {
             return None;
         }
 
-        // Slice samples from current position to end
-        let remaining_samples = samples[self.current_position_samples..].to_vec();
-
+        // Use Arc + offset instead of cloning - zero-copy seek!
         Some(AudioBufferSource::new(
-            remaining_samples,
+            buffer,
+            self.current_position_samples,
             reader.sample_rate,
             1, // Mono playback (we've already selected a channel)
         ))
@@ -288,7 +368,7 @@ impl VoyagerApp {
     #[cfg(feature = "audio_playback")]
     /// Restart audio playback from the current position (used when seeking)
     fn restart_audio_from_current_position(&mut self) {
-        if !self.is_playing {
+        if !self.audio_state.is_playing() {
             return;
         }
 
@@ -297,15 +377,33 @@ impl VoyagerApp {
             sink.stop();
         }
 
+        // Ensure audio stream is available
+        let handle = match self.ensure_audio_stream() {
+            Some(h) => h,
+            None => {
+                self.audio_state = AudioPlaybackState::Error(AudioError::StreamInitFailed);
+                return;
+            }
+        };
+
         // Create new sink with source from current position
-        let (sink, _output) = Sink::new();
-        if let Some(source) = self.make_buffer_source_from_current_position() {
-            sink.append(source);
-            sink.play();
-            self.audio_sink = Some(sink);
-            self.playback_start_time = Some(Instant::now());
-        } else {
-            eprintln!("No audio samples available after seek");
+        match Sink::try_new(&handle) {
+            Ok(sink) => {
+                if let Some(source) = self.make_buffer_source_from_current_position() {
+                    sink.append(source);
+                    sink.play();
+                    self.audio_sink = Some(sink);
+                    self.playback_start_time = Some(Instant::now());
+                    self.audio_metrics.record_seek();
+                } else {
+                    eprintln!("No audio samples available after seek");
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to create audio sink after seek: {}", e);
+                self.audio_state = AudioPlaybackState::Error(AudioError::SinkCreationFailed);
+                self.audio_metrics.record_device_error();
+            }
         }
     }
 
@@ -391,7 +489,7 @@ impl VoyagerApp {
 impl eframe::App for VoyagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Update playback position if playing
-        if self.is_playing {
+        if self.audio_state.is_playing() {
             if let (Some(start_time), Some(wav_reader)) =
                 (self.playback_start_time, &self.wav_reader)
             {
@@ -415,7 +513,7 @@ impl eframe::App for VoyagerApp {
         }
 
         // Request continuous repaints during playback for position updates
-        if self.is_playing {
+        if self.audio_state.is_playing() {
             ctx.request_repaint();
         }
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
@@ -463,6 +561,12 @@ impl eframe::App for VoyagerApp {
 
         egui::TopBottomPanel::bottom("debug_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // Audio status indicator
+                let status_icon = self.audio_state.status_icon();
+                let status_message = self.audio_state.status_message();
+                ui.label(format!("{} {}", status_icon, status_message));
+                ui.separator();
+
                 if let Some(reader) = &self.wav_reader {
                     let duration_secs =
                         reader.left_channel.len() as f32 / reader.sample_rate as f32;
@@ -514,7 +618,7 @@ impl eframe::App for VoyagerApp {
 
                 // Playback controls
                 ui.horizontal(|ui| {
-                    let play_button_text = if self.is_playing {
+                    let play_button_text = if self.audio_state.is_playing() {
                         "⏸ Pause"
                     } else {
                         "▶ Play"
@@ -565,7 +669,9 @@ impl eframe::App for VoyagerApp {
                     let rect = response.rect;
 
                     // Handle mouse interaction for seeking
-                    let mut should_restart_audio = false;
+                    #[cfg(feature = "audio_playback")]
+                    let should_restart_audio = response.clicked() && self.audio_state.is_playing();
+
                     if response.clicked() {
                         let click_pos = response.interact_pointer_pos().unwrap_or_default();
                         let relative_x = (click_pos.x - rect.min.x) / rect.width();
@@ -575,14 +681,8 @@ impl eframe::App for VoyagerApp {
                             seek_sample.min(samples_len.saturating_sub(1));
                         println!("Seeking to sample: {}", self.current_position_samples);
 
-                        // Mark that we need to restart audio after drawing
-                        #[cfg(feature = "audio_playback")]
-                        if self.is_playing {
-                            should_restart_audio = true;
-                        }
-
                         #[cfg(not(feature = "audio_playback"))]
-                        if self.is_playing {
+                        if self.audio_state.is_playing() {
                             self.playback_start_time = Some(Instant::now());
                         }
                     }

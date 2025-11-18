@@ -1,9 +1,10 @@
 use hound::WavReader as HoundReader;
 use std::path::Path;
+use std::sync::Arc;
 
 pub struct WavReader {
-    pub left_channel: Vec<f32>,
-    pub right_channel: Vec<f32>,
+    pub left_channel: Arc<[f32]>,
+    pub right_channel: Arc<[f32]>,
     pub sample_rate: u32,
     pub channels: u16,
 }
@@ -24,8 +25,9 @@ impl WavReader {
 
         let (left_channel, right_channel) = match spec.channels {
             1 => {
-                // Mono: duplicate to both channels
-                (samples.clone(), samples)
+                // Mono: duplicate to both channels (convert to Arc)
+                let arc_samples: Arc<[f32]> = samples.into();
+                (Arc::clone(&arc_samples), arc_samples)
             }
             2 => {
                 // Stereo: split interleaved samples
@@ -37,7 +39,7 @@ impl WavReader {
                     right.push(chunk[1]);
                 }
 
-                (left, right)
+                (left.into(), right.into())
             }
             _ => unreachable!(),
         };
@@ -124,8 +126,8 @@ mod tests {
             .map(|&s| s as f32 / i16::MAX as f32)
             .collect();
 
-        assert_eq!(reader.left_channel, expected_normalized);
-        assert_eq!(reader.right_channel, expected_normalized); // Mono duplicated to both channels
+        assert_eq!(reader.left_channel.as_ref(), expected_normalized.as_slice());
+        assert_eq!(reader.right_channel.as_ref(), expected_normalized.as_slice()); // Mono duplicated to both channels
     }
 
     #[test]
@@ -152,8 +154,8 @@ mod tests {
             6000.0 / i16::MAX as f32,
         ];
 
-        assert_eq!(reader.left_channel, expected_left);
-        assert_eq!(reader.right_channel, expected_right);
+        assert_eq!(reader.left_channel.as_ref(), expected_left.as_slice());
+        assert_eq!(reader.right_channel.as_ref(), expected_right.as_slice());
     }
 
     #[test]

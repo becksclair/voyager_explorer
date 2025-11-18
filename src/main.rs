@@ -7,6 +7,7 @@ mod app;
 use app::VoyagerApp;
 
 pub mod audio;
+pub mod audio_state;
 pub mod image_output;
 pub mod sstv;
 pub mod utils;

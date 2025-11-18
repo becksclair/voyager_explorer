@@ -2,13 +2,6 @@
 
 ## Now (Milestone 2 - Non-blocking Decoding)
 
-- [ ] Milestone 1 follow-up: rodio/audio_state alignment (src/app.rs + src/audio_state.rs)
-  - [ ] Integrate `AudioPlaybackState` and `AudioMetrics` into `VoyagerApp` (replace bare `is_playing` / manual counters).
-  - [ ] Update rodio wiring to use `OutputStreamBuilder::open_default_stream()` returning `(OutputStream, OutputStreamHandle)` and `Sink::try_new(&handle)` (TODO: confirm the exact `rodio` crate version in `Cargo.toml` and verify these function signatures against the docs before changing code).
-  - [ ] Switch `AudioBufferSource` to use shared `Arc<[f32]>` (zero-copy seeks) instead of cloning `Vec<f32>` for each seek (TODO: confirm this layout works with the current seeking implementation and any downstream consumers of the audio buffer).
-  - [ ] Add a basic audio status indicator in the debug panel using `AudioPlaybackState::status_icon` / `status_message` (TODO: ensure these methods are implemented as part of the integration task above before wiring up the UI).
-  - [ ] Run QA: `cargo test`, `cargo fmt`, `cargo clippy`, `cargo check`, and manual smoke with `cargo run --features audio_playback` (reminder: run the API verification TODOs above before coding).
-
 - [ ] Milestone 2: Non-blocking decoding & performance (src/app.rs)
   - [ ] Define `DecodeRequest` and `DecodeResult` message structs
   - [ ] Add channels (`decode_tx`, `decode_rx`) to VoyagerApp
@@ -59,6 +52,18 @@
   - [x] Update seek operations (waveform click + skip to sync) to restart audio
   - [x] Ensure feature flag behavior (builds with/without `audio_playback`)
   - [x] Tests pass and code compiles both with and without feature
+
+- [x] Milestone 1 follow-up: rodio/audio_state alignment (src/app.rs + src/audio_state.rs + src/audio.rs)
+  - [x] Integrate `AudioPlaybackState` and `AudioMetrics` into `VoyagerApp` (replaced bare `is_playing` with state machine)
+  - [x] Update rodio wiring to use `OutputStream::try_default()` and `Sink::try_new(&handle)` (rodio 0.21 API)
+  - [x] Switch `AudioBufferSource` to use shared `Arc<[f32]>` (zero-copy seeks) - eliminates O(n) clone per seek
+  - [x] Convert `WavReader` fields to `Arc<[f32]>` for efficient buffer sharing
+  - [x] Add audio status indicator in debug panel using `AudioPlaybackState::status_icon()` / `status_message()`
+  - [x] Update all state checks throughout app.rs to use `audio_state.is_playing()`
+  - [x] Refactor `toggle_playback()`, `stop_playback()`, `restart_audio_from_current_position()` for state machine
+  - [x] Add metrics recording (play/pause/stop/seek counts)
+  - [x] Fix feature-gated imports to eliminate clippy warnings
+  - [x] All tests pass (48 tests), zero clippy warnings, cargo check succeeds
 
 ---
 

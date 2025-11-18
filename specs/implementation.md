@@ -135,17 +135,19 @@ All milestones that require audio for tests or manual QA should use **synthetic 
 - Prefer short, deterministic signals (sync tones, noise+sync, alternating stripe patterns, stereo differentiation) so tests remain fast and self-explanatory.
 - If a fixed "golden" signal is needed, embed raw `i16` samples as a `const` array and wrap them into a temporary WAV via the existing helpers.
 
-### 0.7. Current Implementation Status (2025-11-18)
+### 0.7. Current Implementation Status (2025-11-18 - Updated)
 
-- **Milestone 1 – Real Audio Playback via rodio**
-  - Implemented:
-    - `AudioBufferSource`, `audio_stream`, and `audio_sink` fields in `VoyagerApp` behind the `audio_playback` feature.
+- **Milestone 1 – Real Audio Playback via rodio** ✅ **COMPLETED**
+  - Fully implemented:
+    - `AudioBufferSource`, `audio_stream: Option<(OutputStream, OutputStreamHandle)>`, and `audio_sink` fields in `VoyagerApp` behind the `audio_playback` feature.
     - Synthetic audio fixtures in `src/test_fixtures.rs` and audio-focused tests in `tests/audio_playback_tests.rs`.
-    - `audio_state.rs` and `AudioMetrics` providing an explicit playback state machine and observability primitives.
-  - Still missing / misaligned:
-    - `VoyagerApp` continues to track playback with a bare `is_playing: bool` and does not yet use `AudioPlaybackState` / `AudioMetrics`.
-    - Rodio integration needs to be aligned with `rodio` 0.21 APIs (`OutputStreamBuilder`, `OutputStreamHandle`, and `Sink::try_new`).
-    - `AudioBufferSource` still clones `Vec<f32>` on seek instead of using shared `Arc<[f32]>` buffers, which limits large-file performance.
+    - `audio_state.rs` with `AudioPlaybackState` enum and `AudioMetrics` providing an explicit playback state machine and observability.
+    - **Zero-copy audio buffers**: `WavReader` uses `Arc<[f32]>` for `left_channel` and `right_channel`, eliminating O(n) clones on every seek.
+    - **Rodio 0.21 API alignment**: Uses `OutputStream::try_default()` → `(OutputStream, OutputStreamHandle)` and `Sink::try_new(&handle)`.
+    - **State machine integration**: `VoyagerApp` now uses `audio_state: AudioPlaybackState` instead of bare `is_playing: bool`.
+    - **Metrics tracking**: All playback operations (play, pause, stop, seek) recorded via `audio_metrics`.
+    - **UI status indicator**: Debug panel shows audio state with icons (🔊 ▶️ ⏸️ ⚠️) and messages.
+    - **Feature flag support**: Builds and tests pass with and without `audio_playback` feature (48 tests pass, zero clippy warnings).
 
 - **Milestone 2 – Non-blocking Decoding & Performance**
   - `decode_at_position` runs entirely on the UI thread, and there is no background decoding worker or message-passing yet.
