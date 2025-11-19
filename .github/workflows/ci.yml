@@ -45,16 +45,16 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Run clippy
-        run: cargo clippy --no-default-features --features test_fixtures --all-targets -- -D warnings
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --no-default-features --features test_fixtures --verbose
+        run: cargo build --no-default-features --verbose
 
       - name: Run tests
-        run: cargo test --no-default-features --features test_fixtures --verbose
+        run: cargo test --no-default-features --verbose
 
       - name: Check
-        run: cargo check --no-default-features --features test_fixtures
+        run: cargo check --no-default-features
 
   # Test with audio_playback feature (requires ALSA on Linux)
   test-with-audio:
@@ -92,16 +92,16 @@ jobs:
           key: ${{ runner.os }}-target-with-audio-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run clippy with audio
-        run: cargo clippy --features test_fixtures,audio_playback --all-targets -- -D warnings
+        run: cargo clippy --features audio_playback --all-targets -- -D warnings
 
       - name: Build with audio
-        run: cargo build --features test_fixtures,audio_playback --verbose
+        run: cargo build --features audio_playback --verbose
 
       - name: Run tests with audio
-        run: cargo test --features test_fixtures,audio_playback --verbose
+        run: cargo test --features audio_playback --verbose
 
       - name: Check with audio
-        run: cargo check --features test_fixtures,audio_playback
+        run: cargo check --features audio_playback
 
   # Cross-platform build verification
   build-cross-platform:
@@ -118,6 +118,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libasound2-dev pkg-config
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkg-config
+
+      - name: Install system dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # Windows audio dependencies are typically included with the toolchain
+          # No additional packages needed for basic audio playback
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -141,10 +152,16 @@ jobs:
           key: ${{ runner.os }}-target-build-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build (no audio)
-        run: cargo build --no-default-features --features test_fixtures --verbose
+        run: cargo build --no-default-features --verbose
 
       - name: Build (with audio)
-        run: cargo build --features test_fixtures,audio_playback --verbose
+        run: cargo build --features audio_playback --verbose
+
+      - name: Test (no audio)
+        run: cargo test --no-default-features --verbose
+
+      - name: Test (with audio)
+        run: cargo test --features audio_playback --verbose
 
   # Documentation build check
   docs:
@@ -169,7 +186,12 @@ jobs:
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build documentation
-        run: cargo doc --no-deps --no-default-features --features test_fixtures
+        run: cargo doc --no-deps --no-default-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+      - name: Build documentation (with audio)
+        run: cargo doc --no-deps --features audio_playback
         env:
           RUSTDOCFLAGS: -D warnings
 
