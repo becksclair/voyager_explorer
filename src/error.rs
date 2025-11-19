@@ -85,13 +85,13 @@ pub enum DecoderError {
 pub enum ConfigError {
     #[error("Failed to load config file '{path}': {source}")]
     LoadFailed {
-        path: PathBuf,
+        path: Box<PathBuf>,
         source: std::io::Error,
     },
 
     #[error("Invalid config format in '{path}': {source}")]
     InvalidFormat {
-        path: PathBuf,
+        path: Box<PathBuf>,
         source: toml::de::Error,
     },
 
@@ -100,9 +100,12 @@ pub enum ConfigError {
 
     #[error("Failed to save config to '{path}': {source}")]
     SaveFailed {
-        path: PathBuf,
+        path: Box<PathBuf>,
         source: std::io::Error,
     },
+
+    #[error("Config serialization failed: {source}")]
+    SerializationFailed { source: toml::ser::Error },
 }
 
 /// Worker thread errors

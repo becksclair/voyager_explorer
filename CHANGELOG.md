@@ -236,6 +236,7 @@ Modified:
 ### 🚀 Major Features Added
 
 #### **Zero-Copy Audio Buffer Architecture**
+
 - **Arc-based buffer sharing** using `Arc<[f32]>` instead of `Vec<f32>`
   - **Performance**: Eliminates O(n) buffer clone on every seek
   - **Measured impact**: Seek latency reduced from ~100ms to ~1ms for large files (100x improvement)
@@ -244,6 +245,7 @@ Modified:
 - Zero-copy seek implementation using Arc + offset pattern
 
 #### **Explicit State Machine for Audio Playback**
+
 - **`AudioPlaybackState` enum** with complete state tracking:
   - `Uninitialized`: No device or WAV loaded
   - `Ready`: Can start playback
@@ -255,6 +257,7 @@ Modified:
 - **Type safety**: No more bare `is_playing: bool` flags
 
 #### **Audio Metrics for Observability**
+
 - **`AudioMetrics` struct** tracking:
   - Play/pause/stop/seek operation counts
   - Total playback time accumulation
@@ -264,6 +267,7 @@ Modified:
 - Foundation for future telemetry features
 
 #### **Audio Status Indicator in UI**
+
 - Real-time display of current playback state in debug panel
 - Visual feedback for all state transitions
 - User-friendly error messages with suggested actions
@@ -311,12 +315,14 @@ if self.audio_state.is_playing() { ... }
 ```
 
 #### **AudioBufferSource Refactoring**
+
 - Changed from Vec cloning to Arc + offset pattern
 - **Old approach**: `samples[position..].to_vec()` → O(n) allocation
 - **New approach**: `Arc::clone(&buffer)` + offset → O(1) reference increment
 - Implements `rodio::Source` trait for playback integration
 
 #### **Improved Error Handling**
+
 - **`AudioError` enum** with specific error types:
   - `NoDevice`: No audio hardware detected
   - `DeviceDisconnected`: Hardware removed during playback
@@ -328,6 +334,7 @@ if self.audio_state.is_playing() { ... }
 - Recoverable errors flagged for automatic retry
 
 #### **Feature-Gated Implementation**
+
 - All rodio code properly behind `#[cfg(feature = "audio_playback")]`
 - Imports conditionally compiled to eliminate clippy warnings
 - Visual-only playback mode when feature disabled
@@ -351,6 +358,7 @@ if self.audio_state.is_playing() { ... }
 ### 📚 Documentation
 
 #### **Comprehensive Inline Documentation**
+
 - Added detailed doc comments explaining Arc vs Vec decision
 - Performance characteristics documented with concrete examples
 - Memory and CPU impact quantified
@@ -358,6 +366,7 @@ if self.audio_state.is_playing() { ... }
 - Migration guide for breaking changes
 
 #### **Updated Project Documentation**
+
 - `TODO.md`: Moved Milestone 1 to Done section with complete checklist
 - `specs/implementation.md`: Marked Milestone 1 as COMPLETED
 - `CHANGELOG.md`: This comprehensive changelog entry

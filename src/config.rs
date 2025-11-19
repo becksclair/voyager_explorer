@@ -1,6 +1,6 @@
 //! Application configuration system with TOML persistence.
 //!
-//! Supports loading from file, environment variables, and sensible defaults.
+//! Supports loading from file with sensible defaults.
 
 use crate::error::{ConfigError, Result};
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 /// Top-level application configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct AppConfig {
     /// Decoder configuration
     pub decoder: DecoderConfig,
@@ -28,6 +29,7 @@ pub struct AppConfig {
 
 /// SSTV decoder configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DecoderConfig {
     /// Default line duration in milliseconds (1.0-100.0)
     pub default_line_duration_ms: f32,
@@ -50,6 +52,7 @@ pub struct DecoderConfig {
 
 /// UI configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UiConfig {
     /// Fixed image width in pixels
     pub image_width: usize,
@@ -70,6 +73,7 @@ pub struct UiConfig {
 /// Audio playback configuration
 #[cfg(feature = "audio_playback")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AudioConfig {
     /// Audio buffer size in samples
     pub buffer_size: usize,
@@ -83,6 +87,7 @@ pub struct AudioConfig {
 
 /// Worker thread configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WorkerConfig {
     /// Maximum queue size for pending decode requests
     pub max_queue_size: usize,
@@ -99,6 +104,7 @@ pub struct WorkerConfig {
 
 /// Metrics configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MetricsConfig {
     /// Enable metrics collection
     pub enabled: bool,
@@ -173,15 +179,18 @@ impl Default for MetricsConfig {
 
 impl AppConfig {
     /// Load configuration from TOML file
+    /// 
+    /// Partial TOML files are supported - missing fields will be filled with default values
+    /// from the Default implementations of each config struct.
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::LoadFailed {
-            path: path.to_path_buf(),
+            path: Box::new(path.to_path_buf()),
             source,
         })?;
 
         toml::from_str(&contents).map_err(|source| ConfigError::InvalidFormat {
-            path: path.to_path_buf(),
+            path: Box::new(path.to_path_buf()),
             source,
         })
     }
@@ -201,16 +210,17 @@ impl AppConfig {
         // Create parent directory if needed
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|source| ConfigError::SaveFailed {
-                path: path.to_path_buf(),
+                path: Box::new(path.to_path_buf()),
                 source,
             })?;
         }
 
-        let contents =
-            toml::to_string_pretty(self).expect("Config serialization should never fail");
+        let contents = toml::to_string_pretty(self).map_err(|source| ConfigError::SerializationFailed {
+            source,
+        })?;
 
         std::fs::write(path, contents).map_err(|source| ConfigError::SaveFailed {
-            path: path.to_path_buf(),
+            path: Box::new(path.to_path_buf()),
             source,
         })
     }
@@ -276,35 +286,33 @@ impl AppConfig {
 mod dirs {
     use std::path::PathBuf;
 
+    #[cfg(target_os = "linux")]
     pub fn config_dir() -> Option<PathBuf> {
-        #[cfg(target_os = "linux")]
-        {
-            std::env::var("XDG_CONFIG_HOME")
-                .ok()
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var("HOME")
-                        .ok()
-                        .map(|h| PathBuf::from(h).join(".config"))
-                })
-        }
+        std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".config"))
+            })
+    }
 
-        #[cfg(target_os = "macos")]
-        {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join("Library/Application Support"))
-        }
+    #[cfg(target_os = "macos")]
+    pub fn config_dir() -> Option<PathBuf> {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| PathBuf::from(h).join("Library/Application Support"))
+    }
 
-        #[cfg(target_os = "windows")]
-        {
-            std::env::var("APPDATA").ok().map(PathBuf::from)
-        }
+    #[cfg(target_os = "windows")]
+    pub fn config_dir() -> Option<PathBuf> {
+        std::env::var("APPDATA").ok().map(PathBuf::from)
+    }
 
-        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        {
-            None
-        }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    pub fn config_dir() -> Option<PathBuf> {
+        dirs::config_dir()
     }
 }
 
@@ -358,6 +366,50 @@ mod tests {
         assert!(config.validate().is_err());
 
         config.decoder.fft_chunk_size = 2048; // Power of 2
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_load_from_file_with_defaults() {
+        // Test that config loads from TOML file and falls back to defaults
+        let toml_content = r#"
+[decoder]
+default_line_duration_ms = 10.0
+
+[ui]
+image_width = 256
+"#;
+
+        let temp_file = tempfile::NamedTempFile::new().expect("Should create temp file");
+        std::fs::write(temp_file.path(), toml_content).expect("Should write to temp file");
+
+        let config = AppConfig::load_from_file(temp_file.path()).expect("Should load config");
+        
+        // File-loaded values should override defaults
+        assert_eq!(config.decoder.default_line_duration_ms, 10.0);
+        assert_eq!(config.ui.image_width, 256);
+        
+        // Unspecified values should use defaults from struct field definitions
+        assert_eq!(config.decoder.default_threshold, 0.2); // Default from DecoderConfig::default()
+        assert_eq!(config.ui.max_image_height, 16384); // Default from UiConfig::default()
+        assert_eq!(config.ui.waveform_height, 200.0); // Default from UiConfig::default()
+        
+        // Config should be valid
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_load_or_default_fallback() {
+        // Test that load_or_default falls back to defaults when file doesn't exist
+        let nonexistent_path = "nonexistent_config.toml";
+        let config = AppConfig::load_or_default(nonexistent_path);
+        
+        // Should get all default values
+        let default_config = AppConfig::default();
+        assert_eq!(config.decoder.default_line_duration_ms, default_config.decoder.default_line_duration_ms);
+        assert_eq!(config.ui.image_width, default_config.ui.image_width);
+        
+        // Config should be valid
         assert!(config.validate().is_ok());
     }
 }

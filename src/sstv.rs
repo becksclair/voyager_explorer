@@ -531,7 +531,10 @@ mod tests {
                 samples in random_samples(1000, 10_000),
                 invalid_duration in prop::num::f32::ANY.prop_filter(
                     "Not in valid range",
-                    |&d| d < 1.0 || d > 100.0 || d.is_nan()
+                    |&d| {
+                        let valid_range = 1.0f32..=100.0;
+                        !valid_range.contains(&d) || d.is_nan()
+                    }
                 ),
                 sample_rate in valid_sample_rate()
             ) {
@@ -551,7 +554,10 @@ mod tests {
                 samples in random_samples(1000, 10_000),
                 invalid_threshold in prop::num::f32::ANY.prop_filter(
                     "Not in valid range",
-                    |&t| t < 0.0 || t > 1.0 || t.is_nan()
+                    |&t| {
+                        let valid_range = 0.0f32..=1.0;
+                        !valid_range.contains(&t) || t.is_nan()
+                    }
                 ),
                 sample_rate in valid_sample_rate()
             ) {

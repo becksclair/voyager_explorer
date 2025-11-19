@@ -3,9 +3,9 @@ use hound::WavReader as HoundReader;
 use std::path::Path;
 use std::sync::Arc;
 
-/// WAV file reader with normalized f32 samples and zero-copy buffer sharing.
+/// WAV file reader with normalized `f32` samples and zero-copy buffer sharing.
 ///
-/// # Architecture Decision: Arc<[f32]> vs Vec<f32>
+/// # Architecture Decision: Arc&lt;[f32]&gt; vs Vec&lt;f32&gt;
 ///
 /// This struct uses `Arc<[f32]>` instead of `Vec<f32>` for the audio buffers to enable
 /// efficient zero-copy sharing with audio playback components.
@@ -24,7 +24,7 @@ use std::sync::Arc;
 /// # Sample Normalization
 ///
 /// All samples are normalized to f32 in the range `[-1.0, 1.0]` for consistent
-/// processing regardless of the input WAV format (8-bit, 16-bit, 24-bit, etc.).
+/// processing. Currently only 16-bit PCM WAV files are supported.
 pub struct WavReader {
     /// Left channel samples (or mono channel for mono files).
     /// Shared via Arc for zero-copy playback.

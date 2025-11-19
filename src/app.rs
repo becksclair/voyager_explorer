@@ -1,5 +1,5 @@
 use crate::audio::{WavReader, WaveformChannel};
-use crate::audio_state::{AudioMetrics as OldAudioMetrics, AudioPlaybackState};
+use crate::audio_state::AudioPlaybackState;
 use crate::config::AppConfig;
 use crate::error::VoyagerError;
 use crate::image_output::image_from_pixels;
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use crate::audio_state::AudioError;
 
 #[cfg(feature = "audio_playback")]
-use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
+use rodio::{OutputStream, OutputStreamBuilder, Sink, Source};
 
 /// Request to decode audio samples in background thread.
 ///
@@ -173,12 +173,12 @@ pub struct VoyagerApp {
 
     // Audio playback state
     audio_state: AudioPlaybackState,
-    old_audio_metrics: OldAudioMetrics, // Keep for compatibility, will migrate
     #[cfg(feature = "audio_playback")]
-    audio_stream: Option<(OutputStream, OutputStreamHandle)>,
+    audio_stream: Option<OutputStream>,
     #[cfg(feature = "audio_playback")]
     audio_sink: Option<Sink>,
     current_position_samples: usize,
+    last_decode_position: usize,
     waveform_hover_position: Option<f32>,
     playback_start_time: Option<Instant>,
 
@@ -248,7 +248,7 @@ fn spawn_decode_worker() -> (
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Decode failed");
-                    (Vec::new(), Some(e.to_string()))
+                    (Vec::new(), Some(format!("{}", e)))
                 }
             };
 
@@ -302,13 +302,13 @@ impl Default for VoyagerApp {
             params,
             last_decoded: None,
             selected_channel: WaveformChannel::Left,
-            audio_state: AudioPlaybackState::Uninitialized,
-            old_audio_metrics: OldAudioMetrics::default(),
+            audio_state: AudioPlaybackState::Ready,
             #[cfg(feature = "audio_playback")]
             audio_stream: None,
             #[cfg(feature = "audio_playback")]
             audio_sink: None,
             current_position_samples: 0,
+            last_decode_position: 0,
             waveform_hover_position: None,
             playback_start_time: None,
             decode_tx: Some(decode_tx),
@@ -337,8 +337,9 @@ impl VoyagerApp {
                     self.last_decoded = None;
                     // Update audio state to Ready when WAV is loaded
                     self.audio_state = AudioPlaybackState::Ready;
-                    // Clear any previous error
+                    // Clear any previous error and reset decode position
                     self.error_message = None;
+                    self.last_decode_position = 0;
                 }
                 Err(e) => {
                     tracing::error!(path = %path.display(), error = %e, "Failed to load WAV file");
@@ -357,6 +358,9 @@ impl VoyagerApp {
     fn handle_decode(&mut self, ctx: &egui::Context) {
         if let Some(reader) = &self.wav_reader {
             let samples = reader.get_samples(self.selected_channel);
+            
+            // Clear any previous errors
+            self.error_message = None;
 
             // Detect sync presence
             let sync_detected = self
@@ -374,13 +378,16 @@ impl VoyagerApp {
                     let img = image_from_pixels(&pixels);
                     self.image_texture = Some(ctx.load_texture("decoded", img, Default::default()));
                     self.last_decoded = Some(pixels);
-                    self.error_message = None; // Clear any previous error
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Decode failed");
                     self.error_message = Some(format!("Decode failed: {}", e));
+                    self.image_texture = None;
+                    self.last_decoded = None;
                 }
             }
+        } else {
+            self.error_message = Some("No audio file loaded".to_string());
         }
     }
 
@@ -446,25 +453,25 @@ impl VoyagerApp {
     }
 
     #[cfg(feature = "audio_playback")]
-    /// Ensure audio stream is initialized, return OutputStreamHandle if available
-    fn ensure_audio_stream(&mut self) -> Option<OutputStreamHandle> {
+    fn ensure_audio_stream(&mut self) -> Option<&OutputStream> {
         if self.audio_stream.is_none() {
-            match OutputStream::try_default() {
-                Ok((stream, handle)) => {
-                    self.audio_stream = Some((stream, handle.clone()));
-                    Some(handle)
+            match OutputStreamBuilder::open_default_stream() {
+                Ok(stream) => {
+                    self.audio_stream = Some(stream);
                 }
                 Err(e) => {
                     tracing::error!("Failed to initialize audio stream: {}", e);
                     self.audio_state = AudioPlaybackState::Error(AudioError::StreamInitFailed);
-                    self.old_audio_metrics.record_device_error();
-                    None
+                    return None;
                 }
             }
-        } else {
-            // Return cloned handle from existing stream
-            self.audio_stream.as_ref().map(|(_, handle)| handle.clone())
         }
+
+        self.audio_stream.as_ref()
+    }
+    #[cfg(not(feature = "audio_playback"))]
+    fn ensure_audio_stream(&mut self) -> Option<&OutputStream> {
+        None
     }
 
     fn toggle_playback(&mut self) {
@@ -475,10 +482,12 @@ impl VoyagerApp {
                     // Pause playback
                     if let Some(sink) = &self.audio_sink {
                         sink.pause();
+                        self.audio_state = AudioPlaybackState::Paused;
+                        tracing::info!("Pausing playback");
+                    } else {
+                        tracing::warn!("Cannot pause: no audio sink available");
+                        self.audio_state = AudioPlaybackState::Error(AudioError::SinkNotAvailable);
                     }
-                    self.audio_state = AudioPlaybackState::Paused;
-                    self.old_audio_metrics.record_pause();
-                    tracing::info!("Pausing playback");
                 }
                 AudioPlaybackState::Paused => {
                     // Resume playback
@@ -486,48 +495,47 @@ impl VoyagerApp {
                         sink.play();
                         self.audio_state = AudioPlaybackState::Playing;
                         self.playback_start_time = Some(Instant::now());
-                        self.old_audio_metrics.record_play();
                         tracing::info!("Resuming playback");
+                    } else {
+                        tracing::warn!("Cannot resume: no audio sink available");
+                        self.audio_state = AudioPlaybackState::Error(AudioError::SinkNotAvailable);
                     }
                 }
                 AudioPlaybackState::Ready => {
                     // Start fresh playback
                     if self.wav_reader.is_none() {
+                        self.error_message = Some("No audio file loaded".to_string());
                         return;
                     }
 
                     // Ensure audio stream is available
-                    let handle = match self.ensure_audio_stream() {
-                        Some(h) => h,
-                        None => return, // Error already logged in ensure_audio_stream
+                    let stream = match self.ensure_audio_stream() {
+                        Some(s) => s,
+                        None => {
+                            self.error_message = Some("Failed to initialize audio stream".to_string());
+                            return;
+                        }
                     };
 
-                    // Create sink with the handle
-                    match Sink::try_new(&handle) {
-                        Ok(sink) => {
-                            if let Some(source) = self.make_buffer_source_from_current_position() {
-                                sink.append(source);
-                                sink.play();
-                                self.audio_sink = Some(sink);
-                                self.audio_state = AudioPlaybackState::Playing;
-                                self.playback_start_time = Some(Instant::now());
-                                self.old_audio_metrics.record_play();
-                                tracing::info!("Starting playback");
-                            } else {
-                                tracing::error!("No audio samples available to start playback");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to create audio sink: {}", e);
-                            self.audio_state =
-                                AudioPlaybackState::Error(AudioError::SinkCreationFailed);
-                            self.old_audio_metrics.record_device_error();
-                        }
+                    // Create sink with the mixer
+                    let sink = Sink::connect_new(stream.mixer());
+                    if let Some(source) = self.make_buffer_source_from_current_position() {
+                        sink.append(source);
+                        sink.play();
+                        self.audio_sink = Some(sink);
+                        self.audio_state = AudioPlaybackState::Playing;
+                        self.playback_start_time = Some(Instant::now());
+                        tracing::info!("Starting playback");
+                    } else {
+                        tracing::error!("No audio samples available to start playback");
+                        self.error_message = Some("No audio samples available".to_string());
                     }
                 }
-                AudioPlaybackState::Uninitialized | AudioPlaybackState::Error(_) => {
-                    // Can't play in these states
-                    tracing::warn!("Cannot play: {}", self.audio_state);
+                AudioPlaybackState::Uninitialized => {
+                    self.error_message = Some("Audio not initialized - load a file first".to_string());
+                }
+                AudioPlaybackState::Error(_) => {
+                    self.error_message = Some(format!("Cannot play: {}", self.audio_state));
                 }
             }
         }
@@ -539,12 +547,10 @@ impl VoyagerApp {
                 AudioPlaybackState::Ready | AudioPlaybackState::Paused => {
                     self.audio_state = AudioPlaybackState::Playing;
                     self.playback_start_time = Some(Instant::now());
-                    self.old_audio_metrics.record_play();
                     tracing::info!("Starting visual playback");
                 }
                 AudioPlaybackState::Playing => {
                     self.audio_state = AudioPlaybackState::Paused;
-                    self.old_audio_metrics.record_pause();
                     tracing::info!("Pausing visual playback");
                 }
                 _ => {}
@@ -567,8 +573,8 @@ impl VoyagerApp {
         } else {
             self.audio_state = AudioPlaybackState::Uninitialized;
         }
-        self.old_audio_metrics.record_stop();
         self.current_position_samples = 0;
+        self.last_decode_position = 0;
         self.playback_start_time = None;
         tracing::info!("Stopping playback");
     }
@@ -604,8 +610,30 @@ impl VoyagerApp {
                     WaveformChannel::Right => Arc::clone(&reader.right_channel),
                 };
 
-                // Bounds check
+                // Bounds check - ensure we have samples and position is valid
+                if samples.is_empty() {
+                    tracing::warn!("No samples available for decoding");
+                    return;
+                }
+                
                 if position >= samples.len() {
+                    tracing::warn!(
+                        position = position,
+                        samples_len = samples.len(),
+                        "Decode position out of bounds"
+                    );
+                    return;
+                }
+
+                // Ensure we have enough samples for a meaningful decode window
+                let min_window_samples = (reader.sample_rate as f64 * 0.1) as usize; // 100ms minimum
+                let remaining_samples = samples.len() - position;
+                if remaining_samples < min_window_samples {
+                    tracing::debug!(
+                        remaining = remaining_samples,
+                        min_required = min_window_samples,
+                        "Insufficient samples remaining for decode window"
+                    );
                     return;
                 }
 
@@ -632,6 +660,22 @@ impl VoyagerApp {
     fn seek_to_next_sync(&mut self) {
         if let Some(reader) = &self.wav_reader {
             let samples = reader.get_samples(self.selected_channel);
+            
+            if samples.is_empty() {
+                tracing::warn!("No samples available for sync detection");
+                return;
+            }
+            
+            // Ensure current position is within bounds
+            if self.current_position_samples >= samples.len() {
+                tracing::warn!(
+                    position = self.current_position_samples,
+                    samples_len = samples.len(),
+                    "Current position out of bounds, resetting to start"
+                );
+                self.current_position_samples = 0;
+            }
+            
             let next_sync = self.video_decoder.find_next_sync(
                 samples,
                 self.current_position_samples,
@@ -639,16 +683,25 @@ impl VoyagerApp {
             );
 
             if let Some(sync_position) = next_sync {
-                self.current_position_samples = sync_position;
-                tracing::info!(sync_position, "Seeking to next sync");
+                // Validate sync position
+                if sync_position < samples.len() {
+                    self.current_position_samples = sync_position;
+                    tracing::info!(sync_position, "Seeking to next sync");
 
-                // If playing, restart audio from new position
-                #[cfg(feature = "audio_playback")]
-                self.restart_audio_from_current_position();
+                    // If playing, restart audio from new position
+                    #[cfg(feature = "audio_playback")]
+                    self.restart_audio_from_current_position();
 
-                #[cfg(not(feature = "audio_playback"))]
-                if self.audio_state.is_playing() {
-                    self.playback_start_time = Some(Instant::now());
+                    #[cfg(not(feature = "audio_playback"))]
+                    if self.audio_state.is_playing() {
+                        self.playback_start_time = Some(Instant::now());
+                    }
+                } else {
+                    tracing::warn!(
+                        sync_position = sync_position,
+                        samples_len = samples.len(),
+                        "Sync position out of bounds, ignoring"
+                    );
                 }
             } else {
                 tracing::info!("No more sync signals found");
@@ -693,8 +746,8 @@ impl VoyagerApp {
         }
 
         // Ensure audio stream is available
-        let handle = match self.ensure_audio_stream() {
-            Some(h) => h,
+        let stream = match self.ensure_audio_stream() {
+            Some(s) => s,
             None => {
                 self.audio_state = AudioPlaybackState::Error(AudioError::StreamInitFailed);
                 return;
@@ -702,23 +755,14 @@ impl VoyagerApp {
         };
 
         // Create new sink with source from current position
-        match Sink::try_new(&handle) {
-            Ok(sink) => {
-                if let Some(source) = self.make_buffer_source_from_current_position() {
-                    sink.append(source);
-                    sink.play();
-                    self.audio_sink = Some(sink);
-                    self.playback_start_time = Some(Instant::now());
-                    self.old_audio_metrics.record_seek();
-                } else {
-                    tracing::error!("No audio samples available after seek");
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to create audio sink after seek: {}", e);
-                self.audio_state = AudioPlaybackState::Error(AudioError::SinkCreationFailed);
-                self.old_audio_metrics.record_device_error();
-            }
+        let sink = Sink::connect_new(stream.mixer());
+        if let Some(source) = self.make_buffer_source_from_current_position() {
+            sink.append(source);
+            sink.play();
+            self.audio_sink = Some(sink);
+            self.playback_start_time = Some(Instant::now());
+        } else {
+            tracing::error!("No audio samples available after seek");
         }
     }
 
@@ -736,6 +780,18 @@ impl VoyagerApp {
             // Background
             painter.rect_filled(*rect, 0.0, egui::Color32::from_gray(20));
 
+            // Handle empty samples gracefully
+            if samples.is_empty() {
+                painter.text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "No audio data",
+                    egui::FontId::default(),
+                    egui::Color32::GRAY,
+                );
+                return;
+            }
+
             // Draw waveform
             let samples_per_pixel = samples.len().max(1) as f32 / rect.width();
 
@@ -752,8 +808,10 @@ impl VoyagerApp {
                     for sample_idx in start_sample..end_sample {
                         if sample_idx < samples.len() {
                             let sample = samples[sample_idx];
-                            min_val = min_val.min(sample);
-                            max_val = max_val.max(sample);
+                            // Clamp sample values to prevent rendering issues
+                            let clamped_sample = sample.clamp(-1.0, 1.0);
+                            min_val = min_val.min(clamped_sample);
+                            max_val = max_val.max(clamped_sample);
                         }
                     }
 
@@ -773,8 +831,8 @@ impl VoyagerApp {
                 }
             }
 
-            // Draw current position indicator
-            if !samples.is_empty() {
+            // Draw current position indicator (only if position is valid)
+            if current_position < samples.len() {
                 let position_x =
                     rect.min.x + (current_position as f32 / samples.len() as f32) * rect.width();
                 painter.line_segment(
@@ -796,6 +854,21 @@ impl VoyagerApp {
                     ],
                     egui::Stroke::new(1.0, egui::Color32::YELLOW),
                 );
+            }
+        }
+    }
+}
+
+impl Drop for VoyagerApp {
+    fn drop(&mut self) {
+        // Drop channels first to signal worker thread to shut down
+        self.decode_tx = None;
+        self.decode_rx = None;
+        
+        // Join worker thread to prevent panic on shutdown
+        if let Some(handle) = self.worker_handle.take() {
+            if let Err(e) = handle.join() {
+                tracing::error!("Worker thread panicked on shutdown: {:?}", e);
             }
         }
     }
@@ -880,8 +953,15 @@ impl eframe::App for VoyagerApp {
                     self.playback_start_time = Some(Instant::now());
                     self.current_position_samples = new_position;
 
-                    // Real-time decoding: decode from current position
-                    self.decode_at_position(ctx, new_position);
+                    // Real-time decoding: decode from current position only if significant change
+                    // Decode every 500ms of audio to avoid flooding worker thread
+                    let decode_threshold_samples = (wav_reader.sample_rate as f32 * 0.5) as usize;
+                    let position_change = new_position.abs_diff(self.last_decode_position);
+                    
+                    if position_change >= decode_threshold_samples {
+                        self.decode_at_position(ctx, new_position);
+                        self.last_decode_position = new_position;
+                    }
                 }
             }
         }
@@ -1081,23 +1161,29 @@ impl eframe::App for VoyagerApp {
                         }
                     }
 
-                    // Track hover position for vertical line
-                    if response.hovered() {
-                        if let Some(hover_pos) = response.hover_pos() {
-                            let relative_x = (hover_pos.x - rect.min.x) / rect.width();
-                            self.waveform_hover_position = Some(relative_x.clamp(0.0, 1.0));
+                        // Track hover position for vertical line
+                        if response.hovered() {
+                            if let Some(hover_pos) = response.hover_pos() {
+                                let relative_x = (hover_pos.x - rect.min.x) / rect.width();
+                                self.waveform_hover_position = Some(relative_x.clamp(0.0, 1.0));
+                            }
+                        } else {
+                            self.waveform_hover_position = None;
                         }
-                    } else {
-                        self.waveform_hover_position = None;
-                    }
 
-                    self.draw_waveform_internal(
-                        ui,
-                        &rect,
-                        samples,
-                        current_position,
-                        hover_position,
-                    );
+                        self.draw_waveform_internal(
+                            ui,
+                            &rect,
+                            samples,
+                            current_position,
+                            hover_position,
+                        );
+
+                        // Trigger decode on manual seek (user clicked)
+                        if response.clicked() {
+                            self.decode_at_position(ctx, self.current_position_samples);
+                            self.last_decode_position = self.current_position_samples;
+                        }
 
                     // Restart audio after drawing is complete (borrow checker fix)
                     #[cfg(feature = "audio_playback")]
@@ -1111,15 +1197,9 @@ impl eframe::App for VoyagerApp {
 
         // Central panel for controls and info
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("SSTV Decoder Settings");
+            ui.heading("🚀 Voyager Golden Record Explorer");
             ui.separator();
-
-            ui.horizontal(|ui| {
-                ui.label("📏 Line Duration (ms):");
-                ui.add(egui::DragValue::new(&mut self.params.line_duration_ms).range(1..=100));
-                ui.label("🔪 Threshold:");
-                ui.add(egui::Slider::new(&mut self.params.threshold, 0.0..=1.0));
-            });
+            ui.label("Use the controls in the top panel to load audio files and adjust decoder settings.");
         });
     }
 }

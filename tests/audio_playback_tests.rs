@@ -180,7 +180,7 @@ fn test_chirp_signal_properties() {
     // Amplitude should stay within expected range
     let max_amp = chirp
         .iter()
-        .map(|&s| s.abs())
+        .map(|&s: &f32| s.abs())
         .fold::<f32, _>(0.0f32, f32::max);
     assert!(
         (max_amp - 0.7).abs() < 0.05,
@@ -191,8 +191,8 @@ fn test_chirp_signal_properties() {
     let first_quarter = &chirp[0..11025];
     let last_quarter = &chirp[33075..44100];
 
-    let avg_first: f32 = first_quarter.iter().map(|s| s.abs()).sum::<f32>() / 11025.0;
-    let avg_last: f32 = last_quarter.iter().map(|s| s.abs()).sum::<f32>() / 11025.0;
+    let avg_first: f32 = first_quarter.iter().map(|s: &f32| s.abs()).sum::<f32>() / 11025.0;
+    let avg_last: f32 = last_quarter.iter().map(|s: &f32| s.abs()).sum::<f32>() / 11025.0;
 
     // Both should have significant energy (not silence)
     assert!(avg_first > 0.1, "First quarter should have energy");
@@ -363,7 +363,7 @@ fn test_composite_signal_structure() {
     );
 
     // Should not be all zeros
-    let non_zero_count = composite.iter().filter(|&&s| s.abs() > 0.01).count();
+    let non_zero_count = composite.iter().filter(|&&s: &&f32| s.abs() > 0.01).count();
     assert!(
         non_zero_count > 10000,
         "Composite should have significant non-zero content"

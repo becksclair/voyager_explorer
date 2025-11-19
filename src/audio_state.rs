@@ -95,6 +95,8 @@ pub enum AudioError {
     SinkCreationFailed,
     /// Failed to initialize audio stream
     StreamInitFailed,
+    /// Audio sink not available or lost
+    SinkNotAvailable,
 }
 
 impl fmt::Display for AudioError {
@@ -106,6 +108,7 @@ impl fmt::Display for AudioError {
             Self::BufferUnderrun => write!(f, "Audio buffer underrun"),
             Self::SinkCreationFailed => write!(f, "Failed to create audio sink"),
             Self::StreamInitFailed => write!(f, "Failed to initialize audio stream"),
+            Self::SinkNotAvailable => write!(f, "Audio sink not available"),
         }
     }
 }
@@ -115,7 +118,7 @@ impl AudioError {
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
-            Self::DeviceDisconnected | Self::BufferUnderrun | Self::SinkCreationFailed
+            Self::DeviceDisconnected | Self::BufferUnderrun | Self::SinkCreationFailed | Self::SinkNotAvailable
         )
     }
 
@@ -128,6 +131,7 @@ impl AudioError {
             Self::BufferUnderrun => "Playback may stutter; try reducing system load",
             Self::SinkCreationFailed => "Retry playback",
             Self::StreamInitFailed => "Restart application or check audio settings",
+            Self::SinkNotAvailable => "Retry playback or restart application",
         }
     }
 }
