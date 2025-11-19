@@ -453,11 +453,12 @@ impl VoyagerApp {
     }
 
     #[cfg(feature = "audio_playback")]
-    fn ensure_audio_stream(&mut self) -> Option<&OutputStream> {
+    #[cfg(feature = "audio_playback")]
+    fn ensure_audio_stream(&mut self) -> Option<&OutputStreamHandle> {
         if self.audio_stream.is_none() {
-            match OutputStreamBuilder::open_default_stream() {
-                Ok(stream) => {
-                    self.audio_stream = Some(stream);
+            match OutputStream::try_default() {
+                Ok((stream, handle)) => {
+                    self.audio_stream = Some((stream, handle));
                 }
                 Err(e) => {
                     tracing::error!("Failed to initialize audio stream: {}", e);
@@ -467,10 +468,10 @@ impl VoyagerApp {
             }
         }
 
-        self.audio_stream.as_ref()
+        self.audio_stream.as_ref().map(|(_, handle)| handle)
     }
     #[cfg(not(feature = "audio_playback"))]
-    fn ensure_audio_stream(&mut self) -> Option<&OutputStream> {
+    fn ensure_audio_stream(&mut self) -> Option<&OutputStreamHandle> {
         None
     }
 
