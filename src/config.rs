@@ -312,7 +312,7 @@ mod dirs {
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     pub fn config_dir() -> Option<PathBuf> {
-        dirs::config_dir()
+        None
     }
 }
 
