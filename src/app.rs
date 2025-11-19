@@ -18,6 +18,7 @@ use crate::audio_state::AudioError;
 
 #[cfg(feature = "audio_playback")]
 use rodio::{OutputStream, OutputStreamBuilder, Sink, Source};
+use rodio::mixer::Mixer;
 
 /// Request to decode audio samples in background thread.
 ///
@@ -302,7 +303,7 @@ impl Default for VoyagerApp {
             params,
             last_decoded: None,
             selected_channel: WaveformChannel::Left,
-            audio_state: AudioPlaybackState::Ready,
+            audio_state: AudioPlaybackState::Uninitialized,
             #[cfg(feature = "audio_playback")]
             audio_stream: None,
             #[cfg(feature = "audio_playback")]
@@ -453,12 +454,11 @@ impl VoyagerApp {
     }
 
     #[cfg(feature = "audio_playback")]
-    #[cfg(feature = "audio_playback")]
-    fn ensure_audio_stream(&mut self) -> Option<&OutputStreamHandle> {
+    fn ensure_audio_stream(&mut self) -> Option<&Mixer> {
         if self.audio_stream.is_none() {
-            match OutputStream::try_default() {
-                Ok((stream, handle)) => {
-                    self.audio_stream = Some((stream, handle));
+            match OutputStreamBuilder::open_default_stream() {
+                Ok(stream) => {
+                    self.audio_stream = Some(stream);
                 }
                 Err(e) => {
                     tracing::error!("Failed to initialize audio stream: {}", e);
@@ -468,10 +468,10 @@ impl VoyagerApp {
             }
         }
 
-        self.audio_stream.as_ref().map(|(_, handle)| handle)
+        self.audio_stream.as_ref().map(|stream| stream.mixer())
     }
     #[cfg(not(feature = "audio_playback"))]
-    fn ensure_audio_stream(&mut self) -> Option<&OutputStreamHandle> {
+    fn ensure_audio_stream(&mut self) -> Option<()> {
         None
     }
 
@@ -519,7 +519,7 @@ impl VoyagerApp {
                     };
 
                     // Create sink with the mixer
-                    let sink = Sink::connect_new(stream.mixer());
+                    let sink = Sink::connect_new(stream);
                     if let Some(source) = self.make_buffer_source_from_current_position() {
                         sink.append(source);
                         sink.play();
@@ -756,7 +756,7 @@ impl VoyagerApp {
         };
 
         // Create new sink with source from current position
-        let sink = Sink::connect_new(stream.mixer());
+        let sink = Sink::connect_new(stream);
         if let Some(source) = self.make_buffer_source_from_current_position() {
             sink.append(source);
             sink.play();
