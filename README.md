@@ -144,7 +144,7 @@ pub struct VoyagerApp {
 git clone https://github.com/your-username/voyager_explorer
 cd voyager_explorer
 
-# Run in development mode
+# Run in development mode (audio_playback enabled by default)
 cargo run
 
 # Build optimized release
@@ -152,6 +152,9 @@ cargo build --release
 
 # Run comprehensive tests (29 total)
 cargo test
+
+# For sandboxed environments (CI/CD, no audio dependencies)
+cargo test --no-default-features
 ```
 
 ### **Using the Application**
@@ -184,8 +187,11 @@ cargo test
   - Error handling and edge cases
 
 ```bash
-# Run all tests
+# Run all tests (with audio_playback feature)
 cargo test
+
+# Run tests without audio dependencies (for CI/sandboxed environments)
+cargo test --no-default-features
 
 # Run specific test categories
 cargo test --lib          # Unit tests only
@@ -225,10 +231,16 @@ voyager_explorer/
 ### **Key Dependencies**
 
 - **egui + eframe** (0.33.0) - Modern immediate-mode GUI
-- **rodio** (0.21.1, optional via `audio_playback` feature) - Audio playback backend for planned sound output
+- **rodio** (0.21.1, optional via `audio_playback` feature) - Audio playback backend (enabled by default)
 - **hound** (3.5.1) - WAV file reading and processing
 - **realfft** (3.5.0) - FFT operations for sync detection
 - **rfd** (0.15.4) - Native file dialogs
+
+### **Feature Configuration**
+
+- **Default**: `audio_playback` feature enabled (includes rodio for audio output)
+- **Sandboxed**: Use `--no-default-features` to disable audio dependencies (ideal for CI/CD)
+- **Development**: Full feature set available with `cargo run` (no additional flags needed)
 
 ### **Development Commands**
 
