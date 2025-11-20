@@ -475,10 +475,6 @@ impl VoyagerApp {
 
         self.audio_stream.as_ref().map(|stream| stream.mixer())
     }
-    #[cfg(not(feature = "audio_playback"))]
-    fn ensure_audio_stream(&mut self) -> Option<()> {
-        None
-    }
 
     fn toggle_playback(&mut self) {
         #[cfg(feature = "audio_playback")]
