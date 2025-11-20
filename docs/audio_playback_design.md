@@ -144,14 +144,17 @@ pub struct AudioPlaybackSystem {
 ## Performance Considerations
 
 ### Memory Usage
+
 - **Before**: `samples[pos..].to_vec()` = O(n) copy on every seek
 - **After**: `Arc::clone(&samples)` + offset = O(1) on every seek
 
 ### CPU Usage
+
 - Background decoding (Milestone 2) won't block audio thread
 - Position tracking uses wall-clock time, not polling
 
 ### Latency
+
 - Seek latency: < 50ms (stop old sink + start new)
 - Device initialization: lazy (only when first needed)
 
