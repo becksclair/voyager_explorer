@@ -28,19 +28,39 @@ env_logger = { version = "0.11", default-features = false, features = [
 ] }
 hound = "3.5.1"
 
-image = { version = "0.25", features = [
+image = { version = "0.25", default-features = false, features = [
   "jpeg",
   "png",
 ] }
 realfft = { version = "3.5.0", features = ["avx", "neon", "sse", "wasm_simd"] }
 rfd = "0.15.4"
 rodio = { version = "0.21.1", optional = true, default-features = false, features = ["playback"] }
-tempfile = { version = "3.23", optional = true }
+tempfile = "3.23"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Metrics
+hdrhistogram = "7.5"
 
 [dev-dependencies]
 tempfile = "3.23"
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.5"
+
+[[bench]]
+name = "audio_seek"
+harness = false
 
 [features]
 default = ["audio_playback"]
 audio_playback = ["rodio"]
-test_fixtures = ["tempfile"]  # Enable synthetic audio generation for testing

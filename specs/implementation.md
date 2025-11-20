@@ -91,11 +91,13 @@ Agents should read these before making non-trivial changes:
 From `README.md`, `CLAUDE.md`, and `AGENTS.md`:
 
 - Build / run:
-  - `cargo run`
+  - `cargo run` (audio_playback enabled by default)
   - `cargo build`
   - `cargo build --release`
+  - `cargo build --no-default-features` (for CI/CD, no audio dependencies)
 - Tests:
-  - `cargo test` (all tests)
+  - `cargo test` (all tests, with audio_playback feature)
+  - `cargo test --no-default-features` (without audio dependencies)
   - `cargo test --lib` (unit)
   - `cargo test --test integration_tests` (integration)
 - Lint / format / check:
@@ -135,17 +137,19 @@ All milestones that require audio for tests or manual QA should use **synthetic 
 - Prefer short, deterministic signals (sync tones, noise+sync, alternating stripe patterns, stereo differentiation) so tests remain fast and self-explanatory.
 - If a fixed "golden" signal is needed, embed raw `i16` samples as a `const` array and wrap them into a temporary WAV via the existing helpers.
 
-### 0.7. Current Implementation Status (2025-11-18)
+### 0.7. Current Implementation Status (2025-11-18 - Updated)
 
-- **Milestone 1 – Real Audio Playback via rodio**
-  - Implemented:
-    - `AudioBufferSource`, `audio_stream`, and `audio_sink` fields in `VoyagerApp` behind the `audio_playback` feature.
+- **Milestone 1 – Real Audio Playback via Rodio** ✅ **COMPLETED**
+  - Fully implemented:
+    - `AudioBufferSource`, `audio_stream: Option<OutputStream>`, and `audio_sink` fields in `VoyagerApp` behind the `audio_playback` feature.
     - Synthetic audio fixtures in `src/test_fixtures.rs` and audio-focused tests in `tests/audio_playback_tests.rs`.
-    - `audio_state.rs` and `AudioMetrics` providing an explicit playback state machine and observability primitives.
-  - Still missing / misaligned:
-    - `VoyagerApp` continues to track playback with a bare `is_playing: bool` and does not yet use `AudioPlaybackState` / `AudioMetrics`.
-    - Rodio integration needs to be aligned with `rodio` 0.21 APIs (`OutputStreamBuilder`, `OutputStreamHandle`, and `Sink::try_new`).
-    - `AudioBufferSource` still clones `Vec<f32>` on seek instead of using shared `Arc<[f32]>` buffers, which limits large-file performance.
+    - `audio_state.rs` with `AudioPlaybackState` enum and `AudioMetrics` providing an explicit playback state machine and observability.
+    - **Zero-copy audio buffers**: `WavReader` uses `Arc<[f32]>` for `left_channel` and `right_channel`, eliminating O(n) clones on every seek.
+    - **Rodio 0.21.1 API alignment**: Uses `OutputStreamBuilder::open_default_stream()` (Rodio 0.21.1) to create a single `OutputStream` (no separate `OutputStreamHandle`), then obtains the mixer via `output_stream.mixer()` and creates sinks via `Sink::connect_new(&output_stream.mixer())` / the stream-mixer path instead of the removed `OutputStream::try_default()` + `Sink::try_new(&handle)` API.
+    - **State machine integration**: `VoyagerApp` now uses `audio_state: AudioPlaybackState` instead of bare `is_playing: bool`.
+    - **Metrics tracking**: All playback operations (play, pause, stop, seek) recorded via `audio_metrics`.
+    - **UI status indicator**: Debug panel shows audio state with icons (🔊 ▶️ ⏸️ ⚠️) and messages.
+    - **Feature flag support**: Builds and tests pass with and without `audio_playback` feature (48 tests pass, zero clippy warnings). Note: `audio_playback` is enabled by default; use `--no-default-features` for CI/CD environments.
 
 - **Milestone 2 – Non-blocking Decoding & Performance**
   - `decode_at_position` runs entirely on the UI thread, and there is no background decoding worker or message-passing yet.

@@ -1,20 +1,87 @@
+use crate::error::{AudioError, Result};
 use hound::WavReader as HoundReader;
 use std::path::Path;
+use std::sync::Arc;
 
+/// WAV file reader with normalized `f32` samples and zero-copy buffer sharing.
+///
+/// # Architecture Decision: Arc&lt;[f32]&gt; vs Vec&lt;f32&gt;
+///
+/// This struct uses `Arc<[f32]>` instead of `Vec<f32>` for the audio buffers to enable
+/// efficient zero-copy sharing with audio playback components.
+///
+/// **Key benefit**: When seeking during playback, we can create new `AudioBufferSource`
+/// instances that share the same underlying buffer via `Arc::clone()`, which only
+/// increments a reference count (O(1)) rather than copying megabytes of sample data (O(n)).
+///
+/// **Memory impact**: For a 100MB audio file with frequent seeking:
+/// - With `Vec<f32>`: Each seek allocates 50MB average (half the file)
+/// - With `Arc<[f32]>`: Each seek allocates 16 bytes (Arc pointer + metadata)
+///
+/// **Trade-off**: Arc adds 16 bytes of overhead vs Vec, but this is negligible compared
+/// to the sample data size (millions of f32 values).
+///
+/// # Sample Normalization
+///
+/// All samples are normalized to f32 in the range `[-1.0, 1.0]` for consistent
+/// processing. Currently only 16-bit PCM WAV files are supported.
 pub struct WavReader {
-    pub left_channel: Vec<f32>,
-    pub right_channel: Vec<f32>,
+    /// Left channel samples (or mono channel for mono files).
+    /// Shared via Arc for zero-copy playback.
+    pub left_channel: Arc<[f32]>,
+    /// Right channel samples (duplicated from left for mono files).
+    /// Shared via Arc for zero-copy playback.
+    pub right_channel: Arc<[f32]>,
+    /// Original sample rate in Hz (e.g., 44100, 48000).
     pub sample_rate: u32,
+    /// Number of channels in the original file (1 for mono, 2 for stereo).
     pub channels: u16,
 }
 
 impl WavReader {
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
-        let mut reader = HoundReader::open(path).map_err(|e| format!("Failed to open WAV: {e}"))?;
+    /// Load and decode a WAV file with comprehensive error handling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::LoadFailed`] if the file cannot be opened or read.
+    /// Returns [`AudioError::UnsupportedChannels`] for files with > 2 channels.
+    /// Returns [`AudioError::InvalidSampleRate`] for sample rates outside 8kHz-192kHz.
+    /// Returns [`AudioError::EmptyFile`] if the file contains no audio samples.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use voyager_explorer::audio::WavReader;
+    ///
+    /// let reader = WavReader::from_file("audio.wav")?;
+    /// println!("Loaded {} samples at {} Hz", reader.left_channel.len(), reader.sample_rate);
+    /// # Ok::<(), voyager_explorer::error::VoyagerError>(())
+    /// ```
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+        let path_buf = path.to_path_buf();
+
+        let mut reader = HoundReader::open(path).map_err(|source| AudioError::LoadFailed {
+            path: path_buf.clone(),
+            source,
+        })?;
+
         let spec = reader.spec();
 
+        // Validate sample rate
+        if !(8000..=192_000).contains(&spec.sample_rate) {
+            return Err(AudioError::InvalidSampleRate {
+                rate: spec.sample_rate,
+            }
+            .into());
+        }
+
+        // Validate channel count
         if spec.channels != 1 && spec.channels != 2 {
-            return Err("Only mono and stereo WAV files are supported.".into());
+            return Err(AudioError::UnsupportedChannels {
+                channels: spec.channels,
+            }
+            .into());
         }
 
         let samples: Vec<f32> = reader
@@ -22,10 +89,16 @@ impl WavReader {
             .map(|s| s.unwrap_or(0) as f32 / i16::MAX as f32)
             .collect();
 
+        // Check for empty file
+        if samples.is_empty() {
+            return Err(AudioError::EmptyFile { path: path_buf }.into());
+        }
+
         let (left_channel, right_channel) = match spec.channels {
             1 => {
-                // Mono: duplicate to both channels
-                (samples.clone(), samples)
+                // Mono: duplicate to both channels (convert to Arc)
+                let arc_samples: Arc<[f32]> = samples.into();
+                (Arc::clone(&arc_samples), arc_samples)
             }
             2 => {
                 // Stereo: split interleaved samples
@@ -37,10 +110,18 @@ impl WavReader {
                     right.push(chunk[1]);
                 }
 
-                (left, right)
+                (left.into(), right.into())
             }
             _ => unreachable!(),
         };
+
+        tracing::info!(
+            path = %path.display(),
+            sample_rate = spec.sample_rate,
+            channels = spec.channels,
+            samples = left_channel.len(),
+            "Successfully loaded WAV file"
+        );
 
         Ok(Self {
             left_channel,
@@ -124,8 +205,11 @@ mod tests {
             .map(|&s| s as f32 / i16::MAX as f32)
             .collect();
 
-        assert_eq!(reader.left_channel, expected_normalized);
-        assert_eq!(reader.right_channel, expected_normalized); // Mono duplicated to both channels
+        assert_eq!(reader.left_channel.as_ref(), expected_normalized.as_slice());
+        assert_eq!(
+            reader.right_channel.as_ref(),
+            expected_normalized.as_slice()
+        ); // Mono duplicated to both channels
     }
 
     #[test]
@@ -152,8 +236,8 @@ mod tests {
             6000.0 / i16::MAX as f32,
         ];
 
-        assert_eq!(reader.left_channel, expected_left);
-        assert_eq!(reader.right_channel, expected_right);
+        assert_eq!(reader.left_channel.as_ref(), expected_left.as_slice());
+        assert_eq!(reader.right_channel.as_ref(), expected_right.as_slice());
     }
 
     #[test]

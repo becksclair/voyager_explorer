@@ -1,13 +1,17 @@
+use crate::error::{DecoderError, Result, VoyagerError};
 use realfft::{RealFftPlanner, RealToComplex};
 use std::f32::consts::PI;
 
-// const TARGET_FREQ_HZ: f32 = 3500.0;
+/// Target sync frequency in Hz (Voyager Golden Record standard)
 const TARGET_FREQ_HZ: f32 = 1200.0;
+/// FFT chunk size for frequency analysis
 const CHUNK_SIZE: usize = 2048;
 
+#[derive(Debug, Clone, Copy)]
 pub struct DecoderParams {
     pub line_duration_ms: f32,
     pub threshold: f32,
+    pub decode_window_secs: f64,
 }
 
 impl Default for DecoderParams {
@@ -15,6 +19,7 @@ impl Default for DecoderParams {
         Self {
             line_duration_ms: 8.3,
             threshold: 0.2,
+            decode_window_secs: 2.0,
         }
     }
 }
@@ -61,7 +66,16 @@ impl SstvDecoder {
         peak > (avg * 10.0) // Simple threshold, tweak as needed
     }
 
-    pub fn detect_sync(&self, samples: Vec<f32>, sample_rate: u32) {
+    /// Detect presence of sync tone in audio samples.
+    ///
+    /// This method performs a simple detection pass through the samples,
+    /// stopping at the first detected sync. For more comprehensive sync
+    /// analysis, use `find_sync_positions()` or `find_next_sync()`.
+    ///
+    /// # Performance Note
+    /// This method processes chunks sequentially until a sync is found.
+    /// Consider using `find_sync_positions()` for batch analysis.
+    pub fn detect_sync(&self, samples: Vec<f32>, sample_rate: u32) -> bool {
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(CHUNK_SIZE);
         let window = Self::hann_window(CHUNK_SIZE);
@@ -72,11 +86,10 @@ impl SstvDecoder {
             }
             let sync_detected = Self::detect_sync_tone(chunk, &*fft, &window, sample_rate as f32);
             if sync_detected {
-                println!("Sync tone detected!");
-                break;
+                return true;
             }
         }
-        println!("Sync tone not detected!");
+        false
     }
 
     /// Find all sync signal positions in the audio samples
@@ -119,15 +132,66 @@ impl SstvDecoder {
         sync_positions.first().map(|&pos| start_position + pos)
     }
 
-    pub fn decode(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Vec<u8> {
+    /// Decode audio samples into SSTV image pixels with comprehensive error handling.
+    ///
+    /// # Arguments
+    ///
+    /// * `samples` - Audio samples normalized to [-1.0, 1.0]
+    /// * `params` - Decoder parameters (line duration, threshold)
+    /// * `sample_rate` - Audio sample rate in Hz (8kHz-192kHz)
+    ///
+    /// # Returns
+    ///
+    /// Grayscale pixels (0-255) in row-major order, width=512px
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecoderError::InvalidLineDuration`] if line duration is out of range 1-100ms.
+    /// Returns [`DecoderError::InvalidThreshold`] if threshold is out of range 0.0-1.0.
+    /// Returns [`DecoderError::InsufficientSamples`] if buffer is too short.
+    pub fn decode(
+        &self,
+        samples: &[f32],
+        params: &DecoderParams,
+        sample_rate: u32,
+    ) -> Result<Vec<u8>> {
+        // Validate parameters
+        if !(1.0..=100.0).contains(&params.line_duration_ms) {
+            return Err(VoyagerError::Decoder(DecoderError::InvalidLineDuration {
+                duration_ms: params.line_duration_ms,
+            }));
+        }
+
+        if !(0.0..=1.0).contains(&params.threshold) {
+            return Err(VoyagerError::Decoder(DecoderError::InvalidThreshold {
+                threshold: params.threshold,
+            }));
+        }
+
+        // Validate samples
         if samples.is_empty() {
-            return Vec::new();
+            return Err(VoyagerError::Decoder(DecoderError::InsufficientSamples {
+                needed: 1,
+                actual: 0,
+            }));
         }
 
         let samples_per_line =
             (params.line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
         if samples_per_line == 0 {
-            return Vec::new();
+            return Err(VoyagerError::Decoder(DecoderError::InvalidParams {
+                reason: format!(
+                    "Calculated samples_per_line is 0 (line_duration={}, sample_rate={})",
+                    params.line_duration_ms, sample_rate
+                ),
+            }));
+        }
+
+        if samples.len() < samples_per_line {
+            return Err(VoyagerError::Decoder(DecoderError::InsufficientSamples {
+                needed: samples_per_line,
+                actual: samples.len(),
+            }));
         }
 
         let width = 512;
@@ -152,7 +216,13 @@ impl SstvDecoder {
             lines_decoded += 1;
         }
 
-        image
+        tracing::debug!(
+            lines_decoded,
+            pixels = image.len(),
+            "Decode operation completed"
+        );
+
+        Ok(image)
     }
 }
 
@@ -261,7 +331,11 @@ mod tests {
         let empty_samples = Vec::new();
 
         let result = decoder.decode(&empty_samples, &params, 44100);
-        assert!(result.is_empty());
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            VoyagerError::Decoder(DecoderError::InsufficientSamples { .. })
+        ));
     }
 
     #[test]
@@ -270,6 +344,7 @@ mod tests {
         let params = DecoderParams {
             line_duration_ms: 10.0, // Short duration for testing
             threshold: 0.3,
+            decode_window_secs: 2.0,
         };
 
         let sample_rate = 44100;
@@ -287,7 +362,9 @@ mod tests {
             test_samples.push(value);
         }
 
-        let result = decoder.decode(&test_samples, &params, sample_rate);
+        let result = decoder
+            .decode(&test_samples, &params, sample_rate)
+            .expect("Decode should succeed");
 
         assert!(!result.is_empty());
         assert_eq!(result.len() % 512, 0); // Should be multiples of width
@@ -356,5 +433,173 @@ mod tests {
 
         // Should return None if no sync found
         assert!(next_sync.is_none());
+    }
+
+    // Property-based tests using proptest
+    #[cfg(test)]
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Generate valid decoder parameters for property testing
+        fn valid_decoder_params() -> impl Strategy<Value = DecoderParams> {
+            (1.0f32..=100.0, 0.0f32..=1.0).prop_map(|(line_duration_ms, threshold)| DecoderParams {
+                line_duration_ms,
+                threshold,
+                decode_window_secs: 2.0,
+            })
+        }
+
+        /// Generate valid sample rates for property testing
+        fn valid_sample_rate() -> impl Strategy<Value = u32> {
+            prop::sample::select(vec![8000, 11025, 16000, 22050, 44100, 48000, 96000])
+        }
+
+        /// Generate random audio samples in valid range
+        fn random_samples(
+            min_samples: usize,
+            max_samples: usize,
+        ) -> impl Strategy<Value = Vec<f32>> {
+            prop::collection::vec(-1.0f32..=1.0f32, min_samples..=max_samples)
+        }
+
+        proptest! {
+            /// Property: Decoder never panics with valid inputs
+            #[test]
+            fn prop_decode_never_panics(
+                samples in random_samples(1000, 100_000),
+                params in valid_decoder_params(),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+                let _ = decoder.decode(&samples, &params, sample_rate);
+                // Test passes if no panic occurs
+            }
+
+            /// Property: Decoded output width is always 512 pixels
+            #[test]
+            fn prop_decode_width_always_512(
+                samples in random_samples(1000, 50_000),
+                params in valid_decoder_params(),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+                if let Ok(pixels) = decoder.decode(&samples, &params, sample_rate) {
+                    if !pixels.is_empty() {
+                        // All pixels should be multiples of 512
+                        prop_assert_eq!(pixels.len() % 512, 0);
+                    }
+                }
+            }
+
+            /// Property: Decoder is deterministic (same input always produces same output)
+            #[test]
+            fn prop_decode_is_deterministic(
+                samples in random_samples(1000, 20_000),
+                params in valid_decoder_params(),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+
+                let result1 = decoder.decode(&samples, &params, sample_rate);
+                let result2 = decoder.decode(&samples, &params, sample_rate);
+
+                // Both should succeed or both should fail
+                prop_assert_eq!(result1.is_ok(), result2.is_ok());
+
+                // If successful, outputs should be identical
+                if let (Ok(pixels1), Ok(pixels2)) = (result1, result2) {
+                    prop_assert_eq!(pixels1, pixels2);
+                }
+            }
+
+            /// Property: All output pixels are binary (0 or 255)
+            #[test]
+            fn prop_pixels_are_binary(
+                samples in random_samples(1000, 20_000),
+                params in valid_decoder_params(),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+                if let Ok(pixels) = decoder.decode(&samples, &params, sample_rate) {
+                    for &pixel in &pixels {
+                        prop_assert!(pixel == 0 || pixel == 255,
+                            "Expected 0 or 255, got {}", pixel);
+                    }
+                }
+            }
+
+            /// Property: Invalid line duration returns error
+            #[test]
+            fn prop_invalid_line_duration_errors(
+                samples in random_samples(1000, 10_000),
+                invalid_duration in prop::num::f32::ANY.prop_filter(
+                    "Not in valid range",
+                    |&d| {
+                        let valid_range = 1.0f32..=100.0;
+                        !valid_range.contains(&d) || d.is_nan()
+                    }
+                ),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+                let params = DecoderParams {
+                    line_duration_ms: invalid_duration,
+                    threshold: 0.5,
+                    decode_window_secs: 2.0,
+                };
+
+                let result = decoder.decode(&samples, &params, sample_rate);
+                prop_assert!(result.is_err());
+            }
+
+            /// Property: Invalid threshold returns error
+            #[test]
+            fn prop_invalid_threshold_errors(
+                samples in random_samples(1000, 10_000),
+                invalid_threshold in prop::num::f32::ANY.prop_filter(
+                    "Not in valid range",
+                    |&t| {
+                        let valid_range = 0.0f32..=1.0;
+                        !valid_range.contains(&t) || t.is_nan()
+                    }
+                ),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+                let params = DecoderParams {
+                    line_duration_ms: 10.0,
+                    threshold: invalid_threshold,
+                    decode_window_secs: 2.0,
+                };
+
+                let result = decoder.decode(&samples, &params, sample_rate);
+                prop_assert!(result.is_err());
+            }
+
+            /// Property: Output size grows with more input samples
+            #[test]
+            fn prop_output_grows_with_input(
+                base_samples in random_samples(5000, 10_000),
+                params in valid_decoder_params(),
+                sample_rate in valid_sample_rate()
+            ) {
+                let decoder = SstvDecoder::new();
+
+                // Decode with base samples
+                let result1 = decoder.decode(&base_samples, &params, sample_rate);
+
+                // Extend samples and decode again
+                let mut extended_samples = base_samples.clone();
+                extended_samples.extend(vec![0.0; 10_000]);
+                let result2 = decoder.decode(&extended_samples, &params, sample_rate);
+
+                // Both should succeed
+                if let (Ok(pixels1), Ok(pixels2)) = (result1, result2) {
+                    // Extended should have more or equal pixels
+                    prop_assert!(pixels2.len() >= pixels1.len());
+                }
+            }
+        }
     }
 }

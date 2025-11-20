@@ -2,10 +2,16 @@
 
 pub mod audio;
 pub mod audio_state;
+pub mod config;
+pub mod error;
 pub mod image_output;
+pub mod metrics;
 pub mod sstv;
 pub mod utils;
 
 // Test fixtures for synthetic audio generation
-#[cfg(any(test, feature = "test_fixtures"))]
 pub mod test_fixtures;
+
+// Re-export commonly used types
+pub use config::AppConfig;
+pub use error::{AudioError, DecoderError, Result, VoyagerError};

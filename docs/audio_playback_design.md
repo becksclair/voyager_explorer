@@ -8,7 +8,7 @@ Real-time audio playback system for Voyager Golden Record Explorer with seamless
 
 ### State Machine
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                     Audio Playback State Machine                │
 └─────────────────────────────────────────────────────────────────┘
@@ -102,26 +102,31 @@ pub struct AudioPlaybackSystem {
 ## Key Design Decisions
 
 ### 1. **Explicit State Tracking**
-- Replace implicit state (checking Option<Sink>) with explicit AudioPlaybackState enum
+
+- Replace implicit state (checking Option<`Sink`>) with explicit AudioPlaybackState enum
 - UI can query state directly: `system.state()`
 - Clear error reporting: state includes error variant
 
 ### 2. **Zero-Copy Buffer Management**
+
 - Use `Arc<[f32]>` instead of `Vec<f32>` clones on every seek
 - AudioBufferSource holds Arc and offset, no cloning
 - Reduces memory pressure for large files
 
 ### 3. **Graceful Degradation**
+
 - If audio device unavailable: visual-only mode
 - If device disconnects: automatic fallback, user notification
 - Format incompatibility: clear error message
 
 ### 4. **User Feedback for All Errors**
+
 - Status bar indicator: 🔊 Audio Ready | ⚠️ Audio Unavailable | ⏸️ Paused
 - Toast notifications for transient errors
 - Detailed error in debug panel
 
 ### 5. **Testability**
+
 - AudioPlaybackSystem is fully testable via state queries
 - Mock audio devices for CI/CD environments
 - Synthetic audio fixtures with known properties (440Hz tone, chirp)
@@ -139,14 +144,17 @@ pub struct AudioPlaybackSystem {
 ## Performance Considerations
 
 ### Memory Usage
+
 - **Before**: `samples[pos..].to_vec()` = O(n) copy on every seek
 - **After**: `Arc::clone(&samples)` + offset = O(1) on every seek
 
 ### CPU Usage
+
 - Background decoding (Milestone 2) won't block audio thread
 - Position tracking uses wall-clock time, not polling
 
 ### Latency
+
 - Seek latency: < 50ms (stop old sink + start new)
 - Device initialization: lazy (only when first needed)
 
@@ -177,13 +185,15 @@ fn generate_sync_pattern() -> Vec<f32> { ... }
 ```
 
 **CI/CD Strategy**:
-- GitHub Actions: Build with `--no-default-features` (no audio)
-- Local dev: Build with `--features audio_playback`
+
+- GitHub Actions: Build with `--no-default-features` (no audio dependencies for sandboxed environments)
+- Local dev: Build with default features (audio_playback enabled automatically)
 - Integration tests: Use synthetic fixtures, verify state transitions
 
 ## Observability
 
 ### Metrics to Track
+
 ```rust
 pub struct AudioMetrics {
     pub total_playback_time: Duration,
@@ -195,6 +205,7 @@ pub struct AudioMetrics {
 ```
 
 ### Logging Strategy
+
 ```rust
 // Structured logging for debugging
 log::debug!(

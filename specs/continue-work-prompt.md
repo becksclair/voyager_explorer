@@ -133,8 +133,9 @@ Operate autonomously and methodically:
    - Prefer editing existing modules over creating new ones.
    - Keep diffs focused; avoid large rewrites unless strictly necessary.
    - Respect feature flags:
-     - `audio_playback` gates rodio usage.
+     - `audio_playback` gates rodio usage (enabled by default).
      - `test_fixtures` gates synthetic audio helpers.
+     - Use `--no-default-features` for CI/CD environments to disable audio dependencies.
 
 3. **Verification (MANDATORY after non-trivial changes)**
    - From repo root, run at least:
@@ -143,7 +144,7 @@ Operate autonomously and methodically:
      - `cargo test --all`
      - `cargo check`
    - For audio changes, also run:
-     - `cargo run` (or `cargo run --features audio_playback`)
+     - `cargo run` (audio_playback enabled by default)
      - Manually load a WAV (or synthetic test WAV) and confirm:
        - Playback starts/stops/pauses as expected.
        - Seeking works and doesn’t crash.

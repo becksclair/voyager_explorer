@@ -72,16 +72,21 @@ fn test_decoding_produces_consistent_output() {
     let params = DecoderParams {
         line_duration_ms: 10.0,
         threshold: 0.3,
+        decode_window_secs: 2.0,
     };
 
     // Generate square wave for clear pattern
     let signal = generate_square_wave(50.0, 0.5, 44100, 0.8);
 
     // Decode once
-    let pixels1 = decoder.decode(&signal, &params, 44100);
+    let pixels1 = decoder
+        .decode(&signal, &params, 44100)
+        .expect("Decode should succeed");
 
     // Decode again with same input
-    let pixels2 = decoder.decode(&signal, &params, 44100);
+    let pixels2 = decoder
+        .decode(&signal, &params, 44100)
+        .expect("Decode should succeed");
 
     // Should produce identical output
     assert_eq!(pixels1.len(), pixels2.len());
@@ -176,7 +181,7 @@ fn test_chirp_signal_properties() {
     // Amplitude should stay within expected range
     let max_amp = chirp
         .iter()
-        .map(|&s| s.abs())
+        .map(|&s: &f32| s.abs())
         .fold::<f32, _>(0.0f32, f32::max);
     assert!(
         (max_amp - 0.7).abs() < 0.05,
@@ -187,8 +192,8 @@ fn test_chirp_signal_properties() {
     let first_quarter = &chirp[0..11025];
     let last_quarter = &chirp[33075..44100];
 
-    let avg_first: f32 = first_quarter.iter().map(|s| s.abs()).sum::<f32>() / 11025.0;
-    let avg_last: f32 = last_quarter.iter().map(|s| s.abs()).sum::<f32>() / 11025.0;
+    let avg_first: f32 = first_quarter.iter().map(|s: &f32| s.abs()).sum::<f32>() / 11025.0;
+    let avg_last: f32 = last_quarter.iter().map(|s: &f32| s.abs()).sum::<f32>() / 11025.0;
 
     // Both should have significant energy (not silence)
     assert!(avg_first > 0.1, "First quarter should have energy");
@@ -260,8 +265,8 @@ fn test_empty_audio_handling() {
     let empty: Vec<f32> = vec![];
     let result = decoder.decode(&empty, &params, 44100);
 
-    // Should return empty without crashing
-    assert!(result.is_empty());
+    // Should return error for empty input
+    assert!(result.is_err(), "Empty input should return error");
 
     // Find sync in empty - should return empty
     let positions = decoder.find_sync_positions(&empty, 44100);
@@ -289,14 +294,20 @@ fn test_parameter_variation_affects_output() {
     let params_short = DecoderParams {
         line_duration_ms: 5.0,
         threshold: 0.3,
+        decode_window_secs: 2.0,
     };
     let params_long = DecoderParams {
         line_duration_ms: 15.0,
         threshold: 0.3,
+        decode_window_secs: 2.0,
     };
 
-    let pixels_short = decoder.decode(&signal, &params_short, 44100);
-    let pixels_long = decoder.decode(&signal, &params_long, 44100);
+    let pixels_short = decoder
+        .decode(&signal, &params_short, 44100)
+        .expect("Short duration decode should succeed");
+    let pixels_long = decoder
+        .decode(&signal, &params_long, 44100)
+        .expect("Long duration decode should succeed");
 
     // Different line durations should produce different number of lines
     let lines_short = pixels_short.len() / 512;
@@ -355,7 +366,7 @@ fn test_composite_signal_structure() {
     );
 
     // Should not be all zeros
-    let non_zero_count = composite.iter().filter(|&&s| s.abs() > 0.01).count();
+    let non_zero_count = composite.iter().filter(|&&s: &&f32| s.abs() > 0.01).count();
     assert!(
         non_zero_count > 10000,
         "Composite should have significant non-zero content"

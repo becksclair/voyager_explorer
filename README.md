@@ -136,6 +136,7 @@ pub struct VoyagerApp {
 - Rust 1.70+ with Cargo
 - Linux audio libraries: `sudo dnf install alsa-lib-devel`
 - WAV audio files from Voyager Golden Record
+- (Optional) [just](https://github.com/casey/just) command runner: `cargo install just` or `scoop install just` (Windows)
 
 ### **Building & Running**
 
@@ -144,7 +145,7 @@ pub struct VoyagerApp {
 git clone https://github.com/your-username/voyager_explorer
 cd voyager_explorer
 
-# Run in development mode
+# Run in development mode (audio_playback enabled by default)
 cargo run
 
 # Build optimized release
@@ -152,6 +153,46 @@ cargo build --release
 
 # Run comprehensive tests (29 total)
 cargo test
+
+# For sandboxed environments (CI/CD, no audio dependencies)
+cargo test --no-default-features
+```
+
+### **Using Just Commands** (Recommended)
+
+The project includes a `justfile` with common development tasks:
+
+```bash
+# See all available commands
+just --list
+
+# Run the app
+just run
+just run-debug         # With debug logging
+just run-no-audio      # Without audio feature
+
+# Build
+just build
+just build-release
+
+# Testing
+just test              # Default tests
+just test-all          # All feature combinations
+just test-unit         # Unit tests only
+just test-integration  # Integration tests only
+
+# Code quality
+just fmt               # Format code
+just fmt-check         # Check formatting
+just clippy-all        # Run clippy on all feature combinations
+
+# CI verification (run before pushing!)
+just ci                # Run all CI checks: format, clippy, tests, type checks
+
+# Other utilities
+just install-hooks     # Install git hooks
+just clean             # Clean build artifacts
+just docs              # Build and open documentation
 ```
 
 ### **Using the Application**
@@ -184,8 +225,11 @@ cargo test
   - Error handling and edge cases
 
 ```bash
-# Run all tests
+# Run all tests (with audio_playback feature)
 cargo test
+
+# Run tests without audio dependencies (for CI/sandboxed environments)
+cargo test --no-default-features
 
 # Run specific test categories
 cargo test --lib          # Unit tests only
@@ -225,10 +269,16 @@ voyager_explorer/
 ### **Key Dependencies**
 
 - **egui + eframe** (0.33.0) - Modern immediate-mode GUI
-- **rodio** (0.21.1, optional via `audio_playback` feature) - Audio playback backend for planned sound output
+- **rodio** (0.21.1, optional via `audio_playback` feature) - Audio playback backend (enabled by default)
 - **hound** (3.5.1) - WAV file reading and processing
 - **realfft** (3.5.0) - FFT operations for sync detection
 - **rfd** (0.15.4) - Native file dialogs
+
+### **Feature Configuration**
+
+- **Default**: `audio_playback` feature enabled (includes rodio for audio output)
+- **Sandboxed**: Use `--no-default-features` to disable audio dependencies (ideal for CI/CD)
+- **Development**: Full feature set available with `cargo run` (no additional flags needed)
 
 ### **Development Commands**
 
@@ -248,6 +298,16 @@ RUST_LOG=debug cargo run
 # Generate documentation
 cargo doc --open
 ```
+
+### **Git hooks (auto-format on commit)**
+
+Run this once per clone to enable the shared pre-commit hook:
+
+```bash
+git config core.hooksPath githooks
+```
+
+This configures Git to use the repo's `githooks/pre-commit`, which runs `cargo fmt` before each commit.
 
 > **Editor note:** many tests rely on the `test_fixtures` feature (it supplies synthetic audio generators). Enable it via `cargo test --features test_fixtures` or set `rust-analyzer.cargo.features = ["test_fixtures"]` (see `.vscode/settings.json`) so IDE diagnostics resolve the same symbols contributors see when running tests locally.
 

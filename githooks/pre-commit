@@ -1,0 +1,4 @@
+#!/bin/sh
+
+# Format Rust code before commit
+cargo fmt || exit 1
