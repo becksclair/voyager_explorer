@@ -239,7 +239,7 @@ fn spawn_decode_worker() -> (
             let decode_start = Instant::now();
 
             // Extract decode window from shared buffer
-            let window_duration_secs = 2.0; // 2-second decode window
+            let window_duration_secs = params.decode_window_secs;
             let window_samples = (window_duration_secs * sample_rate as f64) as usize;
             let end_offset = (start_offset + window_samples).min(samples.len());
             let decode_slice = &samples[start_offset..end_offset];
@@ -285,7 +285,11 @@ impl Default for VoyagerApp {
         let (decode_tx, decode_rx, worker_handle) = spawn_decode_worker();
 
         // Load configuration from file or use defaults
-        let config = AppConfig::load_or_default(AppConfig::default_path());
+        let mut config = AppConfig::load_or_default(AppConfig::default_path());
+        if let Err(e) = config.validate() {
+            tracing::warn!("Invalid config, using defaults: {}", e);
+            config = AppConfig::default();
+        }
 
         tracing::info!(
             config_path = %AppConfig::default_path().display(),
@@ -296,6 +300,7 @@ impl Default for VoyagerApp {
         let params = DecoderParams {
             line_duration_ms: config.decoder.default_line_duration_ms,
             threshold: config.decoder.default_threshold,
+            decode_window_secs: config.decoder.decode_window_secs as f64,
         };
 
         Self {

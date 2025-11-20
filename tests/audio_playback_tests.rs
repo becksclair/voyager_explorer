@@ -72,6 +72,7 @@ fn test_decoding_produces_consistent_output() {
     let params = DecoderParams {
         line_duration_ms: 10.0,
         threshold: 0.3,
+        decode_window_secs: 2.0,
     };
 
     // Generate square wave for clear pattern
@@ -293,10 +294,12 @@ fn test_parameter_variation_affects_output() {
     let params_short = DecoderParams {
         line_duration_ms: 5.0,
         threshold: 0.3,
+        decode_window_secs: 2.0,
     };
     let params_long = DecoderParams {
         line_duration_ms: 15.0,
         threshold: 0.3,
+        decode_window_secs: 2.0,
     };
 
     let pixels_short = decoder

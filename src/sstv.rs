@@ -11,6 +11,7 @@ const CHUNK_SIZE: usize = 2048;
 pub struct DecoderParams {
     pub line_duration_ms: f32,
     pub threshold: f32,
+    pub decode_window_secs: f64,
 }
 
 impl Default for DecoderParams {
@@ -18,6 +19,7 @@ impl Default for DecoderParams {
         Self {
             line_duration_ms: 8.3,
             threshold: 0.2,
+            decode_window_secs: 2.0,
         }
     }
 }
@@ -342,6 +344,7 @@ mod tests {
         let params = DecoderParams {
             line_duration_ms: 10.0, // Short duration for testing
             threshold: 0.3,
+            decode_window_secs: 2.0,
         };
 
         let sample_rate = 44100;
@@ -443,6 +446,7 @@ mod tests {
             (1.0f32..=100.0, 0.0f32..=1.0).prop_map(|(line_duration_ms, threshold)| DecoderParams {
                 line_duration_ms,
                 threshold,
+                decode_window_secs: 2.0,
             })
         }
 
@@ -542,6 +546,7 @@ mod tests {
                 let params = DecoderParams {
                     line_duration_ms: invalid_duration,
                     threshold: 0.5,
+                    decode_window_secs: 2.0,
                 };
 
                 let result = decoder.decode(&samples, &params, sample_rate);
@@ -565,6 +570,7 @@ mod tests {
                 let params = DecoderParams {
                     line_duration_ms: 10.0,
                     threshold: invalid_threshold,
+                    decode_window_secs: 2.0,
                 };
 
                 let result = decoder.decode(&samples, &params, sample_rate);

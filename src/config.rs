@@ -254,6 +254,15 @@ impl AppConfig {
             });
         }
 
+        if !(0.1..=60.0).contains(&self.decoder.decode_window_secs) {
+            return Err(ConfigError::ValidationFailed {
+                reason: format!(
+                    "Decode window {}s out of range 0.1-60s",
+                    self.decoder.decode_window_secs
+                ),
+            });
+        }
+
         if !self.decoder.fft_chunk_size.is_power_of_two() {
             return Err(ConfigError::ValidationFailed {
                 reason: format!(

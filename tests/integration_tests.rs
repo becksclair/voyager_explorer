@@ -96,6 +96,7 @@ fn test_full_workflow_wav_to_image() {
     let params = DecoderParams {
         line_duration_ms: 20.0, // Longer lines for test data
         threshold: 0.3,
+        decode_window_secs: 2.0,
     };
 
     // Get samples from left channel
@@ -235,10 +236,12 @@ fn test_parameter_variations() {
     let params_fast = DecoderParams {
         line_duration_ms: 5.0,
         threshold: 0.3,
+        decode_window_secs: 2.0,
     };
     let params_slow = DecoderParams {
         line_duration_ms: 50.0,
         threshold: 0.3,
+        decode_window_secs: 2.0,
     };
 
     let pixels_fast = decoder
@@ -258,10 +261,12 @@ fn test_parameter_variations() {
     let params_low_thresh = DecoderParams {
         line_duration_ms: 10.0,
         threshold: 0.1,
+        decode_window_secs: 2.0,
     };
     let params_high_thresh = DecoderParams {
         line_duration_ms: 10.0,
         threshold: 0.9,
+        decode_window_secs: 2.0,
     };
 
     let pixels_low = decoder
