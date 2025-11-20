@@ -261,6 +261,16 @@ RUST_LOG=debug cargo run
 cargo doc --open
 ```
 
+### **Git hooks (auto-format on commit)**
+
+Run this once per clone to enable the shared pre-commit hook:
+
+```bash
+git config core.hooksPath githooks
+```
+
+This configures Git to use the repo's `githooks/pre-commit`, which runs `cargo fmt` before each commit.
+
 > **Editor note:** many tests rely on the `test_fixtures` feature (it supplies synthetic audio generators). Enable it via `cargo test --features test_fixtures` or set `rust-analyzer.cargo.features = ["test_fixtures"]` (see `.vscode/settings.json`) so IDE diagnostics resolve the same symbols contributors see when running tests locally.
 
 ### **Code Quality Standards**

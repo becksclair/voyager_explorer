@@ -63,8 +63,9 @@
 
 ## Development workflow
 
+- When setting up the repo, enable shared git hooks with `git config core.hooksPath githooks` so the `githooks/pre-commit` hook runs `cargo fmt` automatically on each commit.
 - Prefer small, incremental changes that keep the app running; prototype/MVP first, then refine.
 - For non-trivial edits, run at least: `cargo fmt`, `cargo clippy`, `cargo check`, and `cargo test` (with `--features test_fixtures` when relevant), plus a quick `cargo run` smoke test.
 - Add at least one happy-path test when it provides clear value, especially for new decoding or audio behaviors.
 - Verify real-time performance and interactive behavior with reasonably large WAV files before considering work "done".
-- Keep `AGENTS.md`, `README.md`, and `specs/implementation.md` aligned when you reshape architecture or public APIs.
+- Keep `AGENTS.md`, `README.md`, and `specs/implementation.md` aligned when you reshape modules or public APIs.
