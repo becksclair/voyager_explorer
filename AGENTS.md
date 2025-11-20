@@ -63,9 +63,11 @@
 
 ## Development workflow
 
-- When setting up the repo, enable shared git hooks with `git config core.hooksPath githooks` so the `githooks/pre-commit` hook runs `cargo fmt` automatically on each commit.
+- When setting up the repo, enable shared git hooks with `git config core.hooksPath githooks` (or run `just install-hooks`) so the `githooks/pre-commit` hook runs `cargo fmt` automatically on each commit.
 - Prefer small, incremental changes that keep the app running; prototype/MVP first, then refine.
 - For non-trivial edits, run at least: `cargo fmt`, `cargo clippy`, `cargo check`, and `cargo test` (with `--features test_fixtures` when relevant), plus a quick `cargo run` smoke test.
+- **CRITICAL: Before marking any task as complete, run `just ci` to verify all CI checks pass.** This runs formatting checks, clippy on both feature configurations, all tests, and type checking—ensuring everything works before pushing to GitHub.
 - Add at least one happy-path test when it provides clear value, especially for new decoding or audio behaviors.
 - Verify real-time performance and interactive behavior with reasonably large WAV files before considering work "done".
+- Use the `justfile` for common tasks (see `just --list` for all available commands); key recipes include `just run`, `just test-all`, `just clippy-all`, and `just ci`.
 - Keep `AGENTS.md`, `README.md`, and `specs/implementation.md` aligned when you reshape modules or public APIs.

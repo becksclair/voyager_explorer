@@ -136,6 +136,7 @@ pub struct VoyagerApp {
 - Rust 1.70+ with Cargo
 - Linux audio libraries: `sudo dnf install alsa-lib-devel`
 - WAV audio files from Voyager Golden Record
+- (Optional) [just](https://github.com/casey/just) command runner: `cargo install just` or `scoop install just` (Windows)
 
 ### **Building & Running**
 
@@ -155,6 +156,43 @@ cargo test
 
 # For sandboxed environments (CI/CD, no audio dependencies)
 cargo test --no-default-features
+```
+
+### **Using Just Commands** (Recommended)
+
+The project includes a `justfile` with common development tasks:
+
+```bash
+# See all available commands
+just --list
+
+# Run the app
+just run
+just run-debug         # With debug logging
+just run-no-audio      # Without audio feature
+
+# Build
+just build
+just build-release
+
+# Testing
+just test              # Default tests
+just test-all          # All feature combinations
+just test-unit         # Unit tests only
+just test-integration  # Integration tests only
+
+# Code quality
+just fmt               # Format code
+just fmt-check         # Check formatting
+just clippy-all        # Run clippy on all feature combinations
+
+# CI verification (run before pushing!)
+just ci                # Run all CI checks: format, clippy, tests, type checks
+
+# Other utilities
+just install-hooks     # Install git hooks
+just clean             # Clean build artifacts
+just docs              # Build and open documentation
 ```
 
 ### **Using the Application**
