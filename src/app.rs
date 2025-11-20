@@ -413,17 +413,20 @@ impl VoyagerApp {
             return false;
         }
 
-        // Check for response timeout
-        let elapsed = self.worker_last_response.elapsed();
-        let timeout_threshold = Duration::from_millis(self.config.worker.max_unresponsive_ms);
+        // Only check timeout if we have pending requests
+        if self.next_decode_id > 0 {
+            // Check for response timeout
+            let elapsed = self.worker_last_response.elapsed();
+            let timeout_threshold = Duration::from_millis(self.config.worker.max_unresponsive_ms);
 
-        if elapsed > timeout_threshold {
-            tracing::warn!(
-                elapsed_ms = elapsed.as_millis(),
-                threshold_ms = timeout_threshold.as_millis(),
-                "Worker thread unresponsive, needs restart"
-            );
-            return false;
+            if elapsed > timeout_threshold {
+                tracing::warn!(
+                    elapsed_ms = elapsed.as_millis(),
+                    threshold_ms = timeout_threshold.as_millis(),
+                    "Worker thread unresponsive, needs restart"
+                );
+                return false;
+            }
         }
 
         true
