@@ -189,6 +189,7 @@ pub struct VoyagerApp {
     decode_tx: Option<Sender<DecodeRequest>>,
     decode_rx: Option<Receiver<DecodeResult>>,
     next_decode_id: u64,
+    pending_decode_requests: usize,
     worker_handle: Option<JoinHandle<()>>,
     worker_last_response: Instant,
 
@@ -317,6 +318,7 @@ impl Default for VoyagerApp {
             decode_tx: Some(decode_tx),
             decode_rx: Some(decode_rx),
             next_decode_id: 0,
+            pending_decode_requests: 0,
             worker_handle: Some(worker_handle),
             worker_last_response: Instant::now(),
             metrics: AppMetrics::new(),
@@ -414,7 +416,7 @@ impl VoyagerApp {
         }
 
         // Only check timeout if we have pending requests
-        if self.next_decode_id > 0 {
+        if self.pending_decode_requests > 0 {
             // Check for response timeout
             let elapsed = self.worker_last_response.elapsed();
             let timeout_threshold = Duration::from_millis(self.config.worker.max_unresponsive_ms);
@@ -450,6 +452,7 @@ impl VoyagerApp {
         self.decode_tx = Some(decode_tx);
         self.decode_rx = Some(decode_rx);
         self.worker_handle = Some(worker_handle);
+        self.pending_decode_requests = 0;
         self.worker_last_response = Instant::now();
 
         // Record restart in metrics
@@ -651,11 +654,13 @@ impl VoyagerApp {
                 };
 
                 self.next_decode_id += 1;
+                self.pending_decode_requests += 1;
 
                 // Send to worker thread (non-blocking, returns immediately)
                 // If worker is busy, request queues up in channel
                 if decode_tx.send(request).is_err() {
                     tracing::warn!("Decode worker thread has terminated");
+                    self.pending_decode_requests = self.pending_decode_requests.saturating_sub(1);
                 }
             }
         }
@@ -925,6 +930,7 @@ impl eframe::App for VoyagerApp {
                 // Record metrics (track both success and failure)
                 self.metrics
                     .record_decode(decode_duration, pixels.len(), success);
+                self.pending_decode_requests = self.pending_decode_requests.saturating_sub(1);
                 self.worker_last_response = Instant::now();
 
                 // Handle error or update texture
