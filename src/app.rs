@@ -361,7 +361,7 @@ impl VoyagerApp {
     fn handle_decode(&mut self, ctx: &egui::Context) {
         if let Some(reader) = &self.wav_reader {
             let samples = reader.get_samples(self.selected_channel);
-            
+
             // Clear any previous errors
             self.error_message = None;
 
@@ -518,7 +518,8 @@ impl VoyagerApp {
                     let stream = match self.ensure_audio_stream() {
                         Some(s) => s,
                         None => {
-                            self.error_message = Some("Failed to initialize audio stream".to_string());
+                            self.error_message =
+                                Some("Failed to initialize audio stream".to_string());
                             return;
                         }
                     };
@@ -538,7 +539,8 @@ impl VoyagerApp {
                     }
                 }
                 AudioPlaybackState::Uninitialized => {
-                    self.error_message = Some("Audio not initialized - load a file first".to_string());
+                    self.error_message =
+                        Some("Audio not initialized - load a file first".to_string());
                 }
                 AudioPlaybackState::Error(_) => {
                     self.error_message = Some(format!("Cannot play: {}", self.audio_state));
@@ -621,7 +623,7 @@ impl VoyagerApp {
                     tracing::warn!("No samples available for decoding");
                     return;
                 }
-                
+
                 if position >= samples.len() {
                     tracing::warn!(
                         position = position,
@@ -666,12 +668,12 @@ impl VoyagerApp {
     fn seek_to_next_sync(&mut self) {
         if let Some(reader) = &self.wav_reader {
             let samples = reader.get_samples(self.selected_channel);
-            
+
             if samples.is_empty() {
                 tracing::warn!("No samples available for sync detection");
                 return;
             }
-            
+
             // Ensure current position is within bounds
             if self.current_position_samples >= samples.len() {
                 tracing::warn!(
@@ -681,7 +683,7 @@ impl VoyagerApp {
                 );
                 self.current_position_samples = 0;
             }
-            
+
             let next_sync = self.video_decoder.find_next_sync(
                 samples,
                 self.current_position_samples,
@@ -870,7 +872,7 @@ impl Drop for VoyagerApp {
         // Drop channels first to signal worker thread to shut down
         self.decode_tx = None;
         self.decode_rx = None;
-        
+
         // Join worker thread to prevent panic on shutdown
         if let Some(handle) = self.worker_handle.take() {
             if let Err(e) = handle.join() {
@@ -963,7 +965,7 @@ impl eframe::App for VoyagerApp {
                     // Decode every 500ms of audio to avoid flooding worker thread
                     let decode_threshold_samples = (wav_reader.sample_rate as f32 * 0.5) as usize;
                     let position_change = new_position.abs_diff(self.last_decode_position);
-                    
+
                     if position_change >= decode_threshold_samples {
                         self.decode_at_position(ctx, new_position);
                         self.last_decode_position = new_position;
@@ -1167,29 +1169,29 @@ impl eframe::App for VoyagerApp {
                         }
                     }
 
-                        // Track hover position for vertical line
-                        if response.hovered() {
-                            if let Some(hover_pos) = response.hover_pos() {
-                                let relative_x = (hover_pos.x - rect.min.x) / rect.width();
-                                self.waveform_hover_position = Some(relative_x.clamp(0.0, 1.0));
-                            }
-                        } else {
-                            self.waveform_hover_position = None;
+                    // Track hover position for vertical line
+                    if response.hovered() {
+                        if let Some(hover_pos) = response.hover_pos() {
+                            let relative_x = (hover_pos.x - rect.min.x) / rect.width();
+                            self.waveform_hover_position = Some(relative_x.clamp(0.0, 1.0));
                         }
+                    } else {
+                        self.waveform_hover_position = None;
+                    }
 
-                        self.draw_waveform_internal(
-                            ui,
-                            &rect,
-                            samples,
-                            current_position,
-                            hover_position,
-                        );
+                    self.draw_waveform_internal(
+                        ui,
+                        &rect,
+                        samples,
+                        current_position,
+                        hover_position,
+                    );
 
-                        // Trigger decode on manual seek (user clicked)
-                        if response.clicked() {
-                            self.decode_at_position(ctx, self.current_position_samples);
-                            self.last_decode_position = self.current_position_samples;
-                        }
+                    // Trigger decode on manual seek (user clicked)
+                    if response.clicked() {
+                        self.decode_at_position(ctx, self.current_position_samples);
+                        self.last_decode_position = self.current_position_samples;
+                    }
 
                     // Restart audio after drawing is complete (borrow checker fix)
                     #[cfg(feature = "audio_playback")]

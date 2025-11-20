@@ -118,7 +118,10 @@ impl AudioError {
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
-            Self::DeviceDisconnected | Self::BufferUnderrun | Self::SinkCreationFailed | Self::SinkNotAvailable
+            Self::DeviceDisconnected
+                | Self::BufferUnderrun
+                | Self::SinkCreationFailed
+                | Self::SinkNotAvailable
         )
     }
 

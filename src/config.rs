@@ -179,7 +179,7 @@ impl Default for MetricsConfig {
 
 impl AppConfig {
     /// Load configuration from TOML file
-    /// 
+    ///
     /// Partial TOML files are supported - missing fields will be filled with default values
     /// from the Default implementations of each config struct.
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
@@ -215,9 +215,8 @@ impl AppConfig {
             })?;
         }
 
-        let contents = toml::to_string_pretty(self).map_err(|source| ConfigError::SerializationFailed {
-            source,
-        })?;
+        let contents = toml::to_string_pretty(self)
+            .map_err(|source| ConfigError::SerializationFailed { source })?;
 
         std::fs::write(path, contents).map_err(|source| ConfigError::SaveFailed {
             path: Box::new(path.to_path_buf()),
@@ -384,16 +383,16 @@ image_width = 256
         std::fs::write(temp_file.path(), toml_content).expect("Should write to temp file");
 
         let config = AppConfig::load_from_file(temp_file.path()).expect("Should load config");
-        
+
         // File-loaded values should override defaults
         assert_eq!(config.decoder.default_line_duration_ms, 10.0);
         assert_eq!(config.ui.image_width, 256);
-        
+
         // Unspecified values should use defaults from struct field definitions
         assert_eq!(config.decoder.default_threshold, 0.2); // Default from DecoderConfig::default()
         assert_eq!(config.ui.max_image_height, 16384); // Default from UiConfig::default()
         assert_eq!(config.ui.waveform_height, 200.0); // Default from UiConfig::default()
-        
+
         // Config should be valid
         assert!(config.validate().is_ok());
     }
@@ -403,12 +402,15 @@ image_width = 256
         // Test that load_or_default falls back to defaults when file doesn't exist
         let nonexistent_path = "nonexistent_config.toml";
         let config = AppConfig::load_or_default(nonexistent_path);
-        
+
         // Should get all default values
         let default_config = AppConfig::default();
-        assert_eq!(config.decoder.default_line_duration_ms, default_config.decoder.default_line_duration_ms);
+        assert_eq!(
+            config.decoder.default_line_duration_ms,
+            default_config.decoder.default_line_duration_ms
+        );
         assert_eq!(config.ui.image_width, default_config.ui.image_width);
-        
+
         // Config should be valid
         assert!(config.validate().is_ok());
     }
