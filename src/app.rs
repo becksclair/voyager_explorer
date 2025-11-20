@@ -18,6 +18,8 @@ use crate::audio_state::AudioError;
 
 #[cfg(feature = "audio_playback")]
 use rodio::{OutputStream, OutputStreamBuilder, Sink, Source};
+
+#[cfg(feature = "audio_playback")]
 use rodio::mixer::Mixer;
 
 /// Request to decode audio samples in background thread.

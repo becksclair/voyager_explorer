@@ -91,11 +91,13 @@ Agents should read these before making non-trivial changes:
 From `README.md`, `CLAUDE.md`, and `AGENTS.md`:
 
 - Build / run:
-  - `cargo run`
+  - `cargo run` (audio_playback enabled by default)
   - `cargo build`
   - `cargo build --release`
+  - `cargo build --no-default-features` (for CI/CD, no audio dependencies)
 - Tests:
-  - `cargo test` (all tests)
+  - `cargo test` (all tests, with audio_playback feature)
+  - `cargo test --no-default-features` (without audio dependencies)
   - `cargo test --lib` (unit)
   - `cargo test --test integration_tests` (integration)
 - Lint / format / check:
@@ -147,7 +149,7 @@ All milestones that require audio for tests or manual QA should use **synthetic 
     - **State machine integration**: `VoyagerApp` now uses `audio_state: AudioPlaybackState` instead of bare `is_playing: bool`.
     - **Metrics tracking**: All playback operations (play, pause, stop, seek) recorded via `audio_metrics`.
     - **UI status indicator**: Debug panel shows audio state with icons (🔊 ▶️ ⏸️ ⚠️) and messages.
-    - **Feature flag support**: Builds and tests pass with and without `audio_playback` feature (48 tests pass, zero clippy warnings).
+    - **Feature flag support**: Builds and tests pass with and without `audio_playback` feature (48 tests pass, zero clippy warnings). Note: `audio_playback` is enabled by default; use `--no-default-features` for CI/CD environments.
 
 - **Milestone 2 – Non-blocking Decoding & Performance**
   - `decode_at_position` runs entirely on the UI thread, and there is no background decoding worker or message-passing yet.
