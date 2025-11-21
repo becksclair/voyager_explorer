@@ -3,7 +3,7 @@ use std::io::Write;
 use tempfile::NamedTempFile;
 use voyager_explorer::audio::{WavReader, WaveformChannel};
 use voyager_explorer::image_output::image_from_pixels;
-use voyager_explorer::sstv::{DecoderParams, SstvDecoder};
+use voyager_explorer::sstv::{DecoderMode, DecoderParams, SstvDecoder};
 use voyager_explorer::utils::format_duration;
 
 /// Create a test WAV file with synthetic SSTV-like data
@@ -97,6 +97,7 @@ fn test_full_workflow_wav_to_image() {
         line_duration_ms: 20.0, // Longer lines for test data
         threshold: 0.3,
         decode_window_secs: 2.0,
+        mode: DecoderMode::BinaryGrayscale,
     };
 
     // Get samples from left channel
@@ -128,7 +129,7 @@ fn test_full_workflow_wav_to_image() {
     }
 
     // Test image creation
-    let image = image_from_pixels(&decoded_pixels);
+    let image = image_from_pixels(&decoded_pixels, DecoderMode::BinaryGrayscale);
     assert_eq!(image.size[0], 512); // Width should be 512
     assert!(image.size[1] > 0); // Height should be positive
     assert_eq!(image.pixels.len(), image.size[0] * image.size[1]); // Correct pixel count
@@ -234,14 +235,16 @@ fn test_parameter_variations() {
 
     // Test with different line durations
     let params_fast = DecoderParams {
-        line_duration_ms: 5.0,
-        threshold: 0.3,
+        line_duration_ms: 8.3,
+        threshold: 0.2,
         decode_window_secs: 2.0,
+        mode: DecoderMode::BinaryGrayscale,
     };
     let params_slow = DecoderParams {
         line_duration_ms: 50.0,
         threshold: 0.3,
         decode_window_secs: 2.0,
+        mode: DecoderMode::BinaryGrayscale,
     };
 
     let pixels_fast = decoder
@@ -262,11 +265,13 @@ fn test_parameter_variations() {
         line_duration_ms: 10.0,
         threshold: 0.1,
         decode_window_secs: 2.0,
+        mode: DecoderMode::BinaryGrayscale,
     };
     let params_high_thresh = DecoderParams {
         line_duration_ms: 10.0,
         threshold: 0.9,
         decode_window_secs: 2.0,
+        mode: DecoderMode::BinaryGrayscale,
     };
 
     let pixels_low = decoder

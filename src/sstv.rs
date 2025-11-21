@@ -7,11 +7,18 @@ const TARGET_FREQ_HZ: f32 = 1200.0;
 /// FFT chunk size for frequency analysis
 const CHUNK_SIZE: usize = 2048;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecoderMode {
+    BinaryGrayscale,
+    PseudoColor,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DecoderParams {
     pub line_duration_ms: f32,
     pub threshold: f32,
     pub decode_window_secs: f64,
+    pub mode: DecoderMode,
 }
 
 impl Default for DecoderParams {
@@ -20,6 +27,7 @@ impl Default for DecoderParams {
             line_duration_ms: 8.3,
             threshold: 0.2,
             decode_window_secs: 2.0,
+            mode: DecoderMode::BinaryGrayscale,
         }
     }
 }
@@ -174,7 +182,8 @@ impl SstvDecoder {
     ///
     /// # Returns
     ///
-    /// Grayscale pixels (0-255) in row-major order, width=512px
+    /// Grayscale pixels (0-255) in row-major order, width=512px.
+    /// In PseudoColor mode, returns RGB pixels (3 bytes per pixel).
     ///
     /// # Errors
     ///
@@ -266,6 +275,39 @@ impl SstvDecoder {
             lines_decoded += 1;
         }
 
+        // Post-process for PseudoColor mode
+        if params.mode == DecoderMode::PseudoColor {
+            // Group 3 lines (R, G, B) into one color line
+            // Current image buffer contains grayscale pixels (0 or 255)
+            // We need to transform this into RGB pixels
+            // Format: [R, G, B, R, G, B, ...]
+
+            let num_pixels = image.len();
+            let num_lines = num_pixels / width;
+            let num_color_lines = num_lines / 3;
+
+            let mut color_image = Vec::with_capacity(num_color_lines * width * 3);
+
+            for line_idx in 0..num_color_lines {
+                let r_start = (line_idx * 3) * width;
+                let g_start = (line_idx * 3 + 1) * width;
+                let b_start = (line_idx * 3 + 2) * width;
+
+                for x in 0..width {
+                    let r = image[r_start + x];
+                    let g = image[g_start + x];
+                    let b = image[b_start + x];
+
+                    color_image.push(r);
+                    color_image.push(g);
+                    color_image.push(b);
+                }
+            }
+
+            // Replace image with color image
+            image = color_image;
+        }
+
         tracing::debug!(
             lines_decoded,
             pixels = image.len(),
@@ -318,6 +360,7 @@ mod tests {
         let params = DecoderParams::default();
         assert_eq!(params.line_duration_ms, 8.3);
         assert_eq!(params.threshold, 0.2);
+        assert_eq!(params.mode, DecoderMode::BinaryGrayscale);
     }
 
     #[test]
@@ -415,6 +458,7 @@ mod tests {
             line_duration_ms: 10.0, // Short duration for testing
             threshold: 0.3,
             decode_window_secs: 2.0,
+            mode: DecoderMode::BinaryGrayscale,
         };
 
         let sample_rate = 44100;
@@ -517,6 +561,7 @@ mod tests {
                 line_duration_ms,
                 threshold,
                 decode_window_secs: 2.0,
+                mode: DecoderMode::BinaryGrayscale,
             })
         }
 
@@ -617,6 +662,7 @@ mod tests {
                     line_duration_ms: invalid_duration,
                     threshold: 0.5,
                     decode_window_secs: 2.0,
+                    mode: DecoderMode::BinaryGrayscale,
                 };
 
                 let result = decoder.decode(&samples, &params, sample_rate);
@@ -641,6 +687,7 @@ mod tests {
                     line_duration_ms: 10.0,
                     threshold: invalid_threshold,
                     decode_window_secs: 2.0,
+                    mode: DecoderMode::BinaryGrayscale,
                 };
 
                 let result = decoder.decode(&samples, &params, sample_rate);

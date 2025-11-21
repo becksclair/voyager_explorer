@@ -4,7 +4,7 @@ use crate::config::AppConfig;
 use crate::error::VoyagerError;
 use crate::image_output::image_from_pixels;
 use crate::metrics::AppMetrics;
-use crate::sstv::{DecoderParams, SstvDecoder};
+use crate::sstv::{DecoderMode, DecoderParams, SstvDecoder};
 use crate::utils::format_duration;
 use eframe::egui;
 use egui::TextureHandle;
@@ -301,6 +301,7 @@ impl Default for VoyagerApp {
             line_duration_ms: config.decoder.default_line_duration_ms,
             threshold: config.decoder.default_threshold,
             decode_window_secs: config.decoder.decode_window_secs as f64,
+            mode: DecoderMode::BinaryGrayscale,
         };
 
         Self {
@@ -385,7 +386,7 @@ impl VoyagerApp {
             {
                 Ok(pixels) => {
                     tracing::info!(pixels = pixels.len(), "Decode completed successfully");
-                    let img = image_from_pixels(&pixels);
+                    let img = image_from_pixels(&pixels, self.params.mode);
                     self.image_texture = Some(ctx.load_texture("decoded", img, Default::default()));
                     self.last_decoded = Some(pixels);
                 }
@@ -942,7 +943,7 @@ impl eframe::App for VoyagerApp {
                 if let Some(err_msg) = error {
                     self.error_message = Some(format!("Decode failed: {}", err_msg));
                 } else if !pixels.is_empty() {
-                    let img = image_from_pixels(&pixels);
+                    let img = image_from_pixels(&pixels, self.params.mode);
                     self.image_texture =
                         Some(ctx.load_texture("decoded_realtime", img, Default::default()));
                     self.last_decoded = Some(pixels);
@@ -1022,6 +1023,26 @@ impl eframe::App for VoyagerApp {
                 ui.add(egui::DragValue::new(&mut self.params.line_duration_ms).range(1..=100));
                 ui.label("🔪 Threshold:");
                 ui.add(egui::Slider::new(&mut self.params.threshold, 0.0..=1.0));
+
+                ui.separator();
+                ui.label("🎨 Mode:");
+                egui::ComboBox::from_label("")
+                    .selected_text(match self.params.mode {
+                        DecoderMode::BinaryGrayscale => "Binary (B/W)",
+                        DecoderMode::PseudoColor => "PseudoColor",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.params.mode,
+                            DecoderMode::BinaryGrayscale,
+                            "Binary (B/W)",
+                        );
+                        ui.selectable_value(
+                            &mut self.params.mode,
+                            DecoderMode::PseudoColor,
+                            "PseudoColor",
+                        );
+                    });
 
                 ui.separator();
                 ui.label("📻 Channel:");

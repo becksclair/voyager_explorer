@@ -6,7 +6,7 @@
 
 use voyager_explorer::audio::WavReader;
 use voyager_explorer::audio_state::{AudioError, AudioPlaybackState};
-use voyager_explorer::sstv::{DecoderParams, SstvDecoder};
+use voyager_explorer::sstv::{DecoderMode, DecoderParams, SstvDecoder};
 use voyager_explorer::test_fixtures::*;
 
 #[test]
@@ -70,9 +70,10 @@ fn test_sync_detection_with_synthetic_pattern() {
 fn test_decoding_produces_consistent_output() {
     let decoder = SstvDecoder::new();
     let params = DecoderParams {
-        line_duration_ms: 10.0,
-        threshold: 0.3,
+        line_duration_ms: 8.3,
+        threshold: 0.2,
         decode_window_secs: 2.0,
+        mode: DecoderMode::BinaryGrayscale,
     };
 
     // Generate square wave for clear pattern
@@ -99,7 +100,19 @@ fn test_decoding_produces_consistent_output() {
 
     // Should have reasonable number of lines
     let num_lines = pixels1.len() / 512;
-    assert!(num_lines > 0, "Should produce at least one line");
+    assert!(
+        num_lines > 10,
+        "Should produce at least 10 lines, got {}",
+        num_lines
+    );
+
+    // Should have meaningful content (not all black or all white)
+    let has_black = pixels1.contains(&0);
+    let has_white = pixels1.contains(&255);
+    assert!(
+        has_black && has_white,
+        "Image should contain both black and white pixels"
+    );
 }
 
 #[test]
@@ -295,11 +308,13 @@ fn test_parameter_variation_affects_output() {
         line_duration_ms: 5.0,
         threshold: 0.3,
         decode_window_secs: 2.0,
+        mode: DecoderMode::BinaryGrayscale,
     };
     let params_long = DecoderParams {
         line_duration_ms: 15.0,
         threshold: 0.3,
         decode_window_secs: 2.0,
+        mode: DecoderMode::BinaryGrayscale,
     };
 
     let pixels_short = decoder
