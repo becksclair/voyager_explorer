@@ -2,8 +2,10 @@
 
 ## Now
 
-- [ ] Currently in planning phase for next feature development
-- [ ] Review and prioritize Milestone 6 advanced features
+- [ ] Milestone 6 kickoff: choose owner and scope for spectrum view + batch decode
+- [ ] Spike: sketch UI for signal analysis panel (spectrum + playback overlay)
+- [ ] Define batch processing flow (CLI flags + optional UI queue) and list required WAV fixtures
+- [ ] If scope not finalized, move items to Later and confirm when to re-plan
 
 ## Later (Milestone 6 - Advanced Features)
 
