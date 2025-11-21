@@ -137,7 +137,7 @@ All milestones that require audio for tests or manual QA should use **synthetic 
 - Prefer short, deterministic signals (sync tones, noise+sync, alternating stripe patterns, stereo differentiation) so tests remain fast and self-explanatory.
 - If a fixed "golden" signal is needed, embed raw `i16` samples as a `const` array and wrap them into a temporary WAV via the existing helpers.
 
-### 0.7. Current Implementation Status (2025-11-18 - Updated)
+### 0.7. Current Implementation Status (2025-11-21 - Updated)
 
 - **Milestone 1 – Real Audio Playback via Rodio** ✅ **COMPLETED**
   - Fully implemented:
@@ -151,16 +151,31 @@ All milestones that require audio for tests or manual QA should use **synthetic 
     - **UI status indicator**: Debug panel shows audio state with icons (🔊 ▶️ ⏸️ ⚠️) and messages.
     - **Feature flag support**: Builds and tests pass with and without `audio_playback` feature (48 tests pass, zero clippy warnings). Note: `audio_playback` is enabled by default; use `--no-default-features` for CI/CD environments.
 
-- **Milestone 2 – Non-blocking Decoding & Performance**
-  - `decode_at_position` runs entirely on the UI thread, and there is no background decoding worker or message-passing yet.
-  - `DecodeRequest` / `DecodeResult` structs and `decode_tx` / `decode_rx` fields on `VoyagerApp` have not been implemented.
+- **Milestone 2 – Non-blocking Decoding & Performance** ✅ **COMPLETED**
+  - Fully implemented:
+    - `DecodeRequest` and `DecodeResult` message structs for worker communication.
+    - Background worker thread with its own `SstvDecoder` instance.
+    - Channels (`decode_tx`, `decode_rx`) for non-blocking message passing.
+    - `decode_at_position` enqueues decode jobs instead of blocking the UI thread.
+    - `update()` polls `decode_rx` and applies latest decode results without blocking.
+    - Worker health monitoring with configurable auto-restart.
+    - Metrics tracking for decode performance (duration, queue depth, errors).
 
-- **Milestone 3 – Sync Detection Logging & Minor Fixes**
-  - `SstvDecoder::detect_sync` still prints `"Sync tone not detected!"` unconditionally at the end, even when a sync was found earlier.
-  - A clippy/cleanup pass is still needed to reconcile imports and scaffolding now that additional tests and modules exist.
+- **Milestone 3 – Sync Detection Logging & Minor Fixes** ✅ **COMPLETED**
+  - Fully implemented:
+    - Fixed `SstvDecoder::detect_sync` logging (only logs when sync not detected).
+    - Cleaned up unused imports and scaffolding.
+    - All clippy warnings resolved.
+    - Code passes `cargo clippy --no-default-features -- -D warnings`.
 
-- **Milestone 4 – Color Image Decoding**
-  - Implemented: `DecoderMode` (BinaryGrayscale, PseudoColor), mode field in `DecoderParams`, PseudoColor packing (RGB from 3 grayscale lines), `image_from_pixels` handles color, UI ComboBox for mode selection, and unit test coverage for PseudoColor.
+- **Milestone 4 – Color Image Decoding** ✅ **COMPLETED**
+  - Fully implemented:
+    - `DecoderMode` enum (BinaryGrayscale, PseudoColor).
+    - Mode field in `DecoderParams` with default BinaryGrayscale.
+    - PseudoColor packing (group 3 lines as R/G/B channels).
+    - `image_from_pixels` handles both grayscale and color modes.
+    - UI ComboBox for mode selection in central panel.
+    - Unit test coverage for PseudoColor decoding logic.
 
 - **Milestone 5 – Presets, Session Persistence, and Export**
   - Not started in code. The `image` crate is wired in and `image_from_pixels` is tested, but there are no presets, session state, or export options in the UI yet.
