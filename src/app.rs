@@ -171,6 +171,7 @@ pub struct VoyagerApp {
     video_decoder: SstvDecoder,
     image_texture: Option<TextureHandle>,
     params: DecoderParams,
+    current_preset: Option<&'static str>,
     last_decoded: Option<Vec<u8>>,
     selected_channel: WaveformChannel,
 
@@ -310,6 +311,7 @@ impl Default for VoyagerApp {
             video_decoder: SstvDecoder::new(),
             image_texture: None,
             params,
+            current_preset: crate::presets::matches_preset(&params),
             last_decoded: None,
             selected_channel: WaveformChannel::Left,
             audio_state: AudioPlaybackState::Uninitialized,
@@ -400,6 +402,161 @@ impl VoyagerApp {
         } else {
             self.error_message = Some("No audio file loaded".to_string());
         }
+    }
+
+    fn handle_save_session(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Session", &["json"])
+            .set_file_name("session.json")
+            .save_file()
+        {
+            // Get the current wav path if available
+            // Note: We can't store the path directly in WavReader, so sessions
+            // will only save the decoder state, not the file path
+            let session = crate::session::SessionState::from_app(
+                None, // WAV path not currently tracked
+                self.current_position_samples,
+                self.selected_channel,
+                &self.params,
+                self.current_preset,
+            );
+
+            match session.save_to_file(&path) {
+                Ok(()) => {
+                    tracing::info!(path = %path.display(), "Session saved successfully");
+                    self.error_message = None;
+                }
+                Err(e) => {
+                    tracing::error!(path = %path.display(), error = %e, "Failed to save session");
+                    self.error_message = Some(format!("Failed to save session: {}", e));
+                }
+            }
+        }
+    }
+
+    fn handle_load_session(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Session", &["json"])
+            .pick_file()
+        {
+            match crate::session::SessionState::load_from_file(&path) {
+                Ok(session) => {
+                    tracing::info!(path = %path.display(), "Session loaded successfully");
+
+                    // Restore decoder parameters
+                    self.params = session.to_params();
+                    self.selected_channel = session.selected_channel;
+                    self.current_position_samples = session.current_position_samples;
+
+                    // Restore preset name (need to find the static reference)
+                    self.current_preset = session
+                        .current_preset
+                        .as_deref()
+                        .and_then(|name| crate::presets::find_preset(name))
+                        .map(|preset| preset.name);
+
+                    // If session includes a wav_path, try to load it
+                    if let Some(wav_path) = session.wav_path {
+                        match WavReader::from_file(&wav_path) {
+                            Ok(reader) => {
+                                tracing::info!(path = %wav_path.display(), "WAV file loaded from session");
+                                self.wav_reader = Some(reader);
+                                self.audio_state = AudioPlaybackState::Ready;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %wav_path.display(),
+                                    error = %e,
+                                    "Failed to load WAV file from session"
+                                );
+                                self.error_message = Some(format!(
+                                    "Session loaded but WAV file could not be loaded: {}",
+                                    e
+                                ));
+                            }
+                        }
+                    }
+
+                    self.error_message = None;
+                }
+                Err(e) => {
+                    tracing::error!(path = %path.display(), error = %e, "Failed to load session");
+                    self.error_message = Some(format!("Failed to load session: {}", e));
+                }
+            }
+        }
+    }
+
+    fn handle_save_image(&mut self) {
+        if let Some(pixels) = &self.last_decoded {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("PNG Image", &["png"])
+                .set_file_name("decoded_image.png")
+                .save_file()
+            {
+                match self.save_image_to_file(pixels, &path) {
+                    Ok(()) => {
+                        tracing::info!(path = %path.display(), "Image saved successfully");
+                        self.error_message = None;
+                    }
+                    Err(e) => {
+                        tracing::error!(path = %path.display(), error = %e, "Failed to save image");
+                        self.error_message = Some(format!("Failed to save image: {}", e));
+                    }
+                }
+            }
+        } else {
+            self.error_message = Some("No decoded image to save".to_string());
+        }
+    }
+
+    fn save_image_to_file(&self, pixels: &[u8], path: &std::path::Path) -> anyhow::Result<()> {
+        use image::{ImageBuffer, Luma, Rgb};
+
+        match self.params.mode {
+            DecoderMode::BinaryGrayscale => {
+                // Fixed width of 512 pixels
+                const WIDTH: u32 = 512;
+                let height = (pixels.len() / WIDTH as usize) as u32;
+
+                if pixels.len() != (WIDTH * height) as usize {
+                    return Err(anyhow::anyhow!(
+                        "Invalid pixel count: expected {}, got {}",
+                        WIDTH * height,
+                        pixels.len()
+                    ));
+                }
+
+                let img: ImageBuffer<Luma<u8>, Vec<u8>> =
+                    ImageBuffer::from_raw(WIDTH, height, pixels.to_vec()).ok_or_else(|| {
+                        anyhow::anyhow!("Failed to create grayscale image buffer")
+                    })?;
+
+                img.save(path)?;
+            }
+            DecoderMode::PseudoColor => {
+                // PseudoColor mode: pixels are RGB, grouped as 3 consecutive values per pixel
+                const WIDTH: u32 = 512;
+                let pixel_count = pixels.len() / 3;
+                let height = (pixel_count / WIDTH as usize) as u32;
+
+                if pixel_count != (WIDTH * height) as usize {
+                    return Err(anyhow::anyhow!(
+                        "Invalid pixel count for color image: expected {}, got {}",
+                        WIDTH * height * 3,
+                        pixels.len()
+                    ));
+                }
+
+                let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+                    ImageBuffer::from_raw(WIDTH, height, pixels.to_vec())
+                        .ok_or_else(|| anyhow::anyhow!("Failed to create color image buffer"))?;
+
+                img.save(path)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Check if the worker thread is healthy and responsive.
@@ -997,6 +1154,22 @@ impl eframe::App for VoyagerApp {
                 if ui.button("🧠 Decode").clicked() {
                     self.handle_decode(ctx);
                 }
+
+                ui.separator();
+
+                if ui.button("💾 Save Session").clicked() {
+                    self.handle_save_session();
+                }
+
+                if ui.button("📁 Load Session").clicked() {
+                    self.handle_load_session();
+                }
+
+                ui.separator();
+
+                if ui.button("🖼️ Save Image").clicked() {
+                    self.handle_save_image();
+                }
             });
 
             // Display error message if present
@@ -1018,15 +1191,65 @@ impl eframe::App for VoyagerApp {
 
             ui.separator();
 
+            // Preset selector
+            ui.horizontal(|ui| {
+                ui.label("🎛️ Preset:");
+                let mut preset_changed = false;
+                let current_text = self.current_preset.unwrap_or("Custom");
+
+                egui::ComboBox::from_label("")
+                    .selected_text(current_text)
+                    .show_ui(ui, |ui| {
+                        // Add "Custom" option
+                        if ui
+                            .selectable_value(&mut self.current_preset, None, "Custom")
+                            .clicked()
+                        {
+                            preset_changed = true;
+                        }
+
+                        // Add all presets
+                        for preset in crate::presets::PRESETS {
+                            if ui
+                                .selectable_value(
+                                    &mut self.current_preset,
+                                    Some(preset.name),
+                                    preset.name,
+                                )
+                                .clicked()
+                            {
+                                preset_changed = true;
+                                self.params = preset.params;
+                            }
+                        }
+                    });
+
+                if ui.button("💾 Save as Preset").clicked() {
+                    // TODO: Implement custom preset saving in a future enhancement
+                    self.error_message =
+                        Some("Custom preset saving not yet implemented".to_string());
+                }
+            });
+
             ui.horizontal(|ui| {
                 ui.label("📏 Line Duration (ms):");
-                ui.add(egui::DragValue::new(&mut self.params.line_duration_ms).range(1..=100));
+                if ui
+                    .add(egui::DragValue::new(&mut self.params.line_duration_ms).range(1..=100))
+                    .changed()
+                {
+                    self.current_preset = crate::presets::matches_preset(&self.params);
+                }
                 ui.label("🔪 Threshold:");
-                ui.add(egui::Slider::new(&mut self.params.threshold, 0.0..=1.0));
+                if ui
+                    .add(egui::Slider::new(&mut self.params.threshold, 0.0..=1.0))
+                    .changed()
+                {
+                    self.current_preset = crate::presets::matches_preset(&self.params);
+                }
 
                 ui.separator();
                 ui.label("🎨 Mode:");
-                egui::ComboBox::from_label("")
+                let mode_changed = egui::ComboBox::from_label("")
                     .selected_text(match self.params.mode {
                         DecoderMode::BinaryGrayscale => "Binary (B/W)",
                         DecoderMode::PseudoColor => "PseudoColor",
@@ -1036,13 +1259,16 @@ impl eframe::App for VoyagerApp {
                             &mut self.params.mode,
                             DecoderMode::BinaryGrayscale,
                             "Binary (B/W)",
-                        );
-                        ui.selectable_value(
+                        ) | ui.selectable_value(
                             &mut self.params.mode,
                             DecoderMode::PseudoColor,
                             "PseudoColor",
-                        );
-                    });
+                        )
+                    })
+                    .inner;
+                if mode_changed.is_some() && mode_changed.unwrap().clicked() {
+                    self.current_preset = crate::presets::matches_preset(&self.params);
+                }
 
                 ui.separator();
                 ui.label("📻 Channel:");

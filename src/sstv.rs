@@ -7,7 +7,7 @@ const TARGET_FREQ_HZ: f32 = 1200.0;
 /// FFT chunk size for frequency analysis
 const CHUNK_SIZE: usize = 2048;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DecoderMode {
     BinaryGrayscale,
     PseudoColor,

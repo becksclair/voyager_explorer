@@ -13,6 +13,8 @@ pub mod config;
 pub mod error;
 pub mod image_output;
 pub mod metrics;
+pub mod presets;
+pub mod session;
 pub mod sstv;
 pub mod utils;
 
