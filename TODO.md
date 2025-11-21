@@ -2,6 +2,9 @@
 
 ## Now
 
+- [ ] Currently in planning phase for next feature development
+- [ ] Review and prioritize Milestone 6 advanced features
+
 ## Later (Milestone 6 - Advanced Features)
 
 - [ ] Milestone 6: Advanced features (optional)
@@ -63,7 +66,7 @@
 
   - [x] Sub-milestone 5.2: Session State Persistence
     - [x] Add `serde` + `serde_json` dependencies
-    - [x] Define `SessionState` struct (serializable with wav path, position, channel, params)
+    - [x] Define `SessionState` struct (serializable with wav path, position, channel, params, preset name)
     - [x] Implement Save/Load Session buttons with rfd dialogs
     - [x] Add session state serialization/deserialization helpers
 
