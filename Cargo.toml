@@ -33,6 +33,7 @@ image = { version = "0.25", default-features = false, features = [
   "png",
 ] }
 realfft = { version = "3.5.0", features = ["avx", "neon", "sse", "wasm_simd"] }
+num-complex = "0.4"
 rfd = "0.15.4"
 rodio = { version = "0.21.1", optional = true, default-features = false, features = ["playback"] }
 tempfile = "3.23"

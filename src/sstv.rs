@@ -43,25 +43,31 @@ impl SstvDecoder {
         fft: &dyn RealToComplex<f32>,
         window: &[f32],
         sample_rate: f32,
+        input_buffer: &mut [f32],
+        spectrum_buffer: &mut [num_complex::Complex<f32>],
     ) -> bool {
-        let mut input: Vec<f32> = samples
+        // Use reusable input buffer
+        for ((s, w), dest) in samples
             .iter()
             .zip(window.iter())
-            .map(|(s, w)| s * w)
-            .collect();
-        let mut spectrum = fft.make_output_vec();
-        fft.process(&mut input, &mut spectrum).unwrap();
+            .zip(input_buffer.iter_mut())
+        {
+            *dest = s * w;
+        }
 
-        let magnitudes: Vec<f32> = spectrum.iter().map(|c| c.norm()).collect();
+        // Process FFT using reusable buffers
+        fft.process(input_buffer, spectrum_buffer).unwrap();
+
         let bin_size = sample_rate / CHUNK_SIZE as f32;
         let target_bin = (TARGET_FREQ_HZ / bin_size).round() as usize;
 
-        if target_bin >= magnitudes.len() {
+        if target_bin >= spectrum_buffer.len() {
             return false;
         }
 
-        let peak = magnitudes[target_bin];
-        let avg = magnitudes.iter().sum::<f32>() / magnitudes.len() as f32;
+        let peak = spectrum_buffer[target_bin].norm();
+        let avg =
+            spectrum_buffer.iter().map(|c| c.norm()).sum::<f32>() / spectrum_buffer.len() as f32;
 
         peak > (avg * 10.0) // Simple threshold, tweak as needed
     }
@@ -80,11 +86,22 @@ impl SstvDecoder {
         let fft = planner.plan_fft_forward(CHUNK_SIZE);
         let window = Self::hann_window(CHUNK_SIZE);
 
+        // Reusable buffers
+        let mut input_buffer = fft.make_input_vec();
+        let mut spectrum_buffer = fft.make_output_vec();
+
         for chunk in samples.chunks(CHUNK_SIZE) {
             if chunk.len() < CHUNK_SIZE {
                 break;
             }
-            let sync_detected = Self::detect_sync_tone(chunk, &*fft, &window, sample_rate as f32);
+            let sync_detected = Self::detect_sync_tone(
+                chunk,
+                &*fft,
+                &window,
+                sample_rate as f32,
+                &mut input_buffer,
+                &mut spectrum_buffer,
+            );
             if sync_detected {
                 return true;
             }
@@ -99,10 +116,22 @@ impl SstvDecoder {
         let fft = planner.plan_fft_forward(CHUNK_SIZE);
         let window = Self::hann_window(CHUNK_SIZE);
 
+        // Reusable buffers
+        let mut input_buffer = fft.make_input_vec();
+        let mut spectrum_buffer = fft.make_output_vec();
+
         let mut i = 0;
         while i + CHUNK_SIZE <= samples.len() {
             let chunk = &samples[i..i + CHUNK_SIZE];
-            let sync_detected = Self::detect_sync_tone(chunk, &*fft, &window, sample_rate as f32);
+            let sync_detected = Self::detect_sync_tone(
+                chunk,
+                &*fft,
+                &window,
+                sample_rate as f32,
+                &mut input_buffer,
+                &mut spectrum_buffer,
+            );
+
             if sync_detected {
                 positions.push(i);
                 // Skip ahead to avoid detecting the same sync signal multiple times
@@ -196,19 +225,37 @@ impl SstvDecoder {
 
         let width = 512;
         let max_lines = 16_384; // GPU texture limit
-        let mut image: Vec<u8> = Vec::new();
+
+        // Pre-allocate image buffer
+        // Estimate number of lines based on sample count, capped at max_lines
+        let estimated_lines = (samples.len() / samples_per_line).min(max_lines);
+        let mut image: Vec<u8> = Vec::with_capacity(width * estimated_lines);
+
         let mut i = 0;
         let mut lines_decoded = 0;
 
         while i + samples_per_line <= samples.len() && lines_decoded < max_lines {
             let slice = &samples[i..i + samples_per_line];
 
-            // Resample slice to 512 pixels
+            // Resample slice to 512 pixels using linear interpolation
             for x in 0..width {
-                let src_idx =
-                    ((x as f32 / width as f32) * samples_per_line as f32).round() as usize;
-                let src_idx = src_idx.min(samples_per_line - 1);
-                let s = slice[src_idx];
+                // Map x (0..width) to sample index (0..samples_per_line)
+                let exact_idx = if width > 1 {
+                    (x as f32 / (width as f32 - 1.0)) * (samples_per_line - 1) as f32
+                } else {
+                    0.0
+                };
+
+                let idx_floor = exact_idx.floor() as usize;
+                let idx_ceil = (idx_floor + 1).min(samples_per_line - 1);
+                let fract = exact_idx - idx_floor as f32;
+
+                let s1 = slice[idx_floor];
+                let s2 = slice[idx_ceil];
+
+                // Linear interpolation
+                let s = s1 * (1.0 - fract) + s2 * fract;
+
                 let pixel = if s.abs() > params.threshold { 255 } else { 0 };
                 image.push(pixel);
             }
@@ -298,8 +345,18 @@ mod tests {
 
         if test_signal.len() >= CHUNK_SIZE {
             test_signal.truncate(CHUNK_SIZE);
-            let detected =
-                SstvDecoder::detect_sync_tone(&test_signal, &*fft, &window, sample_rate as f32);
+
+            let mut input_buffer = fft.make_input_vec();
+            let mut spectrum_buffer = fft.make_output_vec();
+
+            let detected = SstvDecoder::detect_sync_tone(
+                &test_signal,
+                &*fft,
+                &window,
+                sample_rate as f32,
+                &mut input_buffer,
+                &mut spectrum_buffer,
+            );
             assert!(detected, "Should detect sync tone at target frequency");
         }
     }
@@ -318,8 +375,18 @@ mod tests {
 
         if test_signal.len() >= CHUNK_SIZE {
             test_signal.truncate(CHUNK_SIZE);
-            let detected =
-                SstvDecoder::detect_sync_tone(&test_signal, &*fft, &window, sample_rate as f32);
+
+            let mut input_buffer = fft.make_input_vec();
+            let mut spectrum_buffer = fft.make_output_vec();
+
+            let detected = SstvDecoder::detect_sync_tone(
+                &test_signal,
+                &*fft,
+                &window,
+                sample_rate as f32,
+                &mut input_buffer,
+                &mut spectrum_buffer,
+            );
             assert!(!detected, "Should not detect sync tone in noise");
         }
     }

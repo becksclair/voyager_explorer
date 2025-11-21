@@ -4319,6 +4319,7 @@ dependencies = [
  "hdrhistogram",
  "hound",
  "image",
+ "num-complex",
  "proptest",
  "realfft",
  "rfd",
