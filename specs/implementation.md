@@ -160,7 +160,7 @@ All milestones that require audio for tests or manual QA should use **synthetic 
   - A clippy/cleanup pass is still needed to reconcile imports and scaffolding now that additional tests and modules exist.
 
 - **Milestone 4 – Color Image Decoding**
-  - Not started. `DecoderParams` has no mode field and decoding remains binary grayscale only.
+  - Implemented: `DecoderMode` (BinaryGrayscale, PseudoColor), mode field in `DecoderParams`, PseudoColor packing (RGB from 3 grayscale lines), `image_from_pixels` handles color, UI ComboBox for mode selection, and unit test coverage for PseudoColor.
 
 - **Milestone 5 – Presets, Session Persistence, and Export**
   - Not started in code. The `image` crate is wired in and `image_from_pixels` is tested, but there are no presets, session state, or export options in the UI yet.

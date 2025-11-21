@@ -490,6 +490,40 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_pseudo_color_rgb_packing() {
+        let decoder = SstvDecoder::new();
+        let params = DecoderParams {
+            line_duration_ms: 1.0,
+            threshold: 0.1,
+            decode_window_secs: 2.0,
+            mode: DecoderMode::PseudoColor,
+        };
+
+        let sample_rate = 1000;
+        let samples_per_line =
+            (params.line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
+        assert_eq!(samples_per_line, 1);
+
+        // Three lines: R=high, G=low, B=high -> expect (255,0,255) for every pixel.
+        let mut samples = Vec::new();
+        samples.push(1.0); // R line
+        samples.push(0.0); // G line
+        samples.push(1.0); // B line
+
+        let result = decoder
+            .decode(&samples, &params, sample_rate)
+            .expect("PseudoColor decode should succeed");
+
+        // One color line of width 512 => 512 * 3 bytes
+        assert_eq!(result.len(), 512 * 3);
+
+        // All pixels should match the expected RGB triplet
+        for chunk in result.chunks_exact(3) {
+            assert_eq!(chunk, [255, 0, 255]);
+        }
+    }
+
+    #[test]
     fn test_find_sync_positions() {
         let decoder = SstvDecoder::new();
         let sample_rate = 44100;

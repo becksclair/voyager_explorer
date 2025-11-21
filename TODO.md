@@ -17,15 +17,7 @@
   - [x] Clean up unused imports in `src/app.rs`
   - [x] Run clippy and fix warnings
 
-## Later (Milestones 4-6)
-
-- [ ] Milestone 4: Color image decoding (src/sstv.rs + src/image_output.rs)
-  - [ ] Add `DecoderMode` enum (BinaryGrayscale, PseudoColor)
-  - [ ] Extend `DecoderParams` with `mode` field
-  - [ ] Implement PseudoColor decoding (group 3 lines as R/G/B)
-  - [ ] Add color image helper or extend `image_from_pixels`
-  - [ ] Add UI ComboBox for mode selection
-  - [ ] Add tests for color mode
+## Later (Milestones 5-6)
 
 - [ ] Milestone 5: Presets, session persistence, export
   - [ ] Define `DecoderPreset` struct with static presets
@@ -64,6 +56,14 @@
   - [x] Add metrics recording (play/pause/stop/seek counts)
   - [x] Fix feature-gated imports to eliminate clippy warnings
   - [x] All tests pass (48 tests), zero clippy warnings, cargo check succeeds
+
+- [x] Milestone 4: Color image decoding (src/sstv.rs + src/image_output.rs)
+  - [x] Add `DecoderMode` enum (BinaryGrayscale, PseudoColor)
+  - [x] Extend `DecoderParams` with `mode` field
+  - [x] Implement PseudoColor decoding (group 3 lines as R/G/B)
+  - [x] Add color image helper or extend `image_from_pixels`
+  - [x] Add UI ComboBox for mode selection
+  - [x] Add tests for color mode
 
 ---
 

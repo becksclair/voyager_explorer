@@ -170,6 +170,36 @@ pub fn generate_composite_signal(sample_rate: u32) -> Vec<f32> {
     signal
 }
 
+/// Encode a binary (0/255) image into SSTV-style audio samples using nearest-neighbor mapping.
+///
+/// This mirrors the decoder's line_duration/sample-rate relationship so round-trips in tests are exact.
+pub fn encode_image_to_audio(
+    pixels: &[u8],
+    width: usize,
+    sample_rate: u32,
+    line_duration_ms: f32,
+) -> Vec<f32> {
+    // Keep in sync with decoder sampling: ensures preset/export/color roundtrips remain deterministic.
+    let samples_per_line = (line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
+    assert!(
+        samples_per_line >= width,
+        "samples_per_line must be at least image width for accurate mapping"
+    );
+
+    let mut audio = Vec::with_capacity(samples_per_line * (pixels.len() / width));
+
+    for line in pixels.chunks(width) {
+        for i in 0..samples_per_line {
+            let src_idx = (i * width) / samples_per_line;
+            let pix = line[src_idx];
+            let amp = if pix > 0 { 1.0 } else { 0.0 };
+            audio.push(amp);
+        }
+    }
+
+    audio
+}
+
 /// Create a complete WAV file in memory for testing
 ///
 /// Returns a temporary file handle that can be used with WavReader.
@@ -225,6 +255,25 @@ pub fn create_test_wav_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_encode_image_to_audio_length_and_mapping() {
+        let width = 4;
+        let pixels = vec![
+            0, 255, 0, 255, // line 1
+            255, 0, 255, 0, // line 2
+        ];
+        let sample_rate = 40_000;
+        let line_duration_ms = 10.0; // -> 400 samples/line
+        let samples_per_line = (line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
+
+        let audio = encode_image_to_audio(&pixels, width, sample_rate, line_duration_ms);
+        assert_eq!(audio.len(), samples_per_line * 2);
+
+        // Spot-check mapping: sample near 1/4 of line should map to pixel index 1 (value 255)
+        assert_eq!(audio[0], 0.0);
+        assert_eq!(audio[samples_per_line / 4], 1.0);
+    }
 
     #[test]
     fn test_sine_wave_generation() {
