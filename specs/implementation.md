@@ -137,7 +137,7 @@ All milestones that require audio for tests or manual QA should use **synthetic 
 - Prefer short, deterministic signals (sync tones, noise+sync, alternating stripe patterns, stereo differentiation) so tests remain fast and self-explanatory.
 - If a fixed "golden" signal is needed, embed raw `i16` samples as a `const` array and wrap them into a temporary WAV via the existing helpers.
 
-### 0.7. Current Implementation Status (2025-11-21 - Updated)
+### 0.7. Current Implementation Status (2025-11-21 - Milestone 5 Complete)
 
 - **Milestone 1 – Real Audio Playback via Rodio** ✅ **COMPLETED**
   - Fully implemented:
@@ -177,8 +177,15 @@ All milestones that require audio for tests or manual QA should use **synthetic 
     - UI ComboBox for mode selection in central panel.
     - Unit test coverage for PseudoColor decoding logic.
 
-- **Milestone 5 – Presets, Session Persistence, and Export**
-  - Not started in code. The `image` crate is wired in and `image_from_pixels` is tested, but there are no presets, session state, or export options in the UI yet.
+- **Milestone 5 – Presets, Session Persistence, and Export** ✅ **COMPLETED**
+  - Fully implemented:
+    - **Parameter Presets**: 6 built-in presets with DecoderPreset struct, preset selector UI, automatic tracking
+    - **Session State**: JSON-based session persistence with SessionState struct, Save/Load Session buttons
+    - **Image Export**: PNG export for both grayscale and color modes, Save Image button with file dialog
+    - **Serialization**: Added serde derives to WaveformChannel and DecoderMode enums
+    - **UI Organization**: Organized button groups (Load/Decode | Session | Export)
+    - **Tests**: 86 tests passing, comprehensive coverage for presets and session operations
+    - **Quality**: Zero clippy warnings, proper error handling throughout
 
 - **Milestone 6 – Advanced Signal Analysis & Batch Processing**
   - Not started; only design-level notes exist.

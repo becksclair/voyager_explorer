@@ -1,25 +1,6 @@
 # Voyager Explorer TODO
 
-## Now (Milestone 5 - Presets, Session Persistence, Export)
-
-- [ ] Sub-milestone 5.1: Parameter Presets
-  - [ ] Define `DecoderPreset` struct with name and params
-  - [ ] Create static list of presets (Voyager Default, Test Pattern, etc.)
-  - [ ] Add preset UI (ComboBox) in central panel
-  - [ ] Track custom vs preset state
-
-- [ ] Sub-milestone 5.2: Session State Persistence
-  - [ ] Add `serde` + `serde_json` dependencies
-  - [ ] Define `SessionState` struct (serializable with wav path, position, channel, params)
-  - [ ] Implement Save/Load Session buttons with rfd dialogs
-  - [ ] Add session state serialization/deserialization helpers
-
-- [ ] Sub-milestone 5.3: Image Export
-  - [ ] Implement Save Image button (PNG export via `image` crate)
-  - [ ] Add file dialog for save location
-  - [ ] Optionally implement Save Raw Pixels
-
-## Later (Milestone 6 - Advanced Features)
+## Now (Milestone 6 - Advanced Features)
 
 - [ ] Milestone 6: Advanced features (optional)
   - [ ] Signal analysis panel with spectrum view
@@ -70,6 +51,27 @@
   - [x] Add color image helper or extend `image_from_pixels`
   - [x] Add UI ComboBox for mode selection
   - [x] Add tests for color mode
+
+- [x] Milestone 5: Presets, session persistence, and export (src/presets.rs + src/session.rs + src/app.rs)
+  - [x] Sub-milestone 5.1: Parameter Presets
+    - [x] Define `DecoderPreset` struct with name and params
+    - [x] Create static list of 6 presets (Voyager Default, High Resolution, Fast Scan, Color, Sensitive, Test Pattern)
+    - [x] Add preset UI (ComboBox) in central panel
+    - [x] Track custom vs preset state automatically
+    - [x] Add helper functions (find_preset, matches_preset)
+    - [x] Include comprehensive tests for preset matching
+  - [x] Sub-milestone 5.2: Session State Persistence
+    - [x] Add `serde_json` dependency (serde already present)
+    - [x] Define `SessionState` struct (serializable with wav path, position, channel, params, preset)
+    - [x] Implement Save/Load Session buttons with rfd dialogs
+    - [x] Add session file I/O methods with error handling
+    - [x] Include tests for serialization roundtrips
+  - [x] Sub-milestone 5.3: Image Export
+    - [x] Implement Save Image button (PNG export via `image` crate)
+    - [x] Add file dialog for save location
+    - [x] Support both grayscale and color image export
+    - [x] Handle 512px fixed width with variable height
+  - [x] All tests pass (86 tests), zero clippy warnings, quality gates green
 
 ---
 
