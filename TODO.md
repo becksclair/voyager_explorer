@@ -2,20 +2,20 @@
 
 ## Now (Milestone 2 - Non-blocking Decoding)
 
-- [ ] Milestone 2: Non-blocking decoding & performance (src/app.rs)
-  - [ ] Define `DecodeRequest` and `DecodeResult` message structs
-  - [ ] Add channels (`decode_tx`, `decode_rx`) to VoyagerApp
-  - [ ] Spawn background worker thread with own SstvDecoder instance
-  - [ ] Refactor `decode_at_position` to enqueue jobs instead of blocking
-  - [ ] Poll `decode_rx` in `update()` and apply latest results only
-  - [ ] Manual QA: verify UI remains smooth during decode
+- [x] Milestone 2: Non-blocking decoding & performance (src/app.rs)
+  - [x] Define `DecodeRequest` and `DecodeResult` message structs
+  - [x] Add channels (`decode_tx`, `decode_rx`) to VoyagerApp
+  - [x] Spawn background worker thread with own SstvDecoder instance
+  - [x] Refactor `decode_at_position` to enqueue jobs instead of blocking
+  - [x] Poll `decode_rx` in `update()` and apply latest results only
+  - [x] Manual QA: verify UI remains smooth during decode
 
-## Next (Milestone 3)
+## Now (Milestone 3 - Cleanup & Logging)
 
-- [ ] Milestone 3: Sync detection logging & cleanup (src/sstv.rs)
-  - [ ] Fix `detect_sync` to only print "not detected" when no sync found
-  - [ ] Clean up unused imports in app.rs after worker implementation
-  - [ ] Run clippy and address warnings
+- [x] Milestone 3: Sync detection logging & cleanup
+  - [x] Fix `detect_sync` logging in `src/sstv.rs`
+  - [x] Clean up unused imports in `src/app.rs`
+  - [x] Run clippy and fix warnings
 
 ## Later (Milestones 4-6)
 

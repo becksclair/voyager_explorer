@@ -82,6 +82,7 @@ impl SstvDecoder {
     /// This method processes chunks sequentially until a sync is found.
     /// Consider using `find_sync_positions()` for batch analysis.
     pub fn detect_sync(&self, samples: Vec<f32>, sample_rate: u32) -> bool {
+        tracing::debug!(samples_len = samples.len(), "Starting sync detection");
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(CHUNK_SIZE);
         let window = Self::hann_window(CHUNK_SIZE);
@@ -103,9 +104,11 @@ impl SstvDecoder {
                 &mut spectrum_buffer,
             );
             if sync_detected {
+                tracing::debug!("Sync signal detected");
                 return true;
             }
         }
+        tracing::debug!("No sync signal detected");
         false
     }
 
