@@ -1,23 +1,6 @@
 # Voyager Explorer TODO
 
-## Now (Milestone 5 - Presets, Session Persistence, Export)
-
-- [ ] Sub-milestone 5.1: Parameter Presets
-  - [ ] Define `DecoderPreset` struct with name and params
-  - [ ] Create static list of presets (Voyager Default, Test Pattern, etc.)
-  - [ ] Add preset UI (ComboBox) in central panel
-  - [ ] Track custom vs preset state
-
-- [ ] Sub-milestone 5.2: Session State Persistence
-  - [ ] Add `serde` + `serde_json` dependencies
-  - [ ] Define `SessionState` struct (serializable with wav path, position, channel, params)
-  - [ ] Implement Save/Load Session buttons with rfd dialogs
-  - [ ] Add session state serialization/deserialization helpers
-
-- [ ] Sub-milestone 5.3: Image Export
-  - [ ] Implement Save Image button (PNG export via `image` crate)
-  - [ ] Add file dialog for save location
-  - [ ] Optionally implement Save Raw Pixels
+## Now
 
 ## Later (Milestone 6 - Advanced Features)
 
@@ -70,6 +53,24 @@
   - [x] Add color image helper or extend `image_from_pixels`
   - [x] Add UI ComboBox for mode selection
   - [x] Add tests for color mode
+
+- [x] Milestone 5: Presets, Session Persistence, Export
+  - [x] Sub-milestone 5.1: Parameter Presets
+    - [x] Define `DecoderPreset` struct with name and params
+    - [x] Create static list of presets (Voyager Default, Test Pattern, etc.)
+    - [x] Add preset UI (ComboBox) in central panel
+    - [x] Track custom vs preset state
+
+  - [x] Sub-milestone 5.2: Session State Persistence
+    - [x] Add `serde` + `serde_json` dependencies
+    - [x] Define `SessionState` struct (serializable with wav path, position, channel, params)
+    - [x] Implement Save/Load Session buttons with rfd dialogs
+    - [x] Add session state serialization/deserialization helpers
+
+  - [x] Sub-milestone 5.3: Image Export
+    - [x] Implement Save Image button (PNG export via `image` crate)
+    - [x] Add file dialog for save location
+    - [x] Optionally implement Save Raw Pixels
 
 ---
 

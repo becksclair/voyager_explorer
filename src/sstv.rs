@@ -505,10 +505,11 @@ mod tests {
         assert_eq!(samples_per_line, 1);
 
         // Three lines: R=high, G=low, B=high -> expect (255,0,255) for every pixel.
-        let mut samples = Vec::new();
-        samples.push(1.0); // R line
-        samples.push(0.0); // G line
-        samples.push(1.0); // B line
+        let samples = vec![
+            1.0, // R line
+            0.0, // G line
+            1.0, // B line
+        ];
 
         let result = decoder
             .decode(&samples, &params, sample_rate)
