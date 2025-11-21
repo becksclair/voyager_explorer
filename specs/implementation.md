@@ -177,8 +177,11 @@ All milestones that require audio for tests or manual QA should use **synthetic 
     - UI ComboBox for mode selection in central panel.
     - Unit test coverage for PseudoColor decoding logic.
 
-- **Milestone 5 – Presets, Session Persistence, and Export**
-  - Not started in code. The `image` crate is wired in and `image_from_pixels` is tested, but there are no presets, session state, or export options in the UI yet.
+- **Milestone 5 – Presets, Session Persistence, and Export** ✅ **COMPLETED**
+  - Fully implemented:
+    - Sub-milestone 5.1 — Parameter Presets: `DecoderPreset` struct with name and params; six built-in presets (Voyager Default, High Resolution, Fast Scan, Color, Sensitive, Test Pattern); ComboBox UI selector; automatic custom vs preset state tracking; comprehensive tests.
+    - Sub-milestone 5.2 — Session State Persistence: `serde_json` dependency added; `SessionState` struct (serializable with wav path, position, channel, params, preset name); Save/Load Session buttons with file dialogs via `rfd`; serialization/deserialization helpers; round-trip tests.
+    - Sub-milestone 5.3 — Image Export: PNG export via `image` crate; supports grayscale and color modes; UI "Save Image" button with file dialog; 512px fixed width with variable height; separate logic for BinaryGrayscale vs PseudoColor modes.
 
 - **Milestone 6 – Advanced Signal Analysis & Batch Processing**
   - Not started; only design-level notes exist.
