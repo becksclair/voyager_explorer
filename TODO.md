@@ -1,32 +1,13 @@
 # Voyager Explorer TODO
 
-## Now (Milestone 2 - Non-blocking Decoding)
+## Now
 
-- [x] Milestone 2: Non-blocking decoding & performance (src/app.rs)
-  - [x] Define `DecodeRequest` and `DecodeResult` message structs
-  - [x] Add channels (`decode_tx`, `decode_rx`) to VoyagerApp
-  - [x] Spawn background worker thread with own SstvDecoder instance
-  - [x] Refactor `decode_at_position` to enqueue jobs instead of blocking
-  - [x] Poll `decode_rx` in `update()` and apply latest results only
-  - [x] Manual QA: verify UI remains smooth during decode
+- [ ] Milestone 6 kickoff: choose owner and scope for spectrum view + batch decode
+- [ ] Spike: sketch UI for signal analysis panel (spectrum + playback overlay)
+- [ ] Define batch processing flow (CLI flags + optional UI queue) and list required WAV fixtures
+- [ ] If scope not finalized, move items to Later and confirm when to re-plan
 
-## Now (Milestone 3 - Cleanup & Logging)
-
-- [x] Milestone 3: Sync detection logging & cleanup
-  - [x] Fix `detect_sync` logging in `src/sstv.rs`
-  - [x] Clean up unused imports in `src/app.rs`
-  - [x] Run clippy and fix warnings
-
-## Later (Milestones 5-6)
-
-- [ ] Milestone 5: Presets, session persistence, export
-  - [ ] Define `DecoderPreset` struct with static presets
-  - [ ] Add preset UI (ComboBox) and custom state tracking
-  - [ ] Add `serde` + `serde_json` dependencies
-  - [ ] Define `SessionState` struct (serializable)
-  - [ ] Implement Save/Load Session buttons with rfd dialogs
-  - [ ] Implement Save Image (PNG export via `image` crate)
-  - [ ] Optionally implement Save Raw Pixels
+## Later (Milestone 6 - Advanced Features)
 
 - [ ] Milestone 6: Advanced features (optional)
   - [ ] Signal analysis panel with spectrum view
@@ -57,6 +38,19 @@
   - [x] Fix feature-gated imports to eliminate clippy warnings
   - [x] All tests pass (48 tests), zero clippy warnings, cargo check succeeds
 
+- [x] Milestone 2: Non-blocking decoding & performance (src/app.rs)
+  - [x] Define `DecodeRequest` and `DecodeResult` message structs
+  - [x] Add channels (`decode_tx`, `decode_rx`) to VoyagerApp
+  - [x] Spawn background worker thread with own SstvDecoder instance
+  - [x] Refactor `decode_at_position` to enqueue jobs instead of blocking
+  - [x] Poll `decode_rx` in `update()` and apply latest results only
+  - [x] Manual QA: verify UI remains smooth during decode
+
+- [x] Milestone 3: Sync detection logging & cleanup
+  - [x] Fix `detect_sync` logging in `src/sstv.rs`
+  - [x] Clean up unused imports in `src/app.rs`
+  - [x] Run clippy and fix warnings
+
 - [x] Milestone 4: Color image decoding (src/sstv.rs + src/image_output.rs)
   - [x] Add `DecoderMode` enum (BinaryGrayscale, PseudoColor)
   - [x] Extend `DecoderParams` with `mode` field
@@ -64,6 +58,24 @@
   - [x] Add color image helper or extend `image_from_pixels`
   - [x] Add UI ComboBox for mode selection
   - [x] Add tests for color mode
+
+- [x] Milestone 5: Presets, Session Persistence, Export
+  - [x] Sub-milestone 5.1: Parameter Presets
+    - [x] Define `DecoderPreset` struct with name and params
+    - [x] Create static list of presets (Voyager Default, Test Pattern, etc.)
+    - [x] Add preset UI (ComboBox) in central panel
+    - [x] Track custom vs preset state
+
+  - [x] Sub-milestone 5.2: Session State Persistence
+    - [x] Add `serde` + `serde_json` dependencies
+    - [x] Define `SessionState` struct (serializable with wav path, position, channel, params, preset name)
+    - [x] Implement Save/Load Session buttons with rfd dialogs
+    - [x] Add session state serialization/deserialization helpers
+
+  - [x] Sub-milestone 5.3: Image Export
+    - [x] Implement Save Image button (PNG export via `image` crate)
+    - [x] Add file dialog for save location
+    - [x] Optionally implement Save Raw Pixels
 
 ---
 

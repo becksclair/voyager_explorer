@@ -19,8 +19,8 @@ fn test_image_to_audio_and_back_single_line() {
 
     // Line pattern: first half black, second half white.
     let mut line = vec![0u8; width];
-    for x in (width / 2)..width {
-        line[x] = 255;
+    for value in line.iter_mut().skip(width / 2) {
+        *value = 255;
     }
     let pixels = line.clone(); // single-line image
 
