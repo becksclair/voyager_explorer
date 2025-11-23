@@ -1,6 +1,6 @@
-use eframe::egui;
 use crate::audio::{WavReader, WaveformChannel};
 use crate::utils::format_duration;
+use eframe::egui;
 
 pub struct WaveformPanel;
 
@@ -29,7 +29,7 @@ impl WaveformPanel {
                 ));
             });
         }
-        
+
         ui.separator();
 
         // Waveform visualization
@@ -61,7 +61,13 @@ impl WaveformPanel {
                 *hover_position = None;
             }
 
-            Self::draw_internal(ui, &rect, samples, current_position_samples, *hover_position);
+            Self::draw_internal(
+                ui,
+                &rect,
+                samples,
+                current_position_samples,
+                *hover_position,
+            );
         } else {
             ui.label("No audio loaded");
         }

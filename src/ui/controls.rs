@@ -13,11 +13,7 @@ impl ControlsPanel {
         let mut action = None;
 
         ui.horizontal(|ui| {
-            let play_button_text = if is_playing {
-                "⏸ Pause"
-            } else {
-                "▶ Play"
-            };
+            let play_button_text = if is_playing { "⏸ Pause" } else { "▶ Play" };
             if ui.button(play_button_text).clicked() {
                 action = Some(ControlAction::TogglePlayback);
             }

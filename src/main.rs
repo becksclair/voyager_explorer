@@ -8,22 +8,22 @@ mod app;
 use app::VoyagerApp;
 
 pub mod analysis;
-pub mod batch;
-pub mod ui;
-pub mod services;
-pub mod pipeline;
 pub mod audio;
 pub mod audio_state;
+pub mod batch;
 pub mod config;
 pub mod error;
 pub mod image_output;
 pub mod metrics;
+pub mod pipeline;
+pub mod services;
 pub mod sstv;
+pub mod ui;
 pub mod utils;
 
+use crate::sstv::DecoderMode;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use crate::sstv::DecoderMode;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -81,7 +81,12 @@ fn main() -> eframe::Result {
 
     let cli = Cli::parse();
 
-    if let Some(Commands::Batch { input, output, mode }) = cli.command {
+    if let Some(Commands::Batch {
+        input,
+        output,
+        mode,
+    }) = cli.command
+    {
         let args = batch::BatchArgs {
             input_pattern: input,
             output_dir: output,

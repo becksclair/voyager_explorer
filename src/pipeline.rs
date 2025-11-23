@@ -1,7 +1,7 @@
 use crate::sstv::{DecoderMode, DecoderParams, SstvDecoder};
 use anyhow::{Context, Result};
-use image::{DynamicImage, GrayImage, RgbaImage, Luma, Rgba};
 use egui::ColorImage;
+use image::{DynamicImage, GrayImage, Luma, Rgba, RgbaImage};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -118,7 +118,8 @@ impl DecodingPipeline {
         params: &DecoderParams,
         sample_rate: u32,
     ) -> Result<PipelineResult> {
-        let pixels = self.decoder
+        let pixels = self
+            .decoder
             .decode(samples, params, sample_rate)
             .context("Failed to decode audio")?;
 

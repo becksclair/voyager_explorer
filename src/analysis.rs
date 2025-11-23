@@ -24,7 +24,8 @@ pub fn compute_spectrum(samples: &[f32], sample_rate: u32) -> Vec<(f64, f64)> {
 
     // Apply a Hamming window to reduce spectral leakage
     for (i, sample) in input_vector.iter_mut().enumerate() {
-        let window = 0.54 - 0.46 * ((2.0 * std::f32::consts::PI * i as f32) / (n as f32 - 1.0)).cos();
+        let window =
+            0.54 - 0.46 * ((2.0 * std::f32::consts::PI * i as f32) / (n as f32 - 1.0)).cos();
         *sample *= window;
     }
 

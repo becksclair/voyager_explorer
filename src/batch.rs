@@ -2,8 +2,8 @@ use crate::audio::WavReader;
 use crate::pipeline::DecodingPipeline;
 use crate::sstv::{DecoderMode, DecoderParams};
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct BatchArgs {
@@ -66,7 +66,8 @@ fn process_file(
     let samples = reader.get_samples(crate::audio::WaveformChannel::Left);
 
     // Decode
-    let result = pipeline.process(samples, params, reader.sample_rate)
+    let result = pipeline
+        .process(samples, params, reader.sample_rate)
         .context("Failed to decode audio")?;
 
     if result.pixels.is_empty() {
@@ -75,7 +76,8 @@ fn process_file(
     }
 
     // Convert to image
-    let image_buffer = result.to_dynamic_image()
+    let image_buffer = result
+        .to_dynamic_image()
         .context("Failed to convert pixel data to image")?;
 
     // Save image
@@ -91,7 +93,9 @@ fn process_file(
     let output_filename = PathBuf::from(file_stem).with_extension("png");
     let output_path = output_dir.join(output_filename);
 
-    image_buffer.save(&output_path).context("Failed to save image")?;
+    image_buffer
+        .save(&output_path)
+        .context("Failed to save image")?;
 
     Ok(())
 }

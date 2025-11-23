@@ -1,6 +1,6 @@
+use crate::audio::WavReader;
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
-use crate::audio::WavReader;
 
 #[derive(Default)]
 pub struct SpectrumPanel {
@@ -8,7 +8,13 @@ pub struct SpectrumPanel {
 }
 
 impl SpectrumPanel {
-    pub fn draw(&self, ui: &mut egui::Ui, wav_reader: &Option<WavReader>, current_position_samples: usize, selected_channel: crate::audio::WaveformChannel) {
+    pub fn draw(
+        &self,
+        ui: &mut egui::Ui,
+        wav_reader: &Option<WavReader>,
+        current_position_samples: usize,
+        selected_channel: crate::audio::WaveformChannel,
+    ) {
         ui.heading("Signal Analysis (Spectrum)");
         ui.separator();
 
@@ -22,11 +28,12 @@ impl SpectrumPanel {
 
             if start < end {
                 let window_samples = &samples[start..end];
-                let spectrum = crate::analysis::compute_spectrum(window_samples, reader.sample_rate);
+                let spectrum =
+                    crate::analysis::compute_spectrum(window_samples, reader.sample_rate);
 
                 let points = PlotPoints::from_iter(spectrum.iter().map(|(f, m)| [*f, *m]));
-                let line = Line::new("Magnitude", points)
-                    .color(egui::Color32::from_rgb(100, 255, 100));
+                let line =
+                    Line::new("Magnitude", points).color(egui::Color32::from_rgb(100, 255, 100));
 
                 Plot::new("spectrum_plot")
                     .view_aspect(2.0)

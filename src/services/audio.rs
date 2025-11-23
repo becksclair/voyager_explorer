@@ -84,7 +84,10 @@ impl Iterator for AudioBufferSource {
 #[cfg(feature = "audio_playback")]
 impl Source for AudioBufferSource {
     fn current_span_len(&self) -> Option<usize> {
-        self.buffer.len().checked_sub(self.offset).map(|len| len.saturating_sub(self.position))
+        self.buffer
+            .len()
+            .checked_sub(self.offset)
+            .map(|len| len.saturating_sub(self.position))
     }
 
     fn channels(&self) -> u16 {

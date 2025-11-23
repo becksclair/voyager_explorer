@@ -26,8 +26,6 @@ use rodio::{OutputStream, OutputStreamBuilder, Sink};
 #[cfg(feature = "audio_playback")]
 use rodio::mixer::Mixer;
 
-
-
 pub struct VoyagerApp {
     // Configuration
     config: AppConfig,
@@ -67,8 +65,6 @@ pub struct VoyagerApp {
     // Signal Analysis
     spectrum_panel: SpectrumPanel,
 }
-
-
 
 impl Default for VoyagerApp {
     fn default() -> Self {
@@ -175,7 +171,10 @@ impl VoyagerApp {
             let pipeline = crate::pipeline::DecodingPipeline::new();
             match pipeline.process(samples, &self.params, reader.sample_rate) {
                 Ok(result) => {
-                    tracing::info!(pixels = result.pixels.len(), "Decode completed successfully");
+                    tracing::info!(
+                        pixels = result.pixels.len(),
+                        "Decode completed successfully"
+                    );
                     let img = result.to_egui_image();
                     self.image_texture = Some(ctx.load_texture("decoded", img, Default::default()));
                     self.last_decoded = Some(result.pixels);
@@ -579,11 +578,6 @@ impl VoyagerApp {
             tracing::error!("No audio samples available after seek");
         }
     }
-
-
-
-
-
 }
 
 impl Drop for VoyagerApp {
@@ -629,7 +623,10 @@ impl eframe::App for VoyagerApp {
                 } = decode_result;
 
                 let success = error.is_none();
-                let pixel_count = pipeline_result.as_ref().map(|r| r.pixels.len()).unwrap_or(0);
+                let pixel_count = pipeline_result
+                    .as_ref()
+                    .map(|r| r.pixels.len())
+                    .unwrap_or(0);
 
                 // Log performance metrics and record in metrics system
                 if success {
@@ -712,7 +709,10 @@ impl eframe::App for VoyagerApp {
                 }
 
                 ui.separator();
-                if ui.selectable_label(self.spectrum_panel.visible, "📈 Spectrum").clicked() {
+                if ui
+                    .selectable_label(self.spectrum_panel.visible, "📈 Spectrum")
+                    .clicked()
+                {
                     self.spectrum_panel.visible = !self.spectrum_panel.visible;
                 }
             });
@@ -875,7 +875,7 @@ impl eframe::App for VoyagerApp {
                     &mut self.waveform_hover_position,
                 ) {
                     self.current_position_samples = new_pos;
-                    
+
                     #[cfg(feature = "audio_playback")]
                     self.restart_audio_from_current_position();
 

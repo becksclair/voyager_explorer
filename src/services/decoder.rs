@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use crate::pipeline::{DecodingPipeline, PipelineResult};
+use crate::sstv::DecoderParams;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-use crate::sstv::DecoderParams;
-use crate::pipeline::{DecodingPipeline, PipelineResult};
 
 /// Request to decode audio samples in background thread.
 #[derive(Debug)]
@@ -56,7 +56,10 @@ pub fn spawn_decode_worker() -> (
             // We need to calculate the slice based on start_offset and decode_window_secs
             let window_duration_secs = request.params.decode_window_secs;
             let window_samples = (window_duration_secs * request.sample_rate as f64) as usize;
-            let end_offset = request.start_offset.saturating_add(window_samples).min(request.samples.len());
+            let end_offset = request
+                .start_offset
+                .saturating_add(window_samples)
+                .min(request.samples.len());
 
             let samples_slice = if request.start_offset < request.samples.len() {
                 &request.samples[request.start_offset..end_offset]
@@ -64,7 +67,8 @@ pub fn spawn_decode_worker() -> (
                 &[]
             };
 
-            let result = match pipeline.process(samples_slice, &request.params, request.sample_rate) {
+            let result = match pipeline.process(samples_slice, &request.params, request.sample_rate)
+            {
                 Ok(pipeline_result) => {
                     tracing::debug!("Decode successful for request {}", request.id);
                     DecodeResult {
