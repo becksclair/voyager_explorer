@@ -1,5 +1,7 @@
 // Library interface for Voyager Explorer components
 
+pub mod analysis;
+pub mod batch;
 pub mod audio;
 pub mod audio_state;
 pub mod config;
@@ -7,6 +9,7 @@ pub mod error;
 pub mod image_output;
 pub mod metrics;
 pub mod sstv;
+pub mod pipeline;
 pub mod utils;
 
 // Test fixtures for synthetic audio generation

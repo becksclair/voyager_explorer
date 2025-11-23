@@ -2,165 +2,31 @@ use crate::audio::{WavReader, WaveformChannel};
 use crate::audio_state::AudioPlaybackState;
 use crate::config::AppConfig;
 use crate::error::VoyagerError;
-use crate::image_output::image_from_pixels;
 use crate::metrics::AppMetrics;
+use crate::services::audio::AudioBufferSource;
+use crate::services::decoder::{spawn_decode_worker, DecodeRequest, DecodeResult};
 use crate::sstv::{DecoderMode, DecoderParams, SstvDecoder};
+use crate::ui::controls::{ControlAction, ControlsPanel};
+use crate::ui::spectrum::SpectrumPanel;
+use crate::ui::waveform::WaveformPanel;
 use crate::utils::format_duration;
 use eframe::egui;
 use egui::TextureHandle;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "audio_playback")]
 use crate::audio_state::AudioError;
 
 #[cfg(feature = "audio_playback")]
-use rodio::{OutputStream, OutputStreamBuilder, Sink, Source};
+use rodio::{OutputStream, OutputStreamBuilder, Sink};
 
 #[cfg(feature = "audio_playback")]
 use rodio::mixer::Mixer;
 
-/// Request to decode audio samples in background thread.
-///
-/// # Message Passing Architecture
-///
-/// The decoding operation is CPU-intensive (FFT, sync detection, pixel processing)
-/// and can take 100-500ms for large files. Running it on the UI thread causes
-/// frame drops and unresponsive controls.
-///
-/// **Solution**: Offload decoding to a background worker thread using message passing:
-/// - Main thread sends `DecodeRequest` via `decode_tx` channel
-/// - Worker thread performs decoding with its own `SstvDecoder` instance
-/// - Worker thread sends `DecodeResult` back via `decode_rx` channel
-/// - Main thread polls `decode_rx` in `update()` and applies results
-///
-/// **Benefits**:
-/// - UI remains responsive during decode (60fps maintained)
-/// - No blocking operations in event loop
-/// - Clean separation of concerns (UI thread vs compute thread)
-#[derive(Debug)]
-struct DecodeRequest {
-    /// Unique request ID for matching results to requests
-    id: u64,
-    /// Shared audio buffer (Arc enables zero-copy sharing with worker thread)
-    samples: Arc<[f32]>,
-    /// Starting sample position for decode window
-    start_offset: usize,
-    /// Decoder parameters (line duration, threshold)
-    params: DecoderParams,
-    /// Sample rate in Hz (needed for samples-per-line calculation)
-    sample_rate: u32,
-}
 
-/// Result from background decoding operation.
-#[derive(Debug)]
-struct DecodeResult {
-    /// Request ID (matches DecodeRequest.id) - currently unused but reserved for future features
-    #[allow(dead_code)]
-    id: u64,
-    /// Decoded image data (grayscale pixels, 512px width), or empty on error
-    pixels: Vec<u8>,
-    /// Time taken to decode (for performance monitoring)
-    decode_duration: Duration,
-    /// Error message if decode failed
-    error: Option<String>,
-}
-
-#[cfg(feature = "audio_playback")]
-/// Audio source that plays from a shared buffer of f32 samples with zero-copy seeking.
-///
-/// # Performance Characteristics
-///
-/// **Traditional approach (cloning):**
-/// ```ignore
-/// let remaining_samples = samples[position..].to_vec();  // O(n) clone
-/// ```
-/// - For 100MB file @ 50% position: **50MB copied per seek**
-/// - Seek latency: ~100ms for large files
-/// - Memory pressure: High (GC thrashing)
-///
-/// **This approach (Arc + offset):**
-/// ```ignore
-/// AudioBufferSource::new(Arc::clone(&buffer), offset, ...)  // O(1)
-/// ```
-/// - For 100MB file: **16 bytes (Arc pointer + offset) per seek**
-/// - Seek latency: ~1ms (just metadata update)
-/// - Memory pressure: Minimal (Arc shared across all instances)
-///
-/// # Implementation Details
-///
-/// The `buffer` is shared via `Arc<[f32]>`, so all `AudioBufferSource` instances
-/// point to the same underlying memory. The `offset` field marks where in the
-/// buffer this source should start reading, and `position` tracks the current
-/// read position relative to that offset.
-///
-/// When seeking, we don't clone any samples - we just create a new `AudioBufferSource`
-/// with a different `offset`, reusing the same `Arc<[f32]>`.
-struct AudioBufferSource {
-    /// Shared reference to the audio buffer. Arc enables zero-copy sharing.
-    buffer: Arc<[f32]>,
-    /// Starting position in the buffer (sample index where playback begins).
-    offset: usize,
-    /// Sample rate in Hz (e.g., 44100, 48000).
-    sample_rate: u32,
-    /// Number of audio channels (1 for mono, 2 for stereo).
-    channels: u16,
-    /// Current read position relative to offset.
-    position: usize,
-}
-
-#[cfg(feature = "audio_playback")]
-impl AudioBufferSource {
-    fn new(buffer: Arc<[f32]>, offset: usize, sample_rate: u32, channels: u16) -> Self {
-        Self {
-            buffer,
-            offset,
-            sample_rate,
-            channels,
-            position: 0,
-        }
-    }
-}
-
-#[cfg(feature = "audio_playback")]
-impl Iterator for AudioBufferSource {
-    type Item = f32;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let absolute_position = self.offset + self.position;
-        if absolute_position < self.buffer.len() {
-            let sample = self.buffer[absolute_position];
-            self.position += 1;
-            Some(sample)
-        } else {
-            None
-        }
-    }
-}
-
-#[cfg(feature = "audio_playback")]
-impl Source for AudioBufferSource {
-    fn current_span_len(&self) -> Option<usize> {
-        Some((self.buffer.len() - self.offset).saturating_sub(self.position))
-    }
-
-    fn channels(&self) -> u16 {
-        self.channels
-    }
-
-    fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
-    fn total_duration(&self) -> Option<Duration> {
-        let remaining_samples = (self.buffer.len() - self.offset) as u64;
-        let duration_secs =
-            remaining_samples as f64 / (self.sample_rate as f64 * self.channels as f64);
-        Some(Duration::from_secs_f64(duration_secs))
-    }
-}
 
 pub struct VoyagerApp {
     // Configuration
@@ -197,87 +63,12 @@ pub struct VoyagerApp {
     metrics: AppMetrics,
     error_message: Option<String>,
     frame_start: Option<Instant>,
+
+    // Signal Analysis
+    spectrum_panel: SpectrumPanel,
 }
 
-/// Spawn a background worker thread for non-blocking SSTV decoding.
-///
-/// Returns (decode_tx, decode_rx, worker_handle) tuple:
-/// - decode_tx: Channel to send DecodeRequest to worker
-/// - decode_rx: Channel to receive DecodeResult from worker
-/// - worker_handle: JoinHandle for health monitoring and cleanup
-///
-/// The worker thread runs until:
-/// - The main thread drops decode_tx (app shutdown)
-/// - The worker panics (requires restart)
-/// - The main thread drops decode_rx (app shutdown)
-fn spawn_decode_worker() -> (
-    Sender<DecodeRequest>,
-    Receiver<DecodeResult>,
-    JoinHandle<()>,
-) {
-    // Create bidirectional channels for request/response
-    let (decode_tx, result_rx) = channel();
-    let (result_tx, decode_rx) = channel();
 
-    // Spawn worker thread
-    let worker_handle = thread::spawn(move || {
-        // Worker has its own SstvDecoder instance to avoid sharing across threads
-        let decoder = SstvDecoder::new();
-
-        tracing::info!("Decode worker thread started");
-
-        // Process decode requests until channel is closed
-        while let Ok(request) = result_rx.recv() {
-            let DecodeRequest {
-                id,
-                samples,
-                start_offset,
-                params,
-                sample_rate,
-            } = request;
-
-            let decode_start = Instant::now();
-
-            // Extract decode window from shared buffer
-            let window_duration_secs = params.decode_window_secs;
-            let window_samples = (window_duration_secs * sample_rate as f64) as usize;
-            let end_offset = (start_offset + window_samples).min(samples.len());
-            let decode_slice = &samples[start_offset..end_offset];
-
-            // Perform actual decoding (CPU-intensive FFT + pixel processing)
-            let (pixels, error) = match decoder.decode(decode_slice, &params, sample_rate) {
-                Ok(pixels) => {
-                    tracing::debug!(pixels = pixels.len(), "Decode completed successfully");
-                    (pixels, None)
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Decode failed");
-                    (Vec::new(), Some(format!("{}", e)))
-                }
-            };
-
-            let decode_duration = decode_start.elapsed();
-
-            // Send result back to main thread
-            let result = DecodeResult {
-                id,
-                pixels,
-                decode_duration,
-                error,
-            };
-
-            // If send fails, main thread has dropped the receiver (app is closing)
-            if result_tx.send(result).is_err() {
-                tracing::info!("Main thread closed result channel, worker shutting down");
-                break;
-            }
-        }
-
-        tracing::info!("Decode worker thread exiting");
-    });
-
-    (decode_tx, decode_rx, worker_handle)
-}
 
 impl Default for VoyagerApp {
     fn default() -> Self {
@@ -330,6 +121,7 @@ impl Default for VoyagerApp {
             metrics: AppMetrics::new(),
             error_message: None,
             frame_start: None,
+            spectrum_panel: SpectrumPanel::default(),
         }
     }
 }
@@ -379,16 +171,14 @@ impl VoyagerApp {
                 .detect_sync(samples.to_vec(), reader.sample_rate);
             tracing::debug!(sync_detected, "Sync detection completed");
 
-            // Perform decode with error handling
-            match self
-                .video_decoder
-                .decode(samples, &self.params, reader.sample_rate)
-            {
-                Ok(pixels) => {
-                    tracing::info!(pixels = pixels.len(), "Decode completed successfully");
-                    let img = image_from_pixels(&pixels, self.params.mode);
+            // Perform decode with error handling using unified pipeline
+            let pipeline = crate::pipeline::DecodingPipeline::new();
+            match pipeline.process(samples, &self.params, reader.sample_rate) {
+                Ok(result) => {
+                    tracing::info!(pixels = result.pixels.len(), "Decode completed successfully");
+                    let img = result.to_egui_image();
                     self.image_texture = Some(ctx.load_texture("decoded", img, Default::default()));
-                    self.last_decoded = Some(pixels);
+                    self.last_decoded = Some(result.pixels);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Decode failed");
@@ -740,12 +530,21 @@ impl VoyagerApp {
         }
 
         // Use Arc + offset instead of cloning - zero-copy seek!
-        Some(AudioBufferSource::new(
+        // AudioBufferSource::new validates parameters and returns Result
+        AudioBufferSource::new(
             buffer,
             self.current_position_samples,
             reader.sample_rate,
             1, // Mono playback (we've already selected a channel)
-        ))
+        )
+        .inspect_err(|e| {
+            tracing::error!(
+                error = %e,
+                offset = self.current_position_samples,
+                "Failed to create AudioBufferSource"
+            );
+        })
+        .ok()
     }
 
     #[cfg(feature = "audio_playback")]
@@ -781,97 +580,10 @@ impl VoyagerApp {
         }
     }
 
-    fn draw_waveform_internal(
-        &self,
-        ui: &mut egui::Ui,
-        rect: &egui::Rect,
-        samples: &[f32],
-        current_position: usize,
-        hover_position: Option<f32>,
-    ) {
-        if ui.is_rect_visible(*rect) {
-            let painter = ui.painter();
 
-            // Background
-            painter.rect_filled(*rect, 0.0, egui::Color32::from_gray(20));
 
-            // Handle empty samples gracefully
-            if samples.is_empty() {
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "No audio data",
-                    egui::FontId::default(),
-                    egui::Color32::GRAY,
-                );
-                return;
-            }
 
-            // Draw waveform
-            let samples_per_pixel = samples.len().max(1) as f32 / rect.width();
 
-            for pixel_x in 0..rect.width() as i32 {
-                let start_sample = (pixel_x as f32 * samples_per_pixel) as usize;
-                let end_sample =
-                    (((pixel_x + 1) as f32 * samples_per_pixel) as usize).min(samples.len());
-
-                if start_sample < samples.len() {
-                    // Find min/max in this pixel range for better visualization
-                    let mut min_val = 1.0f32;
-                    let mut max_val = -1.0f32;
-
-                    for sample_idx in start_sample..end_sample {
-                        if sample_idx < samples.len() {
-                            let sample = samples[sample_idx];
-                            // Clamp sample values to prevent rendering issues
-                            let clamped_sample = sample.clamp(-1.0, 1.0);
-                            min_val = min_val.min(clamped_sample);
-                            max_val = max_val.max(clamped_sample);
-                        }
-                    }
-
-                    let center_y = rect.center().y;
-                    let amplitude_scale = rect.height() * 0.4; // Use 40% of height for amplitude
-
-                    let min_y = center_y - min_val * amplitude_scale;
-                    let max_y = center_y - max_val * amplitude_scale;
-
-                    let x = rect.min.x + pixel_x as f32;
-
-                    // Draw vertical line from min to max
-                    painter.line_segment(
-                        [egui::Pos2::new(x, min_y), egui::Pos2::new(x, max_y)],
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(100, 200, 255)),
-                    );
-                }
-            }
-
-            // Draw current position indicator (only if position is valid)
-            if current_position < samples.len() {
-                let position_x =
-                    rect.min.x + (current_position as f32 / samples.len() as f32) * rect.width();
-                painter.line_segment(
-                    [
-                        egui::Pos2::new(position_x, rect.min.y),
-                        egui::Pos2::new(position_x, rect.max.y),
-                    ],
-                    egui::Stroke::new(2.0, egui::Color32::RED),
-                );
-            }
-
-            // Draw hover line
-            if let Some(hover_x) = hover_position {
-                let hover_pixel_x = rect.min.x + hover_x * rect.width();
-                painter.line_segment(
-                    [
-                        egui::Pos2::new(hover_pixel_x, rect.min.y),
-                        egui::Pos2::new(hover_pixel_x, rect.max.y),
-                    ],
-                    egui::Stroke::new(1.0, egui::Color32::YELLOW),
-                );
-            }
-        }
-    }
 }
 
 impl Drop for VoyagerApp {
@@ -908,21 +620,22 @@ impl eframe::App for VoyagerApp {
         if let Some(decode_rx) = &self.decode_rx {
             // try_recv() returns immediately without blocking the UI thread
             // If a result is available, apply it; otherwise continue normally
-            while let Ok(result) = decode_rx.try_recv() {
+            while let Ok(decode_result) = decode_rx.try_recv() {
                 let DecodeResult {
                     id: _,
-                    pixels,
+                    result: pipeline_result,
                     decode_duration,
                     error,
-                } = result;
+                } = decode_result;
 
                 let success = error.is_none();
+                let pixel_count = pipeline_result.as_ref().map(|r| r.pixels.len()).unwrap_or(0);
 
                 // Log performance metrics and record in metrics system
                 if success {
                     tracing::debug!(
                         duration_ms = decode_duration.as_millis(),
-                        pixels = pixels.len(),
+                        pixels = pixel_count,
                         "Decode completed successfully"
                     );
                 } else {
@@ -935,18 +648,18 @@ impl eframe::App for VoyagerApp {
 
                 // Record metrics (track both success and failure)
                 self.metrics
-                    .record_decode(decode_duration, pixels.len(), success);
+                    .record_decode(decode_duration, pixel_count, success);
                 self.pending_decode_requests = self.pending_decode_requests.saturating_sub(1);
                 self.worker_last_response = Instant::now();
 
                 // Handle error or update texture
                 if let Some(err_msg) = error {
                     self.error_message = Some(format!("Decode failed: {}", err_msg));
-                } else if !pixels.is_empty() {
-                    let img = image_from_pixels(&pixels, self.params.mode);
+                } else if let Some(res) = pipeline_result {
+                    let img = res.to_egui_image();
                     self.image_texture =
                         Some(ctx.load_texture("decoded_realtime", img, Default::default()));
-                    self.last_decoded = Some(pixels);
+                    self.last_decoded = Some(res.pixels);
                 }
             }
         }
@@ -996,6 +709,11 @@ impl eframe::App for VoyagerApp {
 
                 if ui.button("🧠 Decode").clicked() {
                     self.handle_decode(ctx);
+                }
+
+                ui.separator();
+                if ui.selectable_label(self.spectrum_panel.visible, "📈 Spectrum").clicked() {
+                    self.spectrum_panel.visible = !self.spectrum_panel.visible;
                 }
             });
 
@@ -1116,6 +834,20 @@ impl eframe::App for VoyagerApp {
                 }
             });
 
+        // Spectrum Analysis Panel (Right Side)
+        if self.spectrum_panel.visible {
+            egui::SidePanel::right("spectrum_panel")
+                .default_width(400.0)
+                .show(ctx, |ui| {
+                    self.spectrum_panel.draw(
+                        ui,
+                        &self.wav_reader,
+                        self.current_position_samples,
+                        self.selected_channel,
+                    );
+                });
+        }
+
         // Bottom panel for waveform visualization
         egui::TopBottomPanel::bottom("waveform_panel")
             .default_height(200.0)
@@ -1124,110 +856,37 @@ impl eframe::App for VoyagerApp {
                 ui.separator();
 
                 // Playback controls
-                ui.horizontal(|ui| {
-                    let play_button_text = if self.audio_state.is_playing() {
-                        "⏸ Pause"
-                    } else {
-                        "▶ Play"
-                    };
-                    if ui.button(play_button_text).clicked() {
-                        self.toggle_playback();
+                if let Some(action) = ControlsPanel::draw(ui, self.audio_state.is_playing()) {
+                    match action {
+                        ControlAction::TogglePlayback => self.toggle_playback(),
+                        ControlAction::StopPlayback => self.stop_playback(),
+                        ControlAction::SeekToNextSync => self.seek_to_next_sync(),
                     }
-
-                    if ui.button("⏹ Stop").clicked() {
-                        self.stop_playback();
-                    }
-
-                    if ui.button("⏭ Skip to Next Sync").clicked() {
-                        self.seek_to_next_sync();
-                    }
-
-                    // Position display
-                    if let Some(reader) = &self.wav_reader {
-                        let duration_secs =
-                            reader.left_channel.len() as f32 / reader.sample_rate as f32;
-                        let current_secs =
-                            self.current_position_samples as f32 / reader.sample_rate as f32;
-                        ui.label(format!(
-                            "Position: {} / {}",
-                            format_duration(current_secs),
-                            format_duration(duration_secs)
-                        ));
-                    }
-                });
+                }
 
                 ui.separator();
 
-                // Waveform visualization (placeholder for now)
-                if self.wav_reader.is_some() {
-                    let selected_channel = self.selected_channel;
-                    let current_position = self.current_position_samples;
-                    let hover_position = self.waveform_hover_position;
-                    let wav_reader = self.wav_reader.as_ref().unwrap();
-
-                    let samples = wav_reader.get_samples(selected_channel);
-                    let available_width = ui.available_width();
-                    let available_height = ui.available_height().min(150.0);
-
-                    let response = ui.allocate_response(
-                        egui::Vec2::new(available_width, available_height),
-                        egui::Sense::click_and_drag(),
-                    );
-                    let rect = response.rect;
-
-                    // Handle mouse interaction for seeking
+                // Waveform visualization
+                if let Some(new_pos) = WaveformPanel::draw(
+                    ui,
+                    &self.wav_reader,
+                    self.selected_channel,
+                    self.current_position_samples,
+                    &mut self.waveform_hover_position,
+                ) {
+                    self.current_position_samples = new_pos;
+                    
                     #[cfg(feature = "audio_playback")]
-                    let should_restart_audio = response.clicked() && self.audio_state.is_playing();
+                    self.restart_audio_from_current_position();
 
-                    if response.clicked() {
-                        let click_pos = response.interact_pointer_pos().unwrap_or_default();
-                        let relative_x = (click_pos.x - rect.min.x) / rect.width();
-                        let samples_len = samples.len();
-                        let seek_sample = (relative_x * samples_len as f32) as usize;
-                        self.current_position_samples =
-                            seek_sample.min(samples_len.saturating_sub(1));
-                        tracing::debug!(
-                            position = self.current_position_samples,
-                            "Seeking to sample"
-                        );
-
-                        #[cfg(not(feature = "audio_playback"))]
-                        if self.audio_state.is_playing() {
-                            self.playback_start_time = Some(Instant::now());
-                        }
+                    #[cfg(not(feature = "audio_playback"))]
+                    if self.audio_state.is_playing() {
+                        self.playback_start_time = Some(Instant::now());
                     }
 
-                    // Track hover position for vertical line
-                    if response.hovered() {
-                        if let Some(hover_pos) = response.hover_pos() {
-                            let relative_x = (hover_pos.x - rect.min.x) / rect.width();
-                            self.waveform_hover_position = Some(relative_x.clamp(0.0, 1.0));
-                        }
-                    } else {
-                        self.waveform_hover_position = None;
-                    }
-
-                    self.draw_waveform_internal(
-                        ui,
-                        &rect,
-                        samples,
-                        current_position,
-                        hover_position,
-                    );
-
-                    // Trigger decode on manual seek (user clicked)
-                    if response.clicked() {
-                        self.decode_at_position(ctx, self.current_position_samples);
-                        self.last_decode_position = self.current_position_samples;
-                    }
-
-                    // Restart audio after drawing is complete (borrow checker fix)
-                    #[cfg(feature = "audio_playback")]
-                    if should_restart_audio {
-                        self.restart_audio_from_current_position();
-                    }
-                } else {
-                    ui.label("📈 No waveform data available");
+                    // Trigger decode on manual seek
+                    self.decode_at_position(ctx, self.current_position_samples);
+                    self.last_decode_position = self.current_position_samples;
                 }
             });
 
