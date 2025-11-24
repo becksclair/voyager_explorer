@@ -2,18 +2,27 @@
 
 ## Now
 
-- [ ] Milestone 6 kickoff: choose owner and scope for spectrum view + batch decode
-- [ ] Spike: sketch UI for signal analysis panel (spectrum + playback overlay)
-- [ ] Define batch processing flow (CLI flags + optional UI queue) and list required WAV fixtures
-- [ ] If scope not finalized, move items to Later and confirm when to re-plan
+## Later (Milestone 7 - Next Phase)
 
-## Later (Milestone 6 - Advanced Features)
-
-- [ ] Milestone 6: Advanced features (optional)
-  - [ ] Signal analysis panel with spectrum view
-  - [ ] Batch processing mode (CLI or UI)
+(Future enhancements and features will be listed here)
 
 ## Done
+
+- [x] Milestone 6: Kickoff & Planning
+  - [x] Milestone 6 kickoff: choose owner and scope for spectrum view + batch decode
+  - [x] Spike: sketch UI for signal analysis panel (spectrum + playback overlay)
+  - [x] Define batch processing flow (CLI flags + optional UI queue) and list required WAV fixtures
+
+- [x] Milestone 6: Advanced features
+  - [x] Spectrum Panel Enhancements
+    - [x] Add logarithmic frequency scale toggle
+    - [x] Add dB magnitude scale
+    - [x] Add peak frequency detection and display
+  - [x] Batch Processing UI
+    - [x] Create Batch Processing panel/tab
+    - [x] Implement file selection (multiple files)
+    - [x] Implement progress tracking (queue, progress bar)
+    - [x] Integrate with existing `batch::process_file` logic
 
 - [x] Milestone 1: Implement real rodio audio playback (src/app.rs)
   - [x] Add feature-gated `audio_stream: Option<(OutputStream, OutputStreamHandle)>` to VoyagerApp

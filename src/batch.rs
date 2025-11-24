@@ -99,3 +99,8 @@ fn process_file(
 
     Ok(())
 }
+
+pub fn process_single_file(path: &Path, output_dir: &Path, params: &DecoderParams) -> Result<()> {
+    let pipeline = DecodingPipeline::new();
+    process_file(path, output_dir, &pipeline, params)
+}

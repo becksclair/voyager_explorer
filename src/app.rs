@@ -3,15 +3,18 @@ use crate::audio_state::AudioPlaybackState;
 use crate::config::AppConfig;
 use crate::error::VoyagerError;
 use crate::metrics::AppMetrics;
+#[cfg(feature = "audio_playback")]
 use crate::services::audio::AudioBufferSource;
 use crate::services::decoder::{spawn_decode_worker, DecodeRequest, DecodeResult};
 use crate::sstv::{DecoderMode, DecoderParams, SstvDecoder};
+use crate::ui::batch::{BatchPanel, BatchStatus};
 use crate::ui::controls::{ControlAction, ControlsPanel};
 use crate::ui::spectrum::SpectrumPanel;
 use crate::ui::waveform::WaveformPanel;
 use crate::utils::format_duration;
 use eframe::egui;
 use egui::TextureHandle;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -25,6 +28,12 @@ use rodio::{OutputStream, OutputStreamBuilder, Sink};
 
 #[cfg(feature = "audio_playback")]
 use rodio::mixer::Mixer;
+
+// Batch progress messages
+enum BatchProgressMsg {
+    ItemStatus(usize, BatchStatus),
+    Progress(f32),
+}
 
 pub struct VoyagerApp {
     // Configuration
@@ -64,6 +73,12 @@ pub struct VoyagerApp {
 
     // Signal Analysis
     spectrum_panel: SpectrumPanel,
+
+    // Batch Processing
+    batch_panel: BatchPanel,
+    batch_worker: Option<JoinHandle<()>>,
+    batch_rx: Option<Receiver<BatchProgressMsg>>,
+    batch_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Default for VoyagerApp {
@@ -118,6 +133,10 @@ impl Default for VoyagerApp {
             error_message: None,
             frame_start: None,
             spectrum_panel: SpectrumPanel::default(),
+            batch_panel: BatchPanel::default(),
+            batch_worker: None,
+            batch_rx: None,
+            batch_cancel: None,
         }
     }
 }
@@ -592,11 +611,130 @@ impl Drop for VoyagerApp {
                 tracing::error!("Worker thread panicked on shutdown: {:?}", e);
             }
         }
+
+        // Join batch worker thread if active
+        if let Some(handle) = self.batch_worker.take() {
+            // Signal cancellation
+            if let Some(flag) = &self.batch_cancel {
+                flag.store(true, Ordering::Relaxed);
+            }
+            // Drop the receiver to potentially signal the sender
+            self.batch_rx = None;
+            if let Err(e) = handle.join() {
+                tracing::error!("Batch worker thread panicked on shutdown: {:?}", e);
+            }
+        }
     }
 }
 
 impl eframe::App for VoyagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // --- Batch Processing Logic ---
+        // Check if user wants to start processing
+        if self.batch_panel.is_processing && self.batch_worker.is_none() {
+            // Start new batch processing
+            let queue = self.batch_panel.queue.clone();
+            let output_dir = match self.batch_panel.output_dir.clone() {
+                Some(dir) => dir,
+                None => {
+                    self.batch_panel.is_processing = false;
+                    return;
+                }
+            };
+            let mode = self.batch_panel.selected_mode;
+
+            // Create cancellation flag (use existing if initialized by start_processing)
+            let cancel_flag = self.batch_panel.cancel_flag.clone().unwrap_or_else(|| {
+                let flag = Arc::new(AtomicBool::new(false));
+                self.batch_panel.cancel_flag = Some(flag.clone());
+                flag
+            });
+            self.batch_cancel = Some(cancel_flag.clone());
+
+            // Create progress channel
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.batch_rx = Some(rx);
+
+            // Spawn worker thread
+            self.batch_worker = Some(std::thread::spawn(move || {
+                let params = crate::sstv::DecoderParams {
+                    mode,
+                    ..Default::default()
+                };
+
+                let total = queue.len();
+
+                for (index, item) in queue.iter().enumerate() {
+                    // Check cancellation
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        tracing::info!("Batch processing cancelled by user");
+                        break;
+                    }
+
+                    // Mark as processing
+                    let _ = tx.send(BatchProgressMsg::ItemStatus(index, BatchStatus::Processing));
+
+                    // Process the file
+                    let result =
+                        crate::batch::process_single_file(&item.path, &output_dir, &params);
+
+                    // Send status update
+                    let status = match result {
+                        Ok(_) => BatchStatus::Done,
+                        Err(e) => BatchStatus::Error(e.to_string()),
+                    };
+                    let _ = tx.send(BatchProgressMsg::ItemStatus(index, status));
+
+                    // Update progress
+                    let progress = (index + 1) as f32 / total.max(1) as f32;
+                    let _ = tx.send(BatchProgressMsg::Progress(progress));
+                }
+
+                tracing::info!("Batch processing thread completed");
+            }));
+
+            ctx.request_repaint();
+        }
+
+        if self.batch_panel.is_processing {
+            // Poll for messages from worker
+            if let Some(rx) = &self.batch_rx {
+                while let Ok(msg) = rx.try_recv() {
+                    match msg {
+                        BatchProgressMsg::ItemStatus(index, status) => {
+                            // Update item status
+                            if let Some(item) = self.batch_panel.queue.get_mut(index) {
+                                item.status = status;
+                            }
+                            ctx.request_repaint();
+                        }
+                        BatchProgressMsg::Progress(progress) => {
+                            // Update progress bar
+                            self.batch_panel.progress = progress;
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+            }
+
+            // Check if worker finished
+            if let Some(handle) = &self.batch_worker {
+                if handle.is_finished() {
+                    // Join the worker and clean up
+                    if let Some(handle) = self.batch_worker.take() {
+                        if let Err(e) = handle.join() {
+                            tracing::error!("Batch worker thread panicked: {:?}", e);
+                        }
+                    }
+                    self.batch_rx = None;
+                    self.batch_cancel = None;
+                    self.batch_panel.cancel_flag = None;
+                    self.batch_panel.is_processing = false;
+                    ctx.request_repaint();
+                }
+            }
+        }
+
         // Record frame time for performance metrics
         if let Some(start) = self.frame_start {
             self.metrics.record_frame_time(start.elapsed());
@@ -696,6 +834,10 @@ impl eframe::App for VoyagerApp {
         if self.audio_state.is_playing() {
             ctx.request_repaint();
         }
+
+        // Draw Batch Panel
+        self.batch_panel.draw(ctx);
+
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("🚀 Voyager Golden Record Explorer");
@@ -706,6 +848,10 @@ impl eframe::App for VoyagerApp {
 
                 if ui.button("🧠 Decode").clicked() {
                     self.handle_decode(ctx);
+                }
+
+                if ui.button("📦 Batch").clicked() {
+                    self.batch_panel.visible = !self.batch_panel.visible;
                 }
 
                 ui.separator();

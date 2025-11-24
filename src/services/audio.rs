@@ -1,6 +1,9 @@
+#[cfg(feature = "audio_playback")]
 use std::sync::Arc;
+#[cfg(feature = "audio_playback")]
 use std::time::Duration;
 
+#[cfg(feature = "audio_playback")]
 use crate::error::{AudioError, Result};
 
 #[cfg(feature = "audio_playback")]
