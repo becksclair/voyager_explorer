@@ -24,8 +24,7 @@ pub fn compute_spectrum(samples: &[f32], sample_rate: u32) -> Vec<(f64, f64)> {
 
     // Apply a Hamming window to reduce spectral leakage
     for (i, sample) in input_vector.iter_mut().enumerate() {
-        let window =
-            0.54 - 0.46 * ((2.0 * std::f32::consts::PI * i as f32) / (n as f32 - 1.0)).cos();
+        let window = 0.54 - 0.46 * ((2.0 * std::f32::consts::PI * i as f32) / (n as f32 - 1.0)).cos();
         *sample *= window;
     }
 
@@ -44,9 +43,8 @@ pub fn compute_spectrum(samples: &[f32], sample_rate: u32) -> Vec<(f64, f64)> {
         // Normalize magnitude
         let normalized_magnitude = magnitude / n as f32;
 
-        // Convert to dB scale (optional, but usually better for visualization)
-        // let db = 20.0 * normalized_magnitude.log10();
-
+        // Return linear magnitude - let the UI decide whether to convert to dB
+        // This preserves the user's choice between linear and dB scale views.
         let frequency = (i as f64 * sample_rate as f64) / n as f64;
         spectrum.push((frequency, normalized_magnitude as f64));
     }

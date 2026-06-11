@@ -2,9 +2,11 @@
 //!
 //! Supports loading from file with sensible defaults.
 
-use crate::error::{ConfigError, Result};
-use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{ConfigError, Result};
 
 /// Top-level application configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -100,6 +102,10 @@ pub struct WorkerConfig {
 
     /// Enable worker auto-restart on panic
     pub auto_restart_on_panic: bool,
+
+    /// Minimum interval between real-time decode requests in milliseconds
+    #[serde(default = "default_decode_interval_ms")]
+    pub decode_interval_ms: u64,
 }
 
 /// Metrics configuration
@@ -117,6 +123,10 @@ pub struct MetricsConfig {
 
     /// Maximum histogram value in milliseconds
     pub histogram_max_ms: u64,
+}
+
+fn default_decode_interval_ms() -> u64 {
+    500
 }
 
 impl Default for DecoderConfig {
@@ -162,6 +172,7 @@ impl Default for WorkerConfig {
             health_check_interval_ms: 1000,
             max_unresponsive_ms: 5000,
             auto_restart_on_panic: true,
+            decode_interval_ms: default_decode_interval_ms(),
         }
     }
 }
@@ -215,8 +226,7 @@ impl AppConfig {
             })?;
         }
 
-        let contents = toml::to_string_pretty(self)
-            .map_err(|source| ConfigError::SerializationFailed { source })?;
+        let contents = toml::to_string_pretty(self).map_err(|source| ConfigError::SerializationFailed { source })?;
 
         std::fs::write(path, contents).map_err(|source| ConfigError::SaveFailed {
             path: Box::new(path.to_path_buf()),
@@ -247,28 +257,19 @@ impl AppConfig {
 
         if !(0.0..=1.0).contains(&self.decoder.default_threshold) {
             return Err(ConfigError::ValidationFailed {
-                reason: format!(
-                    "Threshold {} out of range 0.0-1.0",
-                    self.decoder.default_threshold
-                ),
+                reason: format!("Threshold {} out of range 0.0-1.0", self.decoder.default_threshold),
             });
         }
 
         if !(0.1..=60.0).contains(&self.decoder.decode_window_secs) {
             return Err(ConfigError::ValidationFailed {
-                reason: format!(
-                    "Decode window {}s out of range 0.1-60s",
-                    self.decoder.decode_window_secs
-                ),
+                reason: format!("Decode window {}s out of range 0.1-60s", self.decoder.decode_window_secs),
             });
         }
 
         if !self.decoder.fft_chunk_size.is_power_of_two() {
             return Err(ConfigError::ValidationFailed {
-                reason: format!(
-                    "FFT chunk size {} must be power of 2",
-                    self.decoder.fft_chunk_size
-                ),
+                reason: format!("FFT chunk size {} must be power of 2", self.decoder.fft_chunk_size),
             });
         }
 
@@ -286,6 +287,12 @@ impl AppConfig {
             });
         }
 
+        if self.worker.decode_interval_ms == 0 {
+            return Err(ConfigError::ValidationFailed {
+                reason: "Decode interval must be > 0ms (use 1ms for minimal throttling)".to_string(),
+            });
+        }
+
         Ok(())
     }
 }
@@ -299,11 +306,7 @@ mod dirs {
         std::env::var("XDG_CONFIG_HOME")
             .ok()
             .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| PathBuf::from(h).join(".config"))
-            })
+            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
     }
 
     #[cfg(target_os = "macos")]
@@ -374,6 +377,19 @@ mod tests {
         assert!(config.validate().is_err());
 
         config.decoder.fft_chunk_size = 2048; // Power of 2
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_decode_interval() {
+        let mut config = AppConfig::default();
+        config.worker.decode_interval_ms = 0; // Zero disables throttling - not allowed
+        assert!(config.validate().is_err());
+
+        config.worker.decode_interval_ms = 1; // Minimal throttling - valid
+        assert!(config.validate().is_ok());
+
+        config.worker.decode_interval_ms = 500; // Default - valid
         assert!(config.validate().is_ok());
     }
 

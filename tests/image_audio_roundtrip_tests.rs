@@ -15,6 +15,7 @@ fn test_image_to_audio_and_back_single_line() {
         threshold: 0.1,
         decode_window_secs: 2.0,
         mode: DecoderMode::BinaryGrayscale,
+        ..Default::default()
     };
 
     // Line pattern: first half black, second half white.
@@ -25,9 +26,7 @@ fn test_image_to_audio_and_back_single_line() {
     let pixels = line.clone(); // single-line image
 
     let audio = encode_image_to_audio(&pixels, width, sample_rate, line_duration_ms);
-    let decoded = decoder
-        .decode(&audio, &params, sample_rate)
-        .expect("Decode should succeed");
+    let decoded = decoder.decode(&audio, &params, sample_rate).expect("Decode should succeed");
 
     assert_eq!(decoded.len(), width, "Should decode one line");
     assert_eq!(decoded, pixels, "Round-trip pixels must match input line");
@@ -44,6 +43,7 @@ fn test_image_to_audio_and_back_two_lines() {
         threshold: 0.1,
         decode_window_secs: 2.0,
         mode: DecoderMode::BinaryGrayscale,
+        ..Default::default()
     };
 
     // Two lines: top white, bottom checker of 8-pixel bars.
@@ -60,14 +60,8 @@ fn test_image_to_audio_and_back_two_lines() {
     }
 
     let audio = encode_image_to_audio(&pixels, width, sample_rate, line_duration_ms);
-    let decoded = decoder
-        .decode(&audio, &params, sample_rate)
-        .expect("Decode should succeed");
+    let decoded = decoder.decode(&audio, &params, sample_rate).expect("Decode should succeed");
 
-    assert_eq!(
-        decoded.len(),
-        pixels.len(),
-        "Decoded size should match input"
-    );
+    assert_eq!(decoded.len(), pixels.len(), "Decoded size should match input");
     assert_eq!(decoded, pixels, "Round-trip pixels must match both lines");
 }

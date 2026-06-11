@@ -1,7 +1,9 @@
-use crate::error::{AudioError, Result};
-use hound::WavReader as HoundReader;
 use std::path::Path;
 use std::sync::Arc;
+
+use hound::WavReader as HoundReader;
+
+use crate::error::{AudioError, Result};
 
 /// WAV file reader with normalized `f32` samples and zero-copy buffer sharing.
 ///
@@ -70,24 +72,55 @@ impl WavReader {
 
         // Validate sample rate
         if !(8000..=192_000).contains(&spec.sample_rate) {
-            return Err(AudioError::InvalidSampleRate {
-                rate: spec.sample_rate,
-            }
-            .into());
+            return Err(AudioError::InvalidSampleRate { rate: spec.sample_rate }.into());
         }
 
         // Validate channel count
         if spec.channels != 1 && spec.channels != 2 {
-            return Err(AudioError::UnsupportedChannels {
-                channels: spec.channels,
-            }
-            .into());
+            return Err(AudioError::UnsupportedChannels { channels: spec.channels }.into());
         }
+
+        // Sample-and-hold error recovery strategy:
+        // When a sample fails to decode, we reuse the last valid sample rather than
+        // emitting 0.0. This provides better audio continuity—sudden jumps to silence
+        // cause audible clicks/pops, whereas holding the previous value produces a
+        // brief "freeze" that's perceptually less jarring for occasional corruption.
+        // Trade-off: sustained corruption will sound like a stuck note rather than
+        // silence, but this is preferable for typical corruption patterns (sporadic).
+        let mut held_samples: usize = 0;
+        let mut last_valid_sample: f32 = 0.0;
+        let mut logged_errors: usize = 0;
+        const MAX_LOGGED_ERRORS: usize = 5;
 
         let samples: Vec<f32> = reader
             .samples::<i16>()
-            .map(|s| s.unwrap_or(0) as f32 / i16::MAX as f32)
+            .enumerate()
+            .map(|(idx, s)| match s {
+                Ok(val) => {
+                    let normalized = val as f32 / i16::MAX as f32;
+                    last_valid_sample = normalized;
+                    normalized
+                }
+                Err(e) => {
+                    held_samples += 1;
+                    // Rate-limit error logging to avoid spam on heavily corrupted files
+                    if logged_errors < MAX_LOGGED_ERRORS {
+                        logged_errors += 1;
+                        tracing::debug!(
+                            sample_index = idx,
+                            error = %e,
+                            remaining_logs = MAX_LOGGED_ERRORS - logged_errors,
+                            "Failed to decode sample, using sample-and-hold"
+                        );
+                    }
+                    last_valid_sample
+                }
+            })
             .collect();
+
+        if held_samples > 0 {
+            tracing::warn!("Recovered {} corrupt sample(s) via sample-and-hold", held_samples);
+        }
 
         // Check for empty file
         if samples.is_empty() {
@@ -147,9 +180,11 @@ pub enum WaveformChannel {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
     use tempfile::NamedTempFile;
+
+    use super::*;
 
     fn create_test_wav(samples: &[i16], sample_rate: u32, channels: u16) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -169,8 +204,7 @@ mod tests {
         file.write_all(&1u16.to_le_bytes()).unwrap(); // PCM format
         file.write_all(&channels.to_le_bytes()).unwrap();
         file.write_all(&sample_rate.to_le_bytes()).unwrap();
-        file.write_all(&(sample_rate * channels as u32 * 2).to_le_bytes())
-            .unwrap(); // byte rate
+        file.write_all(&(sample_rate * channels as u32 * 2).to_le_bytes()).unwrap(); // byte rate
         file.write_all(&(channels * 2).to_le_bytes()).unwrap(); // block align
         file.write_all(&16u16.to_le_bytes()).unwrap(); // bits per sample
 
@@ -200,16 +234,11 @@ mod tests {
         assert_eq!(reader.right_channel.len(), 5);
 
         // Check that samples are normalized to f32
-        let expected_normalized: Vec<f32> = test_samples
-            .iter()
-            .map(|&s| s as f32 / i16::MAX as f32)
-            .collect();
+        let expected_normalized: Vec<f32> = test_samples.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
 
         assert_eq!(reader.left_channel.as_ref(), expected_normalized.as_slice());
-        assert_eq!(
-            reader.right_channel.as_ref(),
-            expected_normalized.as_slice()
-        ); // Mono duplicated to both channels
+        assert_eq!(reader.right_channel.as_ref(), expected_normalized.as_slice());
+        // Mono duplicated to both channels
     }
 
     #[test]
@@ -225,16 +254,8 @@ mod tests {
         assert_eq!(reader.right_channel.len(), 3);
 
         // Check that left and right channels are separated correctly
-        let expected_left = vec![
-            1000.0 / i16::MAX as f32,
-            3000.0 / i16::MAX as f32,
-            5000.0 / i16::MAX as f32,
-        ];
-        let expected_right = vec![
-            2000.0 / i16::MAX as f32,
-            4000.0 / i16::MAX as f32,
-            6000.0 / i16::MAX as f32,
-        ];
+        let expected_left = vec![1000.0 / i16::MAX as f32, 3000.0 / i16::MAX as f32, 5000.0 / i16::MAX as f32];
+        let expected_right = vec![2000.0 / i16::MAX as f32, 4000.0 / i16::MAX as f32, 6000.0 / i16::MAX as f32];
 
         assert_eq!(reader.left_channel.as_ref(), expected_left.as_slice());
         assert_eq!(reader.right_channel.as_ref(), expected_right.as_slice());

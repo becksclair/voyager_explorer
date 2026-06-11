@@ -1,16 +1,18 @@
-use crate::sstv::DecoderMode;
 use egui::ColorImage;
+
+use crate::sstv::DecoderMode;
 
 /// Convert pixel array to an egui ColorImage
 ///
 /// # Arguments
 /// * `pixels` - Pixel data (Grayscale: 1 byte/pixel, Color: 3 bytes/pixel RGB)
 /// * `mode` - Decoder mode to interpret the pixel data
+/// * `width` - Image width in pixels; pass `DecoderParams.width` (default 512)
 ///
 /// # Returns
-/// A ColorImage with fixed width of 512 pixels
-pub fn image_from_pixels(pixels: &[u8], mode: DecoderMode) -> ColorImage {
-    let width = 512;
+/// A ColorImage of the given width
+pub fn image_from_pixels(pixels: &[u8], mode: DecoderMode, width: usize) -> ColorImage {
+    let width = width.max(1);
 
     if pixels.is_empty() {
         return ColorImage::new([width, 1], vec![egui::Color32::BLACK; width]);
@@ -21,8 +23,19 @@ pub fn image_from_pixels(pixels: &[u8], mode: DecoderMode) -> ColorImage {
             let height = pixels.len() / width;
             let height = if height == 0 { 1 } else { height };
 
-            let mut img =
-                ColorImage::new([width, height], vec![egui::Color32::BLACK; width * height]);
+            // Note: partial rows are discarded by integer division.
+            // If pixels.len() is not evenly divisible by width, the remaining
+            // pixels after the last complete row are silently dropped.
+            if !pixels.len().is_multiple_of(width) {
+                tracing::debug!(
+                    pixels_len = pixels.len(),
+                    width,
+                    discarded = pixels.len() % width,
+                    "BinaryGrayscale: partial row detected and discarded"
+                );
+            }
+
+            let mut img = ColorImage::new([width, height], vec![egui::Color32::BLACK; width * height]);
 
             let pixel_count = width * height;
             for (i, p) in pixels.iter().take(pixel_count).enumerate() {
@@ -35,8 +48,20 @@ pub fn image_from_pixels(pixels: &[u8], mode: DecoderMode) -> ColorImage {
             let height = pixels.len() / (width * bytes_per_pixel);
             let height = if height == 0 { 1 } else { height };
 
-            let mut img =
-                ColorImage::new([width, height], vec![egui::Color32::BLACK; width * height]);
+            // Note: partial rows are discarded by integer division.
+            // If pixels.len() is not evenly divisible by (width * 3), the remaining
+            // RGB triplets after the last complete row are silently dropped.
+            let row_size = width * bytes_per_pixel;
+            if !pixels.len().is_multiple_of(row_size) {
+                tracing::debug!(
+                    pixels_len = pixels.len(),
+                    row_size,
+                    discarded = pixels.len() % row_size,
+                    "PseudoColor: partial row detected and discarded"
+                );
+            }
+
+            let mut img = ColorImage::new([width, height], vec![egui::Color32::BLACK; width * height]);
 
             // Process RGB triplets
             for i in 0..img.pixels.len() {
@@ -60,7 +85,7 @@ mod tests {
     #[test]
     fn test_image_from_empty_pixels() {
         let empty_pixels = Vec::new();
-        let img = image_from_pixels(&empty_pixels, DecoderMode::BinaryGrayscale);
+        let img = image_from_pixels(&empty_pixels, DecoderMode::BinaryGrayscale, 512);
 
         assert_eq!(img.size, [512, 1]);
         assert_eq!(img.pixels.len(), 512);
@@ -78,7 +103,7 @@ mod tests {
             pixels.push((i % 256) as u8); // Pattern: 0, 1, 2, ..., 255, 0, 1, ...
         }
 
-        let img = image_from_pixels(&pixels, DecoderMode::BinaryGrayscale);
+        let img = image_from_pixels(&pixels, DecoderMode::BinaryGrayscale, 512);
 
         assert_eq!(img.size, [512, 1]);
         assert_eq!(img.pixels.len(), 512);
@@ -102,7 +127,7 @@ mod tests {
             }
         }
 
-        let img = image_from_pixels(&pixels, DecoderMode::BinaryGrayscale);
+        let img = image_from_pixels(&pixels, DecoderMode::BinaryGrayscale, 512);
 
         assert_eq!(img.size, [512, 2]);
         assert_eq!(img.pixels.len(), 1024);
@@ -123,7 +148,7 @@ mod tests {
         // Create pixels that don't fill complete lines
         let pixels: Vec<u8> = (0..100).collect(); // Only 100 pixels
 
-        let img = image_from_pixels(&pixels, DecoderMode::BinaryGrayscale);
+        let img = image_from_pixels(&pixels, DecoderMode::BinaryGrayscale, 512);
 
         assert_eq!(img.size, [512, 1]); // Still creates 1 line
         assert_eq!(img.pixels.len(), 512);
@@ -142,7 +167,7 @@ mod tests {
     #[test]
     fn test_image_grayscale_boundaries() {
         let pixels = vec![0, 127, 128, 255];
-        let img = image_from_pixels(&pixels, DecoderMode::BinaryGrayscale);
+        let img = image_from_pixels(&pixels, DecoderMode::BinaryGrayscale, 512);
 
         assert_eq!(img.pixels[0], egui::Color32::from_gray(0)); // Black
         assert_eq!(img.pixels[1], egui::Color32::from_gray(127)); // Dark gray

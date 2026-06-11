@@ -8,6 +8,7 @@ fn test_pseudocolor_decoding_logic() {
         threshold: 0.0,         // No threshold for this test
         decode_window_secs: 1.0,
         mode: DecoderMode::PseudoColor,
+        ..Default::default()
     };
 
     let sample_rate = 44100;
@@ -29,15 +30,9 @@ fn test_pseudocolor_decoding_logic() {
     // Line 3: Blue channel (all 0.0)
     samples.extend(std::iter::repeat_n(0.0, samples_per_line));
 
-    let pixels = decoder
-        .decode(&samples, &params, sample_rate)
-        .expect("Decode failed");
+    let pixels = decoder.decode(&samples, &params, sample_rate).expect("Decode failed");
 
-    assert_eq!(
-        pixels.len(),
-        512 * 3,
-        "Should produce exactly one line of RGB pixels"
-    );
+    assert_eq!(pixels.len(), 512 * 3, "Should produce exactly one line of RGB pixels");
 
     // Verify pixel values
     // R should be 255 (from 1.0 input)
@@ -69,6 +64,7 @@ fn test_pseudocolor_partial_lines() {
         threshold: 0.0,
         decode_window_secs: 1.0,
         mode: DecoderMode::PseudoColor,
+        ..Default::default()
     };
 
     let sample_rate = 44100;
@@ -78,9 +74,7 @@ fn test_pseudocolor_partial_lines() {
     // 4 lines of data
     samples.extend(std::iter::repeat_n(1.0, samples_per_line * 4));
 
-    let pixels = decoder
-        .decode(&samples, &params, sample_rate)
-        .expect("Decode failed");
+    let pixels = decoder.decode(&samples, &params, sample_rate).expect("Decode failed");
 
     // Should produce 1 RGB line (3 source lines)
     // The 4th line is dropped because it doesn't form a complete RGB triplet?
@@ -88,9 +82,5 @@ fn test_pseudocolor_partial_lines() {
     // "chunks_exact(3)" was used? No, I implemented it manually.
     // If I implemented it to consume 3 lines at a time, the leftover line is dropped.
 
-    assert_eq!(
-        pixels.len(),
-        512 * 3,
-        "Should produce exactly one line of RGB pixels from 4 input lines"
-    );
+    assert_eq!(pixels.len(), 512 * 3, "Should produce exactly one line of RGB pixels");
 }

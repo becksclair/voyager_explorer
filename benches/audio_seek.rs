@@ -1,5 +1,6 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::sync::Arc;
+
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 /// Simulates the OLD approach: cloning remaining samples
 fn seek_with_vec_clone(samples: &[f32], position: usize) -> Vec<f32> {
@@ -31,9 +32,7 @@ fn benchmark_seek_operations(c: &mut Criterion) {
         // Test seeking to middle (50% position)
         let seek_position = num_samples / 2;
 
-        group.throughput(Throughput::Bytes(
-            (num_samples * std::mem::size_of::<f32>()) as u64,
-        ));
+        group.throughput(Throughput::Bytes((num_samples * std::mem::size_of::<f32>()) as u64));
 
         // Benchmark OLD approach (Vec clone)
         group.bench_with_input(
@@ -53,8 +52,7 @@ fn benchmark_seek_operations(c: &mut Criterion) {
             &(samples_arc.clone(), seek_position),
             |b, (samples, pos)| {
                 b.iter(|| {
-                    let result =
-                        seek_with_arc_offset(black_box(Arc::clone(samples)), black_box(*pos));
+                    let result = seek_with_arc_offset(black_box(Arc::clone(samples)), black_box(*pos));
                     black_box(result.0.len());
                 });
             },
@@ -101,8 +99,7 @@ fn benchmark_multiple_seeks(c: &mut Criterion) {
     group.bench_function("arc_offset_10_seeks", |b| {
         b.iter(|| {
             for pos in &seek_positions {
-                let result =
-                    seek_with_arc_offset(black_box(Arc::clone(&samples_arc)), black_box(*pos));
+                let result = seek_with_arc_offset(black_box(Arc::clone(&samples_arc)), black_box(*pos));
                 black_box(result.0.len());
             }
         });
@@ -143,8 +140,7 @@ fn benchmark_memory_pressure(c: &mut Criterion) {
     group.bench_function("arc_100_random_seeks", |b| {
         b.iter(|| {
             for pos in &seek_positions {
-                let result =
-                    seek_with_arc_offset(black_box(Arc::clone(&samples_arc)), black_box(*pos));
+                let result = seek_with_arc_offset(black_box(Arc::clone(&samples_arc)), black_box(*pos));
                 black_box(result.0.len());
             }
         });

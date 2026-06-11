@@ -1,5 +1,6 @@
 use std::f32::consts::PI;
 use std::io::Write;
+
 use tempfile::NamedTempFile;
 use voyager_explorer::audio::{WavReader, WaveformChannel};
 use voyager_explorer::image_output::image_from_pixels;
@@ -56,8 +57,7 @@ fn create_wav_file(samples: &[i16], sample_rate: u32, channels: u16) -> NamedTem
     file.write_all(&1u16.to_le_bytes()).unwrap();
     file.write_all(&channels.to_le_bytes()).unwrap();
     file.write_all(&sample_rate.to_le_bytes()).unwrap();
-    file.write_all(&(sample_rate * channels as u32 * 2).to_le_bytes())
-        .unwrap();
+    file.write_all(&(sample_rate * channels as u32 * 2).to_le_bytes()).unwrap();
     file.write_all(&(channels * 2).to_le_bytes()).unwrap();
     file.write_all(&16u16.to_le_bytes()).unwrap();
 
@@ -98,6 +98,7 @@ fn test_full_workflow_wav_to_image() {
         threshold: 0.3,
         decode_window_secs: 2.0,
         mode: DecoderMode::BinaryGrayscale,
+        ..Default::default()
     };
 
     // Get samples from left channel
@@ -108,10 +109,7 @@ fn test_full_workflow_wav_to_image() {
     let sync_positions = decoder.find_sync_positions(samples, wav_reader.sample_rate);
     println!("Found {} sync positions", sync_positions.len());
     // We should find at least one sync signal
-    assert!(
-        !sync_positions.is_empty(),
-        "Should detect at least one sync signal"
-    );
+    assert!(!sync_positions.is_empty(), "Should detect at least one sync signal");
 
     // Test decoding
     let decoded_pixels = decoder
@@ -121,28 +119,20 @@ fn test_full_workflow_wav_to_image() {
 
     // Verify pixel data is valid (all values should be 0 or 255 for binary decoding)
     for &pixel in &decoded_pixels {
-        assert!(
-            pixel == 0 || pixel == 255,
-            "Pixel value should be 0 or 255, got {}",
-            pixel
-        );
+        assert!(pixel == 0 || pixel == 255, "Pixel value should be 0 or 255, got {}", pixel);
     }
 
     // Test image creation
-    let image = image_from_pixels(&decoded_pixels, DecoderMode::BinaryGrayscale);
+    let image = image_from_pixels(&decoded_pixels, DecoderMode::BinaryGrayscale, 512);
     assert_eq!(image.size[0], 512); // Width should be 512
     assert!(image.size[1] > 0); // Height should be positive
     assert_eq!(image.pixels.len(), image.size[0] * image.size[1]); // Correct pixel count
 
     // Test seeking functionality
     if sync_positions.len() > 1 {
-        let next_sync =
-            decoder.find_next_sync(samples, sync_positions[0] + 1000, wav_reader.sample_rate);
+        let next_sync = decoder.find_next_sync(samples, sync_positions[0] + 1000, wav_reader.sample_rate);
         assert!(next_sync.is_some(), "Should find next sync after first one");
-        assert!(
-            next_sync.unwrap() > sync_positions[0],
-            "Next sync should be after first sync"
-        );
+        assert!(next_sync.unwrap() > sync_positions[0], "Next sync should be after first sync");
     }
 
     println!(
@@ -239,12 +229,14 @@ fn test_parameter_variations() {
         threshold: 0.2,
         decode_window_secs: 2.0,
         mode: DecoderMode::BinaryGrayscale,
+        ..Default::default()
     };
     let params_slow = DecoderParams {
         line_duration_ms: 50.0,
         threshold: 0.3,
         decode_window_secs: 2.0,
         mode: DecoderMode::BinaryGrayscale,
+        ..Default::default()
     };
 
     let pixels_fast = decoder
@@ -266,12 +258,14 @@ fn test_parameter_variations() {
         threshold: 0.1,
         decode_window_secs: 2.0,
         mode: DecoderMode::BinaryGrayscale,
+        ..Default::default()
     };
     let params_high_thresh = DecoderParams {
         line_duration_ms: 10.0,
         threshold: 0.9,
         decode_window_secs: 2.0,
         mode: DecoderMode::BinaryGrayscale,
+        ..Default::default()
     };
 
     let pixels_low = decoder

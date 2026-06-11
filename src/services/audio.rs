@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "audio_playback")]
-use crate::error::{AudioError, Result};
+use rodio::Source;
 
 #[cfg(feature = "audio_playback")]
-use rodio::Source;
+use crate::error::{AudioError, Result};
 
 #[cfg(feature = "audio_playback")]
 /// Audio source that plays from a shared buffer of f32 samples with zero-copy seeking.
@@ -34,12 +34,7 @@ impl AudioBufferSource {
     /// - `offset >= buffer.len()` (offset out of bounds)
     /// - `channels == 0` (invalid channel count)
     /// - `sample_rate == 0` (invalid sample rate)
-    pub fn new(
-        buffer: Arc<[f32]>,
-        offset: usize,
-        sample_rate: u32,
-        channels: u16,
-    ) -> Result<Self, AudioError> {
+    pub fn new(buffer: Arc<[f32]>, offset: usize, sample_rate: u32, channels: u16) -> Result<Self, AudioError> {
         // Validate offset
         if offset >= buffer.len() {
             return Err(AudioError::BufferTooShort {
@@ -82,6 +77,11 @@ impl Iterator for AudioBufferSource {
             None
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.buffer.len().saturating_sub(self.offset + self.position);
+        (remaining, Some(remaining))
+    }
 }
 
 #[cfg(feature = "audio_playback")]
@@ -103,8 +103,7 @@ impl Source for AudioBufferSource {
 
     fn total_duration(&self) -> Option<Duration> {
         let remaining_samples = self.buffer.len().checked_sub(self.offset)? as u64;
-        let duration_secs =
-            remaining_samples as f64 / (self.sample_rate as f64 * self.channels as f64);
+        let duration_secs = remaining_samples as f64 / (self.sample_rate as f64 * self.channels as f64);
         Some(Duration::from_secs_f64(duration_secs))
     }
 }

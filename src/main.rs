@@ -21,9 +21,11 @@ pub mod sstv;
 pub mod ui;
 pub mod utils;
 
-use crate::sstv::DecoderMode;
-use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+
+use crate::sstv::DecoderMode;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -68,10 +70,7 @@ impl From<ModeArg> for DecoderMode {
 fn main() -> eframe::Result {
     // Initialize tracing subscriber
     fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("voyager_explorer=info")),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("voyager_explorer=info")))
         .with_target(false)
         .with_thread_ids(false)
         .with_file(false)
@@ -81,12 +80,7 @@ fn main() -> eframe::Result {
 
     let cli = Cli::parse();
 
-    if let Some(Commands::Batch {
-        input,
-        output,
-        mode,
-    }) = cli.command
-    {
+    if let Some(Commands::Batch { input, output, mode }) = cli.command {
         let args = batch::BatchArgs {
             input_pattern: input,
             output_dir: output,

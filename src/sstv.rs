@@ -1,6 +1,8 @@
-use crate::error::{DecoderError, Result, VoyagerError};
-use realfft::{RealFftPlanner, RealToComplex};
 use std::f32::consts::PI;
+
+use realfft::{RealFftPlanner, RealToComplex};
+
+use crate::error::{DecoderError, Result, VoyagerError};
 
 /// Target sync frequency in Hz (Voyager Golden Record standard)
 const TARGET_FREQ_HZ: f32 = 1200.0;
@@ -19,6 +21,18 @@ pub struct DecoderParams {
     pub threshold: f32,
     pub decode_window_secs: f64,
     pub mode: DecoderMode,
+    /// Image width in pixels. Default is 512, which matches the Voyager spacecraft
+    /// imaging system's standard frame width used for transmitting planetary imagery.
+    pub width: u32,
+}
+
+impl DecoderParams {
+    /// Image width as a usable row size, clamped so it can never be a zero
+    /// divisor in row/height math. Both the decoder and the pipeline must
+    /// use this same value or their row-size contracts diverge.
+    pub fn effective_width(&self) -> usize {
+        (self.width as usize).max(1)
+    }
 }
 
 impl Default for DecoderParams {
@@ -28,6 +42,7 @@ impl Default for DecoderParams {
             threshold: 0.2,
             decode_window_secs: 2.0,
             mode: DecoderMode::BinaryGrayscale,
+            width: 512,
         }
     }
 }
@@ -41,8 +56,13 @@ impl SstvDecoder {
     }
 
     fn hann_window(size: usize) -> Vec<f32> {
+        // The (size - 1) denominator underflows for size == 0 and divides by
+        // zero for size == 1; both degenerate windows are all-ones.
+        if size <= 1 {
+            return vec![1.0; size];
+        }
         (0..size)
-            .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / (size as f32 - 1.0)).cos()))
+            .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / ((size - 1) as f32)).cos()))
             .collect()
     }
 
@@ -55,11 +75,7 @@ impl SstvDecoder {
         spectrum_buffer: &mut [num_complex::Complex<f32>],
     ) -> bool {
         // Use reusable input buffer
-        for ((s, w), dest) in samples
-            .iter()
-            .zip(window.iter())
-            .zip(input_buffer.iter_mut())
-        {
+        for ((s, w), dest) in samples.iter().zip(window.iter()).zip(input_buffer.iter_mut()) {
             *dest = s * w;
         }
 
@@ -74,8 +90,7 @@ impl SstvDecoder {
         }
 
         let peak = spectrum_buffer[target_bin].norm();
-        let avg =
-            spectrum_buffer.iter().map(|c| c.norm()).sum::<f32>() / spectrum_buffer.len() as f32;
+        let avg = spectrum_buffer.iter().map(|c| c.norm()).sum::<f32>() / spectrum_buffer.len() as f32;
 
         peak > (avg * 10.0) // Simple threshold, tweak as needed
     }
@@ -89,7 +104,7 @@ impl SstvDecoder {
     /// # Performance Note
     /// This method processes chunks sequentially until a sync is found.
     /// Consider using `find_sync_positions()` for batch analysis.
-    pub fn detect_sync(&self, samples: Vec<f32>, sample_rate: u32) -> bool {
+    pub fn detect_sync(&self, samples: &[f32], sample_rate: u32) -> bool {
         tracing::debug!(samples_len = samples.len(), "Starting sync detection");
         let mut planner = RealFftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(CHUNK_SIZE);
@@ -145,10 +160,14 @@ impl SstvDecoder {
 
             if sync_detected {
                 positions.push(i);
-                // Skip ahead to avoid detecting the same sync signal multiple times
+                // Asymmetric stepping: Skip ahead 2x CHUNK_SIZE after finding sync to avoid
+                // re-detecting the same tone in the following chunks. After sync is found,
+                // the next line data follows, so we skip more aggressively.
                 i += CHUNK_SIZE * 2;
             } else {
-                i += CHUNK_SIZE / 4; // Overlap for better detection
+                // Overlap for better detection: step forward by 1/4 CHUNK_SIZE
+                // to ensure we don't miss sync signals between chunk boundaries
+                i += CHUNK_SIZE / 4;
             }
         }
 
@@ -156,12 +175,7 @@ impl SstvDecoder {
     }
 
     /// Find the next sync position after the given sample position
-    pub fn find_next_sync(
-        &self,
-        samples: &[f32],
-        start_position: usize,
-        sample_rate: u32,
-    ) -> Option<usize> {
+    pub fn find_next_sync(&self, samples: &[f32], start_position: usize, sample_rate: u32) -> Option<usize> {
         if start_position >= samples.len() {
             return None;
         }
@@ -182,20 +196,15 @@ impl SstvDecoder {
     ///
     /// # Returns
     ///
-    /// Grayscale pixels (0-255) in row-major order, width=512px.
-    /// In PseudoColor mode, returns RGB pixels (3 bytes per pixel).
+    /// Grayscale pixels (0-255) in row-major order, `params.width` pixels
+    /// wide (default 512). In PseudoColor mode, returns RGB pixels (3 bytes per pixel).
     ///
     /// # Errors
     ///
     /// Returns [`DecoderError::InvalidLineDuration`] if line duration is out of range 1-100ms.
     /// Returns [`DecoderError::InvalidThreshold`] if threshold is out of range 0.0-1.0.
     /// Returns [`DecoderError::InsufficientSamples`] if buffer is too short.
-    pub fn decode(
-        &self,
-        samples: &[f32],
-        params: &DecoderParams,
-        sample_rate: u32,
-    ) -> Result<Vec<u8>> {
+    pub fn decode(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Result<Vec<u8>> {
         // Validate parameters
         if !(1.0..=100.0).contains(&params.line_duration_ms) {
             return Err(VoyagerError::Decoder(DecoderError::InvalidLineDuration {
@@ -217,8 +226,7 @@ impl SstvDecoder {
             }));
         }
 
-        let samples_per_line =
-            (params.line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
+        let samples_per_line = (params.line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
         if samples_per_line == 0 {
             return Err(VoyagerError::Decoder(DecoderError::InvalidParams {
                 reason: format!(
@@ -235,7 +243,7 @@ impl SstvDecoder {
             }));
         }
 
-        let width = 512;
+        let width = params.effective_width();
         let max_lines = 16_384; // GPU texture limit
 
         // Pre-allocate image buffer
@@ -249,9 +257,11 @@ impl SstvDecoder {
         while i + samples_per_line <= samples.len() && lines_decoded < max_lines {
             let slice = &samples[i..i + samples_per_line];
 
-            // Resample slice to 512 pixels using linear interpolation
+            // Resample slice to `width` pixels using linear interpolation
             for x in 0..width {
                 // Map x (0..width) to sample index (0..samples_per_line)
+                // Boundary clamping: idx_ceil is clamped to samples_per_line - 1
+                // to avoid reading beyond the slice bounds when interpolating
                 let exact_idx = if width > 1 {
                     (x as f32 / (width as f32 - 1.0)) * (samples_per_line - 1) as f32
                 } else {
@@ -286,6 +296,16 @@ impl SstvDecoder {
             let num_lines = num_pixels / width;
             let num_color_lines = num_lines / 3;
 
+            // Warn if we're discarding incomplete color lines (not divisible by 3)
+            if !num_lines.is_multiple_of(3) {
+                tracing::warn!(
+                    num_lines,
+                    discarded_lines = num_lines % 3,
+                    "PseudoColor: incomplete color lines detected, truncating to {} complete color lines",
+                    num_color_lines
+                );
+            }
+
             let mut color_image = Vec::with_capacity(num_color_lines * width * 3);
 
             for line_idx in 0..num_color_lines {
@@ -308,11 +328,7 @@ impl SstvDecoder {
             image = color_image;
         }
 
-        tracing::debug!(
-            lines_decoded,
-            pixels = image.len(),
-            "Decode operation completed"
-        );
+        tracing::debug!(lines_decoded, pixels = image.len(), "Decode operation completed");
 
         Ok(image)
     }
@@ -320,8 +336,9 @@ impl SstvDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::f32::consts::PI;
+
+    use super::*;
 
     fn generate_test_signal(frequency: f32, duration_secs: f32, sample_rate: u32) -> Vec<f32> {
         let num_samples = (duration_secs * sample_rate as f32) as usize;
@@ -368,13 +385,20 @@ mod tests {
         let window = SstvDecoder::hann_window(10);
         assert_eq!(window.len(), 10);
 
-        // Hann window should be symmetric and start/end at 0
-        assert!((window[0] - 0.0).abs() < 1e-6);
-        assert!((window[9] - 0.0).abs() < 1e-6);
-
-        // Maximum should be around the middle
+        // Standard symmetric Hann window (denominator = N-1)
+        // Both endpoints should be exactly 0
+        assert!((window[0] - 0.0).abs() < 1e-6, "First sample should be 0");
+        assert!((window[9] - 0.0).abs() < 1e-6, "Last sample should be 0");
+        // Peak is close to 1.0 (exactly 1.0 only when N is odd)
         let max_val = window.iter().fold(0.0f32, |max, &val| max.max(val));
-        assert!(max_val > 0.9); // Should be close to 1.0
+        assert!(max_val > 0.95, "Peak should be close to 1.0, got {}", max_val);
+
+        // Verify odd-length window has exact 1.0 peak at center
+        let window_odd = SstvDecoder::hann_window(11);
+        assert!(
+            (window_odd[5] - 1.0).abs() < 1e-6,
+            "Center of odd window should be exactly 1.0"
+        );
     }
 
     #[test]
@@ -459,6 +483,7 @@ mod tests {
             threshold: 0.3,
             decode_window_secs: 2.0,
             mode: DecoderMode::BinaryGrayscale,
+            ..Default::default()
         };
 
         let sample_rate = 44100;
@@ -468,11 +493,7 @@ mod tests {
         let mut test_samples = Vec::new();
         for i in 0..(samples_per_line * 3) {
             // 3 lines worth
-            let value = if (i / samples_per_line).is_multiple_of(2) {
-                0.5
-            } else {
-                -0.5
-            };
+            let value = if (i / samples_per_line).is_multiple_of(2) { 0.5 } else { -0.5 };
             test_samples.push(value);
         }
 
@@ -490,6 +511,29 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_honors_non_default_width() {
+        let decoder = SstvDecoder::new();
+        let params = DecoderParams {
+            line_duration_ms: 10.0,
+            threshold: 0.3,
+            width: 100,
+            ..Default::default()
+        };
+
+        let sample_rate = 44100;
+        let samples_per_line = (params.line_duration_ms / 1000.0 * sample_rate as f32) as usize;
+        let test_samples = vec![0.5; samples_per_line * 3]; // 3 lines worth
+
+        let result = decoder
+            .decode(&test_samples, &params, sample_rate)
+            .expect("Decode should succeed");
+
+        // 3 lines of exactly params.width pixels each
+        assert_eq!(result.len(), 300);
+        assert_eq!(result.len() % params.width as usize, 0);
+    }
+
+    #[test]
     fn test_decode_pseudo_color_rgb_packing() {
         let decoder = SstvDecoder::new();
         let params = DecoderParams {
@@ -497,11 +541,11 @@ mod tests {
             threshold: 0.1,
             decode_window_secs: 2.0,
             mode: DecoderMode::PseudoColor,
+            ..Default::default()
         };
 
         let sample_rate = 1000;
-        let samples_per_line =
-            (params.line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
+        let samples_per_line = (params.line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
         assert_eq!(samples_per_line, 1);
 
         // Three lines: R=high, G=low, B=high -> expect (255,0,255) for every pixel.
@@ -587,8 +631,9 @@ mod tests {
     // Property-based tests using proptest
     #[cfg(test)]
     mod proptests {
-        use super::*;
         use proptest::prelude::*;
+
+        use super::*;
 
         /// Generate valid decoder parameters for property testing
         fn valid_decoder_params() -> impl Strategy<Value = DecoderParams> {
@@ -597,6 +642,7 @@ mod tests {
                 threshold,
                 decode_window_secs: 2.0,
                 mode: DecoderMode::BinaryGrayscale,
+                ..Default::default()
             })
         }
 
@@ -606,10 +652,7 @@ mod tests {
         }
 
         /// Generate random audio samples in valid range
-        fn random_samples(
-            min_samples: usize,
-            max_samples: usize,
-        ) -> impl Strategy<Value = Vec<f32>> {
+        fn random_samples(min_samples: usize, max_samples: usize) -> impl Strategy<Value = Vec<f32>> {
             prop::collection::vec(-1.0f32..=1.0f32, min_samples..=max_samples)
         }
 
@@ -698,6 +741,7 @@ mod tests {
                     threshold: 0.5,
                     decode_window_secs: 2.0,
                     mode: DecoderMode::BinaryGrayscale,
+                    ..Default::default()
                 };
 
                 let result = decoder.decode(&samples, &params, sample_rate);
@@ -723,6 +767,7 @@ mod tests {
                     threshold: invalid_threshold,
                     decode_window_secs: 2.0,
                     mode: DecoderMode::BinaryGrayscale,
+                    ..Default::default()
                 };
 
                 let result = decoder.decode(&samples, &params, sample_rate);

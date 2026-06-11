@@ -1,9 +1,8 @@
 //! Audio playback state management
 //!
-//! Provides explicit state tracking, error handling, and metrics for audio playback.
+//! Provides explicit state tracking and error handling for audio playback.
 
 use std::fmt;
-use std::time::{Duration, Instant};
 
 /// Explicit audio playback state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,10 +117,7 @@ impl AudioError {
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
-            Self::DeviceDisconnected
-                | Self::BufferUnderrun
-                | Self::SinkCreationFailed
-                | Self::SinkNotAvailable
+            Self::DeviceDisconnected | Self::BufferUnderrun | Self::SinkCreationFailed | Self::SinkNotAvailable
         )
     }
 
@@ -136,98 +132,6 @@ impl AudioError {
             Self::StreamInitFailed => "Restart application or check audio settings",
             Self::SinkNotAvailable => "Retry playback or restart application",
         }
-    }
-}
-
-/// Metrics for audio playback monitoring
-#[derive(Debug, Clone)]
-pub struct AudioMetrics {
-    /// Total time spent playing audio
-    pub total_playback_time: Duration,
-    /// Number of seeks performed
-    pub seek_count: u32,
-    /// Number of buffer underruns detected
-    pub buffer_underruns: u32,
-    /// Number of device errors encountered
-    pub device_errors: u32,
-    /// Last known audio device name
-    pub last_device_name: String,
-    /// Timestamp of last state change
-    pub last_state_change: Option<Instant>,
-    /// Number of successful play operations
-    pub play_count: u32,
-    /// Number of pause operations
-    pub pause_count: u32,
-    /// Number of stop operations
-    pub stop_count: u32,
-}
-
-impl Default for AudioMetrics {
-    fn default() -> Self {
-        Self {
-            total_playback_time: Duration::ZERO,
-            seek_count: 0,
-            buffer_underruns: 0,
-            device_errors: 0,
-            last_device_name: "Unknown".to_string(),
-            last_state_change: None,
-            play_count: 0,
-            pause_count: 0,
-            stop_count: 0,
-        }
-    }
-}
-
-impl AudioMetrics {
-    /// Record a seek operation
-    pub fn record_seek(&mut self) {
-        self.seek_count += 1;
-    }
-
-    /// Record a play operation
-    pub fn record_play(&mut self) {
-        self.play_count += 1;
-        self.last_state_change = Some(Instant::now());
-    }
-
-    /// Record a pause operation
-    pub fn record_pause(&mut self) {
-        self.pause_count += 1;
-        self.last_state_change = Some(Instant::now());
-    }
-
-    /// Record a stop operation
-    pub fn record_stop(&mut self) {
-        self.stop_count += 1;
-        self.last_state_change = Some(Instant::now());
-    }
-
-    /// Record a buffer underrun
-    pub fn record_buffer_underrun(&mut self) {
-        self.buffer_underruns += 1;
-    }
-
-    /// Record a device error
-    pub fn record_device_error(&mut self) {
-        self.device_errors += 1;
-    }
-
-    /// Add to total playback time
-    pub fn add_playback_time(&mut self, duration: Duration) {
-        self.total_playback_time += duration;
-    }
-
-    /// Generate a summary string for debugging
-    pub fn summary(&self) -> String {
-        format!(
-            "Audio Metrics: plays={}, pauses={}, stops={}, seeks={}, playback_time={:.1}s, errors={}",
-            self.play_count,
-            self.pause_count,
-            self.stop_count,
-            self.seek_count,
-            self.total_playback_time.as_secs_f32(),
-            self.device_errors + self.buffer_underruns
-        )
     }
 }
 
@@ -265,26 +169,9 @@ mod tests {
     }
 
     #[test]
-    fn test_metrics_recording() {
-        let mut metrics = AudioMetrics::default();
-        assert_eq!(metrics.seek_count, 0);
-
-        metrics.record_seek();
-        metrics.record_seek();
-        assert_eq!(metrics.seek_count, 2);
-
-        metrics.record_play();
-        assert_eq!(metrics.play_count, 1);
-        assert!(metrics.last_state_change.is_some());
-    }
-
-    #[test]
     fn test_status_icons() {
         assert_eq!(AudioPlaybackState::Playing.status_icon(), "▶️");
         assert_eq!(AudioPlaybackState::Paused.status_icon(), "⏸️");
-        assert_eq!(
-            AudioPlaybackState::Error(AudioError::NoDevice).status_icon(),
-            "⚠️"
-        );
+        assert_eq!(AudioPlaybackState::Error(AudioError::NoDevice).status_icon(), "⚠️");
     }
 }

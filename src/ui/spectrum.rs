@@ -1,6 +1,7 @@
-use crate::audio::WavReader;
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
+
+use crate::audio::WavReader;
 
 pub struct SpectrumPanel {
     pub visible: bool,
@@ -57,40 +58,10 @@ impl SpectrumPanel {
 
             if start < end {
                 let window_samples = &samples[start..end];
-                let spectrum =
-                    crate::analysis::compute_spectrum(window_samples, reader.sample_rate);
+                let spectrum = crate::analysis::compute_spectrum(window_samples, reader.sample_rate);
 
-                // Find peak if enabled
+                // Generate points for plotting and track peak in single pass
                 let mut peak: Option<(f64, f64)> = None;
-
-                // First pass to find peak (on linear/dB data before log transform)
-                for (f, m) in &spectrum {
-                    let mag = if self.use_db_scale { to_db(*m) } else { *m };
-
-                    match peak {
-                        None => peak = Some((*f, mag)),
-                        Some((_, max_mag)) => {
-                            if mag > max_mag {
-                                peak = Some((*f, mag));
-                            }
-                        }
-                    }
-                }
-
-                if self.show_peak {
-                    if let Some((peak_freq, peak_mag)) = peak {
-                        ui.label(format!(
-                            "Peak: {:.1} Hz ({:.1} {})",
-                            peak_freq,
-                            peak_mag,
-                            if self.use_db_scale { "dB" } else { "mag" }
-                        ));
-                    } else {
-                        ui.label("Peak: N/A");
-                    }
-                }
-
-                // Generate points for plotting
                 let points: PlotPoints = spectrum
                     .iter()
                     .filter_map(|(f, m)| {
@@ -108,12 +79,36 @@ impl SpectrumPanel {
                             mag = to_db(mag);
                         }
 
+                        // Track peak during iteration (reuse already-scaled mag)
+                        if self.show_peak {
+                            match peak {
+                                None => peak = Some((*f, mag)),
+                                Some((_, max_mag)) => {
+                                    if mag > max_mag {
+                                        peak = Some((*f, mag));
+                                    }
+                                }
+                            }
+                        }
+
                         Some([freq, mag])
                     })
                     .collect();
 
-                let line =
-                    Line::new("Magnitude", points).color(egui::Color32::from_rgb(100, 255, 100));
+                if self.show_peak {
+                    if let Some((peak_freq, peak_mag)) = peak {
+                        ui.label(format!(
+                            "Peak: {:.1} Hz ({:.1} {})",
+                            peak_freq,
+                            peak_mag,
+                            if self.use_db_scale { "dB" } else { "mag" }
+                        ));
+                    } else {
+                        ui.label("Peak: N/A");
+                    }
+                }
+
+                let line = Line::new("Magnitude", points).color(egui::Color32::from_rgb(100, 255, 100));
 
                 let mut plot = Plot::new("spectrum_plot")
                     .view_aspect(2.0)
@@ -122,11 +117,7 @@ impl SpectrumPanel {
                     } else {
                         "Frequency (Hz)"
                     })
-                    .y_axis_label(if self.use_db_scale {
-                        "Magnitude (dB)"
-                    } else {
-                        "Magnitude"
-                    });
+                    .y_axis_label(if self.use_db_scale { "Magnitude (dB)" } else { "Magnitude" });
 
                 if self.use_log_scale {
                     plot = plot.x_axis_formatter(|mark, _range| format_log_freq(mark.value));

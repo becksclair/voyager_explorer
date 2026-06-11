@@ -4,6 +4,7 @@
 //! user-friendly messages, and recovery strategies.
 
 use std::path::PathBuf;
+
 use thiserror::Error;
 
 /// Top-level error type for all Voyager Explorer operations.
@@ -84,25 +85,16 @@ pub enum DecoderError {
 #[derive(Error, Debug)]
 pub enum ConfigError {
     #[error("Failed to load config file '{path}': {source}")]
-    LoadFailed {
-        path: Box<PathBuf>,
-        source: std::io::Error,
-    },
+    LoadFailed { path: Box<PathBuf>, source: std::io::Error },
 
     #[error("Invalid config format in '{path}': {source}")]
-    InvalidFormat {
-        path: Box<PathBuf>,
-        source: toml::de::Error,
-    },
+    InvalidFormat { path: Box<PathBuf>, source: toml::de::Error },
 
     #[error("Config validation failed: {reason}")]
     ValidationFailed { reason: String },
 
     #[error("Failed to save config to '{path}': {source}")]
-    SaveFailed {
-        path: Box<PathBuf>,
-        source: std::io::Error,
-    },
+    SaveFailed { path: Box<PathBuf>, source: std::io::Error },
 
     #[error("Config serialization failed: {source}")]
     SerializationFailed { source: toml::ser::Error },
@@ -135,9 +127,7 @@ impl AudioError {
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
-            AudioError::BufferTooShort { .. }
-                | AudioError::StreamError(_)
-                | AudioError::PlaybackInitFailed { .. }
+            AudioError::BufferTooShort { .. } | AudioError::StreamError(_) | AudioError::PlaybackInitFailed { .. }
         )
     }
 
@@ -156,12 +146,8 @@ impl AudioError {
             AudioError::EmptyFile { path } => {
                 format!("Audio file '{}' is empty", path.display())
             }
-            AudioError::BufferTooShort { .. } => {
-                "Audio segment is too short for decoding".to_string()
-            }
-            AudioError::PlaybackInitFailed { .. } => {
-                "Could not initialize audio playback device".to_string()
-            }
+            AudioError::BufferTooShort { .. } => "Audio segment is too short for decoding".to_string(),
+            AudioError::PlaybackInitFailed { .. } => "Could not initialize audio playback device".to_string(),
             AudioError::StreamError(_) => "Audio playback error occurred".to_string(),
         }
     }
@@ -171,18 +157,10 @@ impl DecoderError {
     /// Get suggested recovery action
     pub fn recovery_hint(&self) -> Option<&str> {
         match self {
-            DecoderError::InvalidLineDuration { .. } => {
-                Some("Try adjusting line duration between 1-100ms")
-            }
-            DecoderError::InvalidThreshold { .. } => {
-                Some("Try adjusting threshold between 0.0-1.0")
-            }
-            DecoderError::InsufficientSamples { .. } => {
-                Some("Load a longer audio file or adjust decode window")
-            }
-            DecoderError::NoSyncDetected => {
-                Some("Try adjusting threshold or verify this is SSTV audio")
-            }
+            DecoderError::InvalidLineDuration { .. } => Some("Try adjusting line duration between 1-100ms"),
+            DecoderError::InvalidThreshold { .. } => Some("Try adjusting threshold between 0.0-1.0"),
+            DecoderError::InsufficientSamples { .. } => Some("Load a longer audio file or adjust decode window"),
+            DecoderError::NoSyncDetected => Some("Try adjusting threshold or verify this is SSTV audio"),
             _ => None,
         }
     }
@@ -201,10 +179,7 @@ mod tests {
 
     #[test]
     fn test_recoverable_errors() {
-        let recoverable = AudioError::BufferTooShort {
-            needed: 100,
-            actual: 50,
-        };
+        let recoverable = AudioError::BufferTooShort { needed: 100, actual: 50 };
         assert!(recoverable.is_recoverable());
 
         let unrecoverable = AudioError::InvalidSampleRate { rate: 999 };

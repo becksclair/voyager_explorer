@@ -1,6 +1,7 @@
+use eframe::egui;
+
 use crate::audio::{WavReader, WaveformChannel};
 use crate::utils::format_duration;
-use eframe::egui;
 
 pub struct WaveformPanel;
 
@@ -49,7 +50,7 @@ impl WaveformPanel {
                 let relative_x = (click_pos.x - rect.min.x) / rect.width();
                 let samples_len = samples.len();
                 let new_position = (relative_x * samples_len as f32) as usize;
-                seek_to = Some(new_position.clamp(0, samples_len));
+                seek_to = Some(new_position.clamp(0, samples_len.saturating_sub(1)));
             }
 
             if response.hovered() {
@@ -61,13 +62,7 @@ impl WaveformPanel {
                 *hover_position = None;
             }
 
-            Self::draw_internal(
-                ui,
-                &rect,
-                samples,
-                current_position_samples,
-                *hover_position,
-            );
+            Self::draw_internal(ui, &rect, samples, current_position_samples, *hover_position);
         } else {
             ui.label("No audio loaded");
         }
@@ -105,8 +100,7 @@ impl WaveformPanel {
 
             for pixel_x in 0..rect.width() as i32 {
                 let start_sample = (pixel_x as f32 * samples_per_pixel) as usize;
-                let end_sample =
-                    (((pixel_x + 1) as f32 * samples_per_pixel) as usize).min(samples.len());
+                let end_sample = (((pixel_x + 1) as f32 * samples_per_pixel) as usize).min(samples.len());
 
                 if start_sample < samples.len() {
                     // Find min/max in this pixel range for better visualization
@@ -141,8 +135,7 @@ impl WaveformPanel {
 
             // Draw current position indicator (only if position is valid)
             if current_position < samples.len() {
-                let position_x =
-                    rect.min.x + (current_position as f32 / samples.len() as f32) * rect.width();
+                let position_x = rect.min.x + (current_position as f32 / samples.len() as f32) * rect.width();
                 painter.line_segment(
                     [
                         egui::Pos2::new(position_x, rect.min.y),

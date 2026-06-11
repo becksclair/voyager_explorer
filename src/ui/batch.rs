@@ -1,7 +1,9 @@
-use crate::sstv::DecoderMode;
-use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{atomic::AtomicBool, Arc};
+
+use eframe::egui;
+
+use crate::sstv::DecoderMode;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BatchStatus {
@@ -67,10 +69,7 @@ impl BatchPanel {
         ui.group(|ui| {
             ui.horizontal(|ui| {
                 if ui.button("📂 Add Files...").clicked() {
-                    if let Some(paths) = rfd::FileDialog::new()
-                        .add_filter("WAV", &["wav"])
-                        .pick_files()
-                    {
+                    if let Some(paths) = rfd::FileDialog::new().add_filter("WAV", &["wav"]).pick_files() {
                         for path in paths {
                             if !self.queue.iter().any(|item| item.path == path) {
                                 self.queue.push(BatchItem {
@@ -106,16 +105,8 @@ impl BatchPanel {
                         DecoderMode::PseudoColor => "PseudoColor",
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.selected_mode,
-                            DecoderMode::BinaryGrayscale,
-                            "Binary (B/W)",
-                        );
-                        ui.selectable_value(
-                            &mut self.selected_mode,
-                            DecoderMode::PseudoColor,
-                            "PseudoColor",
-                        );
+                        ui.selectable_value(&mut self.selected_mode, DecoderMode::BinaryGrayscale, "Binary (B/W)");
+                        ui.selectable_value(&mut self.selected_mode, DecoderMode::PseudoColor, "PseudoColor");
                     });
             });
         });
@@ -126,53 +117,50 @@ impl BatchPanel {
         ui.heading(format!("Queue ({})", self.queue.len()));
         ui.separator();
 
-        egui::ScrollArea::vertical()
-            .max_height(200.0)
-            .show(ui, |ui| {
-                let mut to_remove = None;
-                for (i, item) in self.queue.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(format!("{}.", i + 1));
-                        ui.monospace(item.path.file_name().unwrap_or_default().to_string_lossy());
+        egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+            let mut items_to_remove = std::collections::HashSet::new();
+            for (i, item) in self.queue.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{}.", i + 1));
+                    ui.monospace(item.path.file_name().unwrap_or_default().to_string_lossy());
 
-                        match &item.status {
-                            BatchStatus::Pending => {
-                                ui.label("⏳ Pending");
-                                if !self.is_processing && ui.button("✖").clicked() {
-                                    to_remove = Some(i);
-                                }
-                            }
-                            BatchStatus::Processing => {
-                                ui.spinner();
-                                ui.label("Processing...");
-                            }
-                            BatchStatus::Done => {
-                                ui.colored_label(egui::Color32::GREEN, "✅ Done");
-                            }
-                            BatchStatus::Error(e) => {
-                                ui.colored_label(egui::Color32::RED, format!("❌ Error: {}", e));
+                    match &item.status {
+                        BatchStatus::Pending => {
+                            ui.label("⏳ Pending");
+                            if !self.is_processing && ui.button("✖").clicked() {
+                                items_to_remove.insert(i);
                             }
                         }
-                    });
-                }
+                        BatchStatus::Processing => {
+                            ui.spinner();
+                            ui.label("Processing...");
+                        }
+                        BatchStatus::Done => {
+                            ui.colored_label(egui::Color32::GREEN, "✅ Done");
+                        }
+                        BatchStatus::Error(e) => {
+                            ui.colored_label(egui::Color32::RED, format!("❌ Error: {}", e));
+                        }
+                    }
+                });
+            }
 
-                if let Some(i) = to_remove {
-                    self.queue.remove(i);
-                }
+            let mut current_index = 0;
+            self.queue.retain(|_| {
+                let keep = !items_to_remove.contains(&current_index);
+                current_index += 1;
+                keep
             });
+        });
 
         ui.add_space(10.0);
         ui.separator();
 
         // Actions
         ui.horizontal(|ui| {
-            let can_start =
-                !self.queue.is_empty() && self.output_dir.is_some() && !self.is_processing;
+            let can_start = !self.queue.is_empty() && self.output_dir.is_some() && !self.is_processing;
 
-            if ui
-                .add_enabled(can_start, egui::Button::new("▶ Start Batch"))
-                .clicked()
-            {
+            if ui.add_enabled(can_start, egui::Button::new("▶ Start Batch")).clicked() {
                 self.start_processing();
             }
 
@@ -180,7 +168,7 @@ impl BatchPanel {
                 if ui.button("⏹ Stop").clicked() {
                     // Set cancellation flag
                     if let Some(flag) = &self.cancel_flag {
-                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        flag.store(true, std::sync::atomic::Ordering::Release);
                     }
                 }
 

@@ -20,12 +20,7 @@ use std::f32::consts::PI;
 /// let tone = generate_sine_wave(440.0, 1.0, 44100, 0.5);
 /// assert_eq!(tone.len(), 44100);
 /// ```
-pub fn generate_sine_wave(
-    frequency: f32,
-    duration_secs: f32,
-    sample_rate: u32,
-    amplitude: f32,
-) -> Vec<f32> {
+pub fn generate_sine_wave(frequency: f32, duration_secs: f32, sample_rate: u32, amplitude: f32) -> Vec<f32> {
     let num_samples = (duration_secs * sample_rate as f32) as usize;
     (0..num_samples)
         .map(|i| {
@@ -45,13 +40,7 @@ pub fn generate_sine_wave(
 /// * `duration_secs` - Duration in seconds
 /// * `sample_rate` - Sample rate in Hz
 /// * `amplitude` - Peak amplitude, 0.0 to 1.0
-pub fn generate_chirp(
-    start_freq: f32,
-    end_freq: f32,
-    duration_secs: f32,
-    sample_rate: u32,
-    amplitude: f32,
-) -> Vec<f32> {
+pub fn generate_chirp(start_freq: f32, end_freq: f32, duration_secs: f32, sample_rate: u32, amplitude: f32) -> Vec<f32> {
     let num_samples = (duration_secs * sample_rate as f32) as usize;
     let freq_range = end_freq - start_freq;
 
@@ -90,12 +79,7 @@ pub fn generate_white_noise(duration_secs: f32, sample_rate: u32, amplitude: f32
 ///
 /// Creates a square wave pattern useful for SSTV decoding tests.
 /// Produces clear stripes in decoded images.
-pub fn generate_square_wave(
-    frequency: f32,
-    duration_secs: f32,
-    sample_rate: u32,
-    amplitude: f32,
-) -> Vec<f32> {
+pub fn generate_square_wave(frequency: f32, duration_secs: f32, sample_rate: u32, amplitude: f32) -> Vec<f32> {
     let num_samples = (duration_secs * sample_rate as f32) as usize;
     (0..num_samples)
         .map(|i| {
@@ -122,23 +106,13 @@ pub fn generate_sync_pattern(sample_rate: u32) -> Vec<f32> {
     let mut signal = Vec::new();
 
     // Sync 1
-    signal.extend(generate_sine_wave(
-        sync_freq,
-        sync_duration,
-        sample_rate,
-        0.8,
-    ));
+    signal.extend(generate_sine_wave(sync_freq, sync_duration, sample_rate, 0.8));
 
     // Silence 1
     signal.extend(vec![0.0; (silence_duration * sample_rate as f32) as usize]);
 
     // Sync 2
-    signal.extend(generate_sine_wave(
-        sync_freq,
-        sync_duration,
-        sample_rate,
-        0.8,
-    ));
+    signal.extend(generate_sine_wave(sync_freq, sync_duration, sample_rate, 0.8));
 
     // Silence 2
     signal.extend(vec![0.0; (silence_duration * sample_rate as f32) as usize]);
@@ -173,12 +147,7 @@ pub fn generate_composite_signal(sample_rate: u32) -> Vec<f32> {
 /// Encode a binary (0/255) image into SSTV-style audio samples using nearest-neighbor mapping.
 ///
 /// This mirrors the decoder's line_duration/sample-rate relationship so round-trips in tests are exact.
-pub fn encode_image_to_audio(
-    pixels: &[u8],
-    width: usize,
-    sample_rate: u32,
-    line_duration_ms: f32,
-) -> Vec<f32> {
+pub fn encode_image_to_audio(pixels: &[u8], width: usize, sample_rate: u32, line_duration_ms: f32) -> Vec<f32> {
     // Keep in sync with decoder sampling: ensures preset/export/color roundtrips remain deterministic.
     let samples_per_line = (line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
     assert!(
@@ -204,11 +173,7 @@ pub fn encode_image_to_audio(
 ///
 /// Returns a temporary file handle that can be used with WavReader.
 /// Available in tests and when test_fixtures feature is enabled.
-pub fn create_test_wav_file(
-    samples: &[f32],
-    sample_rate: u32,
-    channels: u16,
-) -> tempfile::NamedTempFile {
+pub fn create_test_wav_file(samples: &[f32], sample_rate: u32, channels: u16) -> tempfile::NamedTempFile {
     use std::io::Write;
 
     let mut file = tempfile::NamedTempFile::new().expect("create temp file");
@@ -234,8 +199,7 @@ pub fn create_test_wav_file(
     file.write_all(&1u16.to_le_bytes()).unwrap(); // PCM format
     file.write_all(&channels.to_le_bytes()).unwrap();
     file.write_all(&sample_rate.to_le_bytes()).unwrap();
-    file.write_all(&(sample_rate * channels as u32 * 2).to_le_bytes())
-        .unwrap(); // byte rate
+    file.write_all(&(sample_rate * channels as u32 * 2).to_le_bytes()).unwrap(); // byte rate
     file.write_all(&(channels * 2).to_le_bytes()).unwrap(); // block align
     file.write_all(&16u16.to_le_bytes()).unwrap(); // bits per sample
 
@@ -321,10 +285,7 @@ mod tests {
         // Should have alternating high-energy and low-energy regions
         let chunk_size = signal.len() / 4;
         let chunk1_energy: f32 = signal[..chunk_size].iter().map(|x| x * x).sum();
-        let chunk2_energy: f32 = signal[chunk_size..chunk_size * 2]
-            .iter()
-            .map(|x| x * x)
-            .sum();
+        let chunk2_energy: f32 = signal[chunk_size..chunk_size * 2].iter().map(|x| x * x).sum();
 
         // First chunk (sync) should have much more energy than second (silence)
         assert!(chunk1_energy > chunk2_energy * 10.0);

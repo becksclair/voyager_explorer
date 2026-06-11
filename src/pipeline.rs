@@ -1,8 +1,9 @@
-use crate::sstv::{DecoderMode, DecoderParams, SstvDecoder};
 use anyhow::{Context, Result};
 use egui::ColorImage;
 use image::{DynamicImage, GrayImage, Luma, Rgba, RgbaImage};
 use thiserror::Error;
+
+use crate::sstv::{DecoderMode, DecoderParams, SstvDecoder};
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
@@ -54,7 +55,7 @@ impl PipelineResult {
                 for y in 0..self.height {
                     for x in 0..self.width {
                         let idx = (y * self.width + x) as usize * 3;
-                        if idx + 2 < self.pixels.len() {
+                        if idx + 3 <= self.pixels.len() {
                             let r = self.pixels[idx];
                             let g = self.pixels[idx + 1];
                             let b = self.pixels[idx + 2];
@@ -88,7 +89,7 @@ impl PipelineResult {
                 );
                 for i in 0..img.pixels.len() {
                     let src_idx = i * 3;
-                    if src_idx + 2 < self.pixels.len() {
+                    if src_idx + 3 <= self.pixels.len() {
                         let r = self.pixels[src_idx];
                         let g = self.pixels[src_idx + 1];
                         let b = self.pixels[src_idx + 2];
@@ -112,12 +113,7 @@ impl DecodingPipeline {
         }
     }
 
-    pub fn process(
-        &self,
-        samples: &[f32],
-        params: &DecoderParams,
-        sample_rate: u32,
-    ) -> Result<PipelineResult> {
+    pub fn process(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Result<PipelineResult> {
         let pixels = self
             .decoder
             .decode(samples, params, sample_rate)
@@ -128,10 +124,10 @@ impl DecodingPipeline {
             anyhow::bail!("Decoded pixels empty");
         }
 
-        let width = 512;
+        let width = params.effective_width();
         let row_size = match params.mode {
-            DecoderMode::BinaryGrayscale => width as usize,
-            DecoderMode::PseudoColor => (width as usize) * 3,
+            DecoderMode::BinaryGrayscale => width,
+            DecoderMode::PseudoColor => width * 3,
         };
 
         if pixels.len() % row_size != 0 {
@@ -147,7 +143,7 @@ impl DecodingPipeline {
 
         Ok(PipelineResult {
             pixels,
-            width,
+            width: width as u32,
             height,
             mode: params.mode,
         })

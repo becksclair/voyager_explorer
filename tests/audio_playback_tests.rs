@@ -25,15 +25,8 @@ fn test_wav_loading_with_synthetic_tone() {
     assert_eq!(reader.right_channel.len(), 22050); // Mono duplicated
 
     // Verify amplitude is approximately 0.6
-    let max_amplitude = reader
-        .left_channel
-        .iter()
-        .map(|&s| s.abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        (max_amplitude - 0.6).abs() < 0.05,
-        "Amplitude should be ~0.6"
-    );
+    let max_amplitude = reader.left_channel.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+    assert!((max_amplitude - 0.6).abs() < 0.05, "Amplitude should be ~0.6");
 }
 
 #[test]
@@ -74,20 +67,17 @@ fn test_decoding_produces_consistent_output() {
         threshold: 0.2,
         decode_window_secs: 2.0,
         mode: DecoderMode::BinaryGrayscale,
+        ..Default::default()
     };
 
     // Generate square wave for clear pattern
     let signal = generate_square_wave(50.0, 0.5, 44100, 0.8);
 
     // Decode once
-    let pixels1 = decoder
-        .decode(&signal, &params, 44100)
-        .expect("Decode should succeed");
+    let pixels1 = decoder.decode(&signal, &params, 44100).expect("Decode should succeed");
 
     // Decode again with same input
-    let pixels2 = decoder
-        .decode(&signal, &params, 44100)
-        .expect("Decode should succeed");
+    let pixels2 = decoder.decode(&signal, &params, 44100).expect("Decode should succeed");
 
     // Should produce identical output
     assert_eq!(pixels1.len(), pixels2.len());
@@ -100,19 +90,12 @@ fn test_decoding_produces_consistent_output() {
 
     // Should have reasonable number of lines
     let num_lines = pixels1.len() / 512;
-    assert!(
-        num_lines > 10,
-        "Should produce at least 10 lines, got {}",
-        num_lines
-    );
+    assert!(num_lines > 10, "Should produce at least 10 lines, got {}", num_lines);
 
     // Should have meaningful content (not all black or all white)
     let has_black = pixels1.contains(&0);
     let has_white = pixels1.contains(&255);
-    assert!(
-        has_black && has_white,
-        "Image should contain both black and white pixels"
-    );
+    assert!(has_black && has_white, "Image should contain both black and white pixels");
 }
 
 #[test]
@@ -175,10 +158,7 @@ fn test_seek_positions_are_valid() {
     // Test find_next_sync from various positions
     for start_pos in [0, total_samples / 4, total_samples / 2] {
         if let Some(next_pos) = decoder.find_next_sync(&signal, start_pos, 44100) {
-            assert!(
-                next_pos > start_pos,
-                "Next sync should be after start position"
-            );
+            assert!(next_pos > start_pos, "Next sync should be after start position");
             assert!(next_pos < total_samples, "Next sync should be in bounds");
         }
     }
@@ -192,14 +172,8 @@ fn test_chirp_signal_properties() {
     assert_eq!(chirp.len(), 44100, "Should be 1 second at 44.1kHz");
 
     // Amplitude should stay within expected range
-    let max_amp = chirp
-        .iter()
-        .map(|&s: &f32| s.abs())
-        .fold::<f32, _>(0.0f32, f32::max);
-    assert!(
-        (max_amp - 0.7).abs() < 0.05,
-        "Chirp amplitude should be ~0.7"
-    );
+    let max_amp = chirp.iter().map(|s: &f32| s.abs()).fold::<f32, _>(0.0f32, f32::max);
+    assert!((max_amp - 0.7).abs() < 0.05, "Chirp amplitude should be ~0.7");
 
     // Signal should not be constant (it's sweeping frequencies)
     let first_quarter = &chirp[0..11025];
@@ -257,16 +231,8 @@ fn test_white_noise_is_not_silent() {
     let positive_count = noise.iter().filter(|&&s| s > 0.0f32).count();
     let negative_count = noise.iter().filter(|&&s| s < 0.0f32).count();
 
-    assert!(
-        positive_count > 1000,
-        "Should have many positive samples: {}",
-        positive_count
-    );
-    assert!(
-        negative_count > 1000,
-        "Should have many negative samples: {}",
-        negative_count
-    );
+    assert!(positive_count > 1000, "Should have many positive samples: {}", positive_count);
+    assert!(negative_count > 1000, "Should have many negative samples: {}", negative_count);
 }
 
 #[test]
@@ -309,12 +275,14 @@ fn test_parameter_variation_affects_output() {
         threshold: 0.3,
         decode_window_secs: 2.0,
         mode: DecoderMode::BinaryGrayscale,
+        ..Default::default()
     };
     let params_long = DecoderParams {
         line_duration_ms: 15.0,
         threshold: 0.3,
         decode_window_secs: 2.0,
         mode: DecoderMode::BinaryGrayscale,
+        ..Default::default()
     };
 
     let pixels_short = decoder
@@ -332,10 +300,7 @@ fn test_parameter_variation_affects_output() {
         lines_short, lines_long,
         "Different line durations should produce different outputs"
     );
-    assert!(
-        lines_short > lines_long,
-        "Shorter line duration should produce more lines"
-    );
+    assert!(lines_short > lines_long, "Shorter line duration should produce more lines");
 }
 
 #[test]
@@ -356,16 +321,8 @@ fn test_error_messages_are_helpful() {
         // Messages should be non-empty and helpful
         assert!(!message.is_empty(), "Error message should not be empty");
         assert!(!action.is_empty(), "User action should not be empty");
-        assert!(
-            message.len() > 10,
-            "Error message should be descriptive: {}",
-            message
-        );
-        assert!(
-            action.len() > 10,
-            "User action should be descriptive: {}",
-            action
-        );
+        assert!(message.len() > 10, "Error message should be descriptive: {}", message);
+        assert!(action.len() > 10, "User action should be descriptive: {}", action);
     }
 }
 
@@ -382,10 +339,7 @@ fn test_composite_signal_structure() {
 
     // Should not be all zeros
     let non_zero_count = composite.iter().filter(|&&s: &&f32| s.abs() > 0.01).count();
-    assert!(
-        non_zero_count > 10000,
-        "Composite should have significant non-zero content"
-    );
+    assert!(non_zero_count > 10000, "Composite should have significant non-zero content");
 
     // Should have both positive and negative samples
     let pos_count = composite.iter().filter(|&&s| s > 0.1f32).count();
