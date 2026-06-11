@@ -1,3 +1,11 @@
 /target
+/logs
 assets/*.wav
-.gitignore
+
+# Coverage artifacts
+lcov.info
+tarpaulin-report.html
+*.profraw
+
+# Local agent settings
+.claude/settings.local.json

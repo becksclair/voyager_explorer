@@ -1,4 +1,15 @@
 #!/bin/sh
+# Format Rust code before commit and re-stage the formatted versions of
+# files that were already staged (otherwise the commit would contain the
+# unformatted content). NUL-delimited so paths with whitespace survive.
 
-# Format Rust code before commit
+staged_list=$(mktemp) || exit 1
+trap 'rm -f "$staged_list"' EXIT
+
+git diff --cached --name-only -z --diff-filter=ACM -- '*.rs' > "$staged_list"
+
 cargo fmt || exit 1
+
+if [ -s "$staged_list" ]; then
+    xargs -0 -r git add -- < "$staged_list"
+fi

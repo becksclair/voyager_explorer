@@ -10,7 +10,7 @@ run:
 
 # Run the app with debug logging
 run-debug:
-    $env:RUST_LOG="debug"; cargo run
+    RUST_LOG=debug cargo run
 
 # Run the app without audio playback
 run-no-audio:
