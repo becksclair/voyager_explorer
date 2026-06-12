@@ -70,22 +70,42 @@ pub fn detect_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams)
     }
 
     // Falling edge: line start = minimum within the search window after the peak.
-    peaks
-        .into_iter()
-        .map(|p| {
-            let end = (p + edge_search).min(samples.len());
-            let mut min_idx = p;
-            let mut min_val = samples[p];
-            for (j, &v) in samples.iter().enumerate().take(end).skip(p) {
-                if v < min_val {
-                    min_val = v;
-                    min_idx = j;
-                }
-            }
-            min_idx
-        })
-        .collect()
+    peaks.into_iter().map(|p| falling_edge_min(samples, p, edge_search)).collect()
 }
+
+/// Index of the minimum sample in `[peak, peak + edge_search)` — the bottom
+/// of the sync spike's falling edge, which marks the line start. First
+/// minimum wins on ties.
+fn falling_edge_min(samples: &[f32], peak: usize, edge_search: usize) -> usize {
+    let end = (peak + edge_search).min(samples.len());
+    let mut min_idx = peak;
+    for j in peak..end {
+        if samples[j] < samples[min_idx] {
+            min_idx = j;
+        }
+    }
+    min_idx
+}
+
+/// Tracker tuning constants. The detector's analogous knobs live on
+/// [`SyncParams`]; these stay module-level because no caller tunes them yet.
+///
+/// Search radius around each predicted sync, as a fraction of the period.
+/// Tight enough that content peaks elsewhere in the line cannot capture the
+/// lock (reference decoders use 1-6%).
+const TRACK_SEARCH_FRAC: f64 = 0.06;
+/// Falling-edge search length after the spike, as a fraction of the period.
+/// The dip follows the spike within a few samples; searching further lets
+/// dark content masquerade as the falling edge.
+const TRACK_EDGE_FRAC: f64 = 0.05;
+/// EMA weight for adapting the period from an accepted lock. Gentle, so
+/// locks at the tolerance edge cannot drag the cadence estimate.
+const PERIOD_EMA_ALPHA: f64 = 0.05;
+/// A re-anchor needs a spike-to-dip swing above this fraction of the
+/// detector threshold; a full-threshold swing also counts as a strong lock.
+const SWING_ANCHOR_FACTOR: f32 = 0.6;
+/// Accepted re-anchor intervals must lie within this fraction of the period.
+const TRACK_INTERVAL_TOL: f64 = 0.06;
 
 /// Track scan-line sync positions with a predictive lock.
 ///
@@ -120,13 +140,8 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
         return detected;
     }
     let threshold = robust_max * params.peak_height;
-    // Search radius around each prediction: tight enough that content peaks
-    // elsewhere in the line can't capture the lock (reference decoders use
-    // 1-6% of the period).
-    let search = ((period * 0.06) as usize).max(2);
-    // The dip follows the spike within a few samples; searching further
-    // lets dark content masquerade as the falling edge.
-    let edge_search = ((period * 0.05) as usize).max(4);
+    let search = ((period * TRACK_SEARCH_FRAC) as usize).max(2);
+    let edge_search = ((period * TRACK_EDGE_FRAC) as usize).max(4);
 
     // Seed at the first detected sync that starts a coherent pair.
     let seed = detected
@@ -164,13 +179,7 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
             .expect("window is non-empty");
 
         // Falling edge after the peak marks the true line start.
-        let end = (peak + edge_search).min(samples.len());
-        let mut min_idx = peak;
-        for j in peak..end {
-            if samples[j] < samples[min_idx] {
-                min_idx = j;
-            }
-        }
+        let min_idx = falling_edge_min(samples, peak, edge_search);
         // Re-anchor only on a sync-like event: a genuine spike-to-dip swing
         // (attenuated syncs in dark lines still swing harder than content
         // noise) at a plausible interval. Anchoring on anything weaker
@@ -178,10 +187,8 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
         // keeps the image coherent.
         let swing = samples[peak] - samples[min_idx];
         let interval = min_idx as f64 - pos;
-        let next = if swing > threshold * 0.6 && (interval - period).abs() / period < 0.06 {
-            // Adapt the period gently: locks at the tolerance edge must not
-            // drag the cadence estimate the coasting depends on.
-            period = period * 0.95 + interval * 0.05;
+        let next = if swing > threshold * SWING_ANCHOR_FACTOR && (interval - period).abs() / period < TRACK_INTERVAL_TOL {
+            period = period * (1.0 - PERIOD_EMA_ALPHA) + interval * PERIOD_EMA_ALPHA;
             if swing > threshold {
                 locked += 1;
             }
@@ -225,11 +232,7 @@ pub fn interval_summary(positions: &[usize], sample_rate: u32) -> Option<Interva
     let intervals: Vec<usize> = positions.windows(2).map(|w| w[1] - w[0]).collect();
     let mut sorted = intervals.clone();
     sorted.sort_unstable();
-    let median_samples = if sorted.len().is_multiple_of(2) {
-        (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) as f64 / 2.0
-    } else {
-        sorted[sorted.len() / 2] as f64
-    };
+    let median_samples = median_of_sorted(&sorted);
     let mean = intervals.iter().sum::<usize>() as f64 / intervals.len() as f64;
     let var = intervals.iter().map(|&i| (i as f64 - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
 
@@ -242,6 +245,16 @@ pub fn interval_summary(positions: &[usize], sample_rate: u32) -> Option<Interva
         max_samples: *sorted.last().unwrap(),
         median_ms: median_samples / sample_rate as f64 * 1000.0,
     })
+}
+
+/// Median of an already-sorted slice (even-length average, odd-length pick).
+/// Caller guarantees `sorted` is non-empty.
+pub(crate) fn median_of_sorted(sorted: &[usize]) -> f64 {
+    if sorted.len().is_multiple_of(2) {
+        (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) as f64 / 2.0
+    } else {
+        sorted[sorted.len() / 2] as f64
+    }
 }
 
 fn percentile_abs(samples: &[f32], pct: f64) -> f32 {

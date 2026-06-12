@@ -103,6 +103,9 @@ pub fn find_image_bounds(samples: &[f32], sample_rate: u32, params: &SegmentImag
         let merge_gap = (params.merge_gap_secs as f64 * sample_rate as f64) as usize;
         runs = merge_false_splits(runs, merge_gap);
         runs = split_fused_runs(runs);
+        // Split parts are not re-checked against min_lines by construction;
+        // drop anything too short to summarize.
+        runs.retain(|run| run.len() >= 2);
     }
 
     runs.into_iter()
@@ -138,11 +141,7 @@ pub fn find_image_bounds(samples: &[f32], sample_rate: u32, params: &SegmentImag
 fn median_run_lines(runs: &[Vec<usize>]) -> f64 {
     let mut lens: Vec<usize> = runs.iter().map(Vec::len).collect();
     lens.sort_unstable();
-    if lens.len().is_multiple_of(2) {
-        (lens[lens.len() / 2 - 1] + lens[lens.len() / 2]) as f64 / 2.0
-    } else {
-        lens[lens.len() / 2] as f64
-    }
+    super::sync::median_of_sorted(&lens)
 }
 
 /// Merge adjacent short runs that together span one image slot: the cadence
@@ -180,13 +179,18 @@ fn split_fused_runs(runs: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
         }
         // Cut before the sync with the largest preceding interval within
         // ±10% of each expected boundary; falls back to a mid-slot cut when
-        // the cadence is perfectly steady across the join.
-        let mut cuts = Vec::with_capacity(parts - 1);
+        // the cadence is perfectly steady across the join. Successive
+        // search windows can overlap for k >= 3, so cuts are forced strictly
+        // forward — otherwise two adjacent cuts could yield an empty part.
+        let mut cuts: Vec<usize> = Vec::with_capacity(parts - 1);
         for j in 1..parts {
             let target = j * run.len() / parts;
             let radius = run.len() / 10;
-            let lo = target.saturating_sub(radius).max(1);
-            let hi = (target + radius).min(run.len() - 1);
+            let lo = target
+                .saturating_sub(radius)
+                .max(cuts.last().map_or(1, |&c| c + 2))
+                .min(run.len() - 1);
+            let hi = (target + radius).clamp(lo, run.len() - 1);
             let cut = (lo..=hi)
                 .max_by_key(|&i| (run[i] - run[i - 1], std::cmp::Reverse(i.abs_diff(target))))
                 .expect("split window is non-empty");
@@ -299,6 +303,31 @@ mod tests {
                 "expected ~256 lines per part, got {} ({b:?})",
                 b.line_count
             );
+        }
+    }
+
+    #[test]
+    fn splits_a_five_way_fused_run_without_panicking() {
+        // k >= 3 splits have overlapping cut-search windows; this used to be
+        // able to produce empty parts and panic downstream. Steady cadence
+        // also exercises the proximity tie-break fallback for every cut.
+        let gap = vec![0.0f32; (0.05 * RATE as f32) as usize];
+        let mut audio = Vec::new();
+        for seed in 0..4u8 {
+            audio.extend(encode_image_to_audio(&test_image(256, seed), WIDTH, RATE, LINE_MS));
+            audio.extend(&gap);
+        }
+        for seed in 4..9u8 {
+            audio.extend(encode_image_to_audio(&test_image(256, seed), WIDTH, RATE, LINE_MS));
+        }
+
+        let bounds = find_image_bounds(&audio, RATE, &params(100, 256));
+        assert_eq!(bounds.len(), 9, "{bounds:?}");
+        for pair in bounds.windows(2) {
+            assert!(pair[0].end_sample <= pair[1].start_sample, "{pair:?}");
+        }
+        for b in &bounds {
+            assert!((b.line_count as i64 - 256).abs() <= 35, "{b:?}");
         }
     }
 

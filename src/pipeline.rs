@@ -160,6 +160,27 @@ pub fn composite_rgb(red: &PipelineResult, grn: &PipelineResult, blu: &PipelineR
     Ok(DynamicImage::ImageRgb8(buffer))
 }
 
+/// Composite a color triplet from raw decoded levels (red, green, blue
+/// planes, row-major at `width` per line). Percentile bounds are computed
+/// jointly over the three planes — stretching each frame by its own bounds
+/// would skew the color balance — then the planes are normalized with the
+/// shared transform, registered, and stacked via [`composite_rgb`].
+pub fn composite_triplet_levels(planes: [&[f32]; 3], width: usize, invert: bool, gamma: f32) -> Result<DynamicImage> {
+    anyhow::ensure!(width > 0, "width must be non-zero");
+    let joint: Vec<f32> = planes.iter().flat_map(|p| p.iter().copied()).collect();
+    let (lo, hi) = crate::sstv::percentile_bounds(&joint, 0.01, 0.99);
+    let frames: Vec<PipelineResult> = planes
+        .iter()
+        .map(|levels| PipelineResult {
+            pixels: crate::sstv::normalize_levels(levels, lo, hi, invert, gamma),
+            width: width as u32,
+            height: (levels.len() / width) as u32,
+            mode: DecoderMode::Grayscale,
+        })
+        .collect();
+    composite_rgb(&frames[0], &frames[1], &frames[2])
+}
+
 /// Mean luminance per row (scan line) of a grayscale frame, computed over
 /// the central columns only: the line-start region holds sync residue and
 /// the row ends hold edge junk, both of which would dominate the profile.
@@ -313,6 +334,23 @@ mod tests {
             height,
             mode: DecoderMode::Grayscale,
         }
+    }
+
+    #[test]
+    fn composite_triplet_levels_uses_joint_bounds() {
+        // Red plane spans [0,1], green/blue sit lower; joint bounds keep the
+        // relative plane intensities instead of stretching each to full range.
+        let width = 4usize;
+        let r: Vec<f32> = (0..width * 8).map(|i| (i % 8) as f32 / 7.0).collect();
+        let g: Vec<f32> = r.iter().map(|v| v * 0.5).collect();
+        let b: Vec<f32> = r.iter().map(|v| v * 0.25).collect();
+        let img = composite_triplet_levels([&r, &g, &b], width, false, 1.0).unwrap().to_rgb8();
+        // Where red is at its max, green must sit near half and blue near a
+        // quarter of it — per-plane stretching would push all three to ~255.
+        let px = img.get_pixel(3, 1); // column with the largest level
+        assert!(px[0] > 220, "{px:?}");
+        assert!((px[1] as i32 - px[0] as i32 / 2).abs() < 25, "{px:?}");
+        assert!((px[2] as i32 - px[0] as i32 / 4).abs() < 25, "{px:?}");
     }
 
     #[test]

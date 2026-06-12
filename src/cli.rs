@@ -498,7 +498,6 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                     width,
                     ..DecoderParams::default()
                 };
-                let pipeline = DecodingPipeline::new();
 
                 let catalog = if color {
                     if bounds.len() == crate::catalog::FRAMES_PER_CHANNEL {
@@ -525,22 +524,37 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                     img
                 };
 
-                // Decode every frame first (pre-rotation), then composite
-                // triplets from the raw frames so plane geometry matches.
-                let mut frames: Vec<Option<crate::pipeline::PipelineResult>> = Vec::with_capacity(bounds.len());
+                // Triplet members keep their raw levels for the joint-bounds
+                // composite pass, so each frame is decoded exactly once.
+                let triplets = match catalog {
+                    Some(_) => crate::catalog::color_triplets(channel.into()),
+                    None => Vec::new(),
+                };
+                let member_idxs: std::collections::HashSet<usize> = triplets.iter().flatten().copied().collect();
+
+                let decoder = crate::sstv::SstvDecoder::new();
+                let plane_width = decode_params.effective_width();
+                let mut member_levels: std::collections::HashMap<usize, Vec<f32>> = std::collections::HashMap::new();
                 for (idx, b) in bounds.iter().enumerate() {
                     let window = &samples[b.start_sample..b.end_sample];
-                    match pipeline.process(window, &decode_params, sample_rate) {
-                        Ok(r) => frames.push(Some(r)),
+                    let levels = match decoder.decode_levels(window, &decode_params, sample_rate) {
+                        Ok(levels) => levels,
                         Err(e) => {
                             tracing::warn!("image {idx} at {:.3}s failed to decode: {e:#}", start + b.start_secs);
-                            frames.push(None);
+                            continue;
                         }
+                    };
+                    // The standalone PNG keeps per-frame contrast bounds.
+                    let (lo, hi) = crate::sstv::percentile_bounds(&levels, 0.01, 0.99);
+                    let frame = crate::pipeline::PipelineResult {
+                        pixels: crate::sstv::normalize_levels(&levels, lo, hi, invert, gamma),
+                        width: plane_width as u32,
+                        height: (levels.len() / plane_width) as u32,
+                        mode: DecoderMode::Grayscale,
+                    };
+                    if member_idxs.contains(&idx) {
+                        member_levels.insert(idx, levels);
                     }
-                }
-
-                for (idx, (b, frame)) in bounds.iter().zip(&frames).enumerate() {
-                    let Some(frame) = frame else { continue };
                     let img = orient(frame.to_dynamic_image().context("building image")?);
                     let name = match catalog {
                         Some(cat) => format!("image_{idx:03}_{}.png", slugify(cat[idx].label)),
@@ -552,42 +566,17 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                 }
 
                 if let Some(cat) = catalog {
-                    // Composite from raw levels with bounds computed jointly
-                    // over the three planes: stretching each frame by its own
-                    // bounds (what the individual PNGs get) skews the color
-                    // balance between planes.
-                    let decoder = crate::sstv::SstvDecoder::new();
-                    let plane_width = decode_params.effective_width();
-                    for triplet in crate::catalog::color_triplets(channel.into()) {
+                    for triplet in triplets {
                         let [r, _, bl] = triplet;
-                        let mut planes: Vec<Vec<f32>> = Vec::with_capacity(3);
-                        for &idx in &triplet {
-                            let b = &bounds[idx];
-                            let window = &samples[b.start_sample..b.end_sample];
-                            match decoder.decode_levels(window, &decode_params, sample_rate) {
-                                Ok(levels) => planes.push(levels),
-                                Err(e) => {
-                                    tracing::warn!("triplet {r}-{bl}: frame {idx} failed to decode: {e:#}");
-                                    break;
-                                }
-                            }
-                        }
-                        if planes.len() != 3 {
-                            continue;
-                        }
-                        let joint: Vec<f32> = planes.iter().flatten().copied().collect();
-                        let (lo, hi) = crate::sstv::percentile_bounds(&joint, 0.01, 0.99);
-                        let triplet_frames: Vec<crate::pipeline::PipelineResult> = planes
+                        let planes: Vec<&[f32]> = triplet
                             .iter()
-                            .map(|levels| crate::pipeline::PipelineResult {
-                                pixels: crate::sstv::normalize_levels(levels, lo, hi, invert, gamma),
-                                width: plane_width as u32,
-                                height: (levels.len() / plane_width) as u32,
-                                mode: DecoderMode::Grayscale,
-                            })
+                            .filter_map(|idx| member_levels.get(idx).map(Vec::as_slice))
                             .collect();
-                        let img = match crate::pipeline::composite_rgb(&triplet_frames[0], &triplet_frames[1], &triplet_frames[2])
-                        {
+                        let [pr, pg, pb] = planes.as_slice() else {
+                            tracing::warn!("triplet {r}-{bl}: missing decoded frame, skipping composite");
+                            continue;
+                        };
+                        let img = match crate::pipeline::composite_triplet_levels([pr, pg, pb], plane_width, invert, gamma) {
                             Ok(img) => orient(img),
                             Err(e) => {
                                 tracing::warn!("triplet {r}-{bl}: composite failed: {e:#}");
