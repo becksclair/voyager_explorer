@@ -133,7 +133,6 @@ pub fn composite_rgb(red: &PipelineResult, grn: &PipelineResult, blu: &PipelineR
     let (lag_g, lag_b) = registration_lags(
         [red.pixels.as_slice(), grn.pixels.as_slice(), blu.pixels.as_slice()],
         red.width as usize,
-        min_height as usize,
     );
     stack_registered(red, grn, blu, lag_g, lag_b)
 }
@@ -191,7 +190,7 @@ pub fn composite_triplet_levels(planes: [&[f32]; 3], width: usize, invert: bool,
 
     let min_height = planes.iter().map(|p| p.len() / width).min().unwrap_or(0);
     anyhow::ensure!(min_height > 0, "empty plane in triplet");
-    let (lag_g, lag_b) = registration_lags(planes, width, min_height);
+    let (lag_g, lag_b) = registration_lags(planes, width);
 
     let frames: Vec<PipelineResult> = planes
         .iter()
@@ -276,11 +275,17 @@ const REG_MAX_LAG_CAP: i64 = 256;
 
 /// Row offsets of the green and blue planes relative to the red plane,
 /// from 2D NCC over the planes' registration blocks.
-fn registration_lags<T: Copy + Into<f64>>(planes: [&[T]; 3], width: usize, min_height: usize) -> (i64, i64) {
-    let max_lag = ((min_height / 3) as i64).clamp(1, REG_MAX_LAG_CAP);
+fn registration_lags<T: Copy + Into<f64>>(planes: [&[T]; 3], width: usize) -> (i64, i64) {
+    // The search radius is per pair: bounding it by the third plane's
+    // height would shrink the red↔green search just because the blue
+    // plane came out short.
+    let pair_max_lag = |b: &[T]| {
+        let min_height = (planes[0].len() / width).min(b.len() / width);
+        ((min_height / 3) as i64).clamp(1, REG_MAX_LAG_CAP)
+    };
     let block_r = registration_block(planes[0], width);
-    let lag_g = best_block_lag(&block_r, &registration_block(planes[1], width), max_lag);
-    let lag_b = best_block_lag(&block_r, &registration_block(planes[2], width), max_lag);
+    let lag_g = best_block_lag(&block_r, &registration_block(planes[1], width), pair_max_lag(planes[1]));
+    let lag_b = best_block_lag(&block_r, &registration_block(planes[2], width), pair_max_lag(planes[2]));
     (lag_g, lag_b)
 }
 
@@ -302,12 +307,14 @@ fn best_block_lag(a: &RegistrationBlock, b: &RegistrationBlock, max_lag: i64) ->
     let a_hi = (a.rows() * 4 / 5) as i64;
     // NCC noise scales with 1/sqrt(window); a tiny overlap at an extreme
     // lag can out-correlate the true peak by chance, so windows below
-    // half the central span don't compete. The floor is capped at the
-    // lag-0 window: when `b` is much shorter than `a`, a half-span floor
-    // would disqualify lag 0 (or empty the curve entirely) while leaving
-    // only extreme lags eligible — a structurally forced misregistration.
+    // half the *attainable* window don't compete. The attainable window
+    // is the central span capped at the lag-0 window: when `b` is much
+    // shorter than `a`, a bare half-span floor would disqualify lag 0
+    // (or empty the curve entirely), and a floor sitting at the lag-0
+    // window would disqualify every positive lag — both structurally
+    // forced misregistrations.
     let window_at_zero = a_hi.min(b.rows() as i64) - a_lo;
-    let min_window = ((a_hi - a_lo) / 2).min(window_at_zero).max(16);
+    let min_window = ((a_hi - a_lo).min(window_at_zero) / 2).max(16);
     let mut curve: Vec<(i64, f64)> = Vec::new();
     for lag in -max_lag..=max_lag {
         let start = a_lo.max(-lag);
@@ -480,6 +487,26 @@ mod tests {
         let r = banded_frame(900, 250);
         let g = banded_frame(900, 256);
         let b = banded_frame(300, 240);
+        let img = composite_rgb(&r, &g, &b).unwrap().to_rgb8();
+        let white_rows: Vec<u32> = (0..img.height())
+            .filter(|&y| img.get_pixel(3, y) == &image::Rgb([255, 255, 255]))
+            .collect();
+        assert_eq!(white_rows.len(), 1, "expected one fully aligned mark: {white_rows:?}");
+        for y in 0..img.height() {
+            if y != white_rows[0] {
+                assert_eq!(img.get_pixel(3, y), &image::Rgb([0, 0, 0]), "row {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn composite_registers_positive_lag_into_a_shorter_plane() {
+        // Mirror of the test above: the short plane's mark sits *after*
+        // the red mark (positive lag). A window floor pinned at the
+        // lag-0 window excludes the entire positive lag axis.
+        let r = banded_frame(900, 250);
+        let g = banded_frame(900, 256);
+        let b = banded_frame(300, 260);
         let img = composite_rgb(&r, &g, &b).unwrap().to_rgb8();
         let white_rows: Vec<u32> = (0..img.height())
             .filter(|&y| img.get_pixel(3, y) == &image::Rgb([255, 255, 255]))
