@@ -47,8 +47,13 @@ Prefer small, incremental changes that keep the app running.
   runs and tone-classified runs), plus the one-shot `compute_spectrum`
   (linear magnitude; UI converts to dB).
 - `pipeline.rs`, `batch.rs` — decode pipeline (`PipelineResult` →
-  egui/PNG images) and batch file processing; cancellation via
-  `Arc<AtomicBool>` with Release/Acquire ordering.
+  egui/PNG images), triplet compositing (`composite_triplet_levels`:
+  joint percentile bounds over the content region only, plane
+  registration via 2D normalized cross-correlation of per-scan-line-
+  demeaned content blocks computed on raw levels before normalization
+  clipping, smallest lag within 0.002 of the peak wins), and batch file
+  processing; cancellation via `Arc<AtomicBool>` with Release/Acquire
+  ordering.
 - `services/` — `decoder.rs` (`DecodeOrchestrator`: background decode
   worker, queue depth, health/restart), `batch.rs` (`BatchRunner`),
   `playback.rs` (device-anchored playhead math: base offset +

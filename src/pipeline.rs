@@ -108,9 +108,9 @@ impl PipelineResult {
 /// Per-line sync locking aligns content *within* each scan line, but the
 /// frames start at their own segmentation boundaries, so the planes can be
 /// offset from each other by tens of scan lines (rows). Registration:
-/// cross-correlate each plane's row-mean luminance profile against the red
-/// plane and shift by the best lag before stacking, cropping to the common
-/// overlap.
+/// 2D normalized cross-correlation of per-scan-line-demeaned content
+/// blocks against the red plane; shift by the best lag before stacking,
+/// cropping to the common overlap.
 pub fn composite_rgb(red: &PipelineResult, grn: &PipelineResult, blu: &PipelineResult) -> Result<DynamicImage> {
     for (name, frame) in [("red", red), ("green", grn), ("blue", blu)] {
         anyhow::ensure!(
@@ -129,11 +129,24 @@ pub fn composite_rgb(red: &PipelineResult, grn: &PipelineResult, blu: &PipelineR
     let min_height = red.height.min(grn.height).min(blu.height);
     anyhow::ensure!(min_height > 0, "empty frame in triplet");
 
-    // Row offsets of green/blue relative to red, from profile correlation.
-    let max_lag = (min_height / 4).clamp(1, 128) as i64;
-    let profile_r = row_profile(red);
-    let lag_g = best_row_lag(&profile_r, &row_profile(grn), max_lag);
-    let lag_b = best_row_lag(&profile_r, &row_profile(blu), max_lag);
+    let max_lag = (min_height / 3).clamp(1, 256) as i64;
+    let width = red.width as usize;
+    let block_r = registration_block(&red.pixels, width);
+    let lag_g = best_block_lag(&block_r, &registration_block(&grn.pixels, width), max_lag);
+    let lag_b = best_block_lag(&block_r, &registration_block(&blu.pixels, width), max_lag);
+    stack_registered(red, grn, blu, lag_g, lag_b)
+}
+
+/// Stack three registered grayscale planes into one RGB image, cropping to
+/// the rows where red row `y`, green row `y + lag_g`, and blue row
+/// `y + lag_b` all exist.
+fn stack_registered(
+    red: &PipelineResult,
+    grn: &PipelineResult,
+    blu: &PipelineResult,
+    lag_g: i64,
+    lag_b: i64,
+) -> Result<DynamicImage> {
     tracing::debug!(lag_g, lag_b, "composite registration offsets (rows vs red)");
 
     // Overlap in red-plane row coordinates: row y reads green at y+lag_g and
@@ -167,8 +180,22 @@ pub fn composite_rgb(red: &PipelineResult, grn: &PipelineResult, blu: &PipelineR
 /// shared transform, registered, and stacked via [`composite_rgb`].
 pub fn composite_triplet_levels(planes: [&[f32]; 3], width: usize, invert: bool, gamma: f32) -> Result<DynamicImage> {
     anyhow::ensure!(width > 0, "width must be non-zero");
-    let joint: Vec<f32> = planes.iter().flat_map(|p| p.iter().copied()).collect();
+    let mut joint: Vec<f32> = planes.iter().flat_map(|p| content_levels(p, width)).collect();
+    if joint.is_empty() {
+        joint = planes.iter().flat_map(|p| p.iter().copied()).collect();
+    }
     let (lo, hi) = crate::sstv::percentile_bounds(&joint, 0.01, 0.99);
+
+    // Register on the raw levels, not the normalized pixels: the
+    // content-region bounds clip levels outside [lo, hi] to 0/255, which
+    // can flatten a plane's structure and starve the correlation.
+    let min_height = planes.iter().map(|p| p.len() / width).min().unwrap_or(0);
+    anyhow::ensure!(min_height > 0, "empty plane in triplet");
+    let max_lag = (min_height as u32 / 3).clamp(1, 256) as i64;
+    let block_r = registration_block(planes[0], width);
+    let lag_g = best_block_lag(&block_r, &registration_block(planes[1], width), max_lag);
+    let lag_b = best_block_lag(&block_r, &registration_block(planes[2], width), max_lag);
+
     let frames: Vec<PipelineResult> = planes
         .iter()
         .map(|levels| PipelineResult {
@@ -178,69 +205,114 @@ pub fn composite_triplet_levels(planes: [&[f32]; 3], width: usize, invert: bool,
             mode: DecoderMode::Grayscale,
         })
         .collect();
-    composite_rgb(&frames[0], &frames[1], &frames[2])
+    stack_registered(&frames[0], &frames[1], &frames[2], lag_g, lag_b)
 }
 
-/// Mean luminance per row (scan line) of a grayscale frame, computed over
-/// the central columns only: the line-start region holds sync residue and
-/// the row ends hold edge junk, both of which would dominate the profile.
-fn row_profile(frame: &PipelineResult) -> Vec<f64> {
-    let width = frame.width as usize;
-    let lo = width / 5;
-    let hi = (width * 9) / 10;
-    let span = (hi - lo).max(1) as f64;
-    frame
-        .pixels
+/// Levels from a plane's content region: central columns (line-start sync
+/// residue and row-end junk, as in [`row_profile`]) and central rows
+/// (inter-image leader bands sit at the frame edges) are excluded.
+/// Segmented frames can carry 15–25% junk pixels; letting them into the
+/// percentile population stretches the bounds far past the content range
+/// and washes the composite out.
+fn content_levels(levels: &[f32], width: usize) -> impl Iterator<Item = f32> + '_ {
+    let rows = levels.len() / width;
+    let row_lo = rows * 3 / 20;
+    let row_hi = ((rows * 17) / 20).max((row_lo + 1).min(rows));
+    let col_lo = width / 5;
+    let col_hi = ((width * 9) / 10).max(col_lo + 1).min(width);
+    levels
         .chunks_exact(width)
-        .map(|row| {
-            row[lo.min(row.len() - 1)..hi.min(row.len())]
-                .iter()
-                .map(|&p| p as f64)
-                .sum::<f64>()
-                / span
-        })
-        .collect()
+        .skip(row_lo)
+        .take(row_hi.saturating_sub(row_lo))
+        .flat_map(move |row| row[col_lo.min(col_hi)..col_hi].iter().copied())
 }
 
-/// Lag of `b` relative to `a` (in rows) maximizing normalized correlation:
-/// a[i] aligns with b[i + lag]. Correlates only over the central 60% of
-/// `a`'s rows — the first/last rows of a segmented frame are inter-image
-/// leader junk whose strong, repetitive structure can outweigh the picture
-/// content. Returns 0 for degenerate (flat) profiles.
-fn best_row_lag(a: &[f64], b: &[f64], max_lag: i64) -> i64 {
-    let a_lo = (a.len() / 5) as i64;
-    let a_hi = (a.len() * 4 / 5) as i64;
-    let mut best = (0i64, f64::NEG_INFINITY);
+/// Per-scan-line-demeaned content block for plane registration: the
+/// central columns of every row (line-start sync residue and row-end junk
+/// excluded, as in [`content_levels`]) with each row's mean subtracted.
+/// Removing the per-line mean zeroes out flat junk/leader rows entirely —
+/// only structure *within* a scan line survives, and that structure
+/// matches across planes solely at the true row offset. A 1D row-mean
+/// profile cannot make this distinction: junk bands and broad luminance
+/// trends dominate it and produce confident wrong lags (Sunset).
+struct RegistrationBlock {
+    data: Vec<f64>,
+    width: usize,
+}
+
+impl RegistrationBlock {
+    fn rows(&self) -> usize {
+        self.data.len().checked_div(self.width).unwrap_or(0)
+    }
+
+    fn row(&self, r: usize) -> &[f64] {
+        &self.data[r * self.width..(r + 1) * self.width]
+    }
+}
+
+fn registration_block<T: Copy + Into<f64>>(levels: &[T], width: usize) -> RegistrationBlock {
+    let col_lo = width / 5;
+    let col_hi = ((width * 9) / 10).max(col_lo + 1).min(width);
+    let col_lo = col_lo.min(col_hi);
+    let bw = col_hi - col_lo;
+    let mut data = Vec::with_capacity((levels.len() / width.max(1)) * bw);
+    for row in levels.chunks_exact(width) {
+        let seg = &row[col_lo..col_hi];
+        let mean = seg.iter().map(|&v| v.into()).sum::<f64>() / bw as f64;
+        data.extend(seg.iter().map(|&v| v.into() - mean));
+    }
+    RegistrationBlock { data, width: bw }
+}
+
+/// How close to the correlation peak a lag must be to count as equivalent.
+/// Among equivalent lags the smallest |lag| wins: when the correlation
+/// curve is flat (featureless slides) the argmax is noise, and a small
+/// shift is always the safer choice.
+const REG_PEAK_DELTA: f64 = 0.002;
+
+/// Row offset of `b` relative to `a` maximizing the 2D normalized
+/// cross-correlation of the registration blocks: a's row `i` aligns with
+/// b's row `i + lag`. Correlates only over the central 60% of `a`'s rows —
+/// the first/last rows of a segmented frame are inter-image leader junk.
+/// Returns 0 for degenerate (flat) blocks.
+fn best_block_lag(a: &RegistrationBlock, b: &RegistrationBlock, max_lag: i64) -> i64 {
+    debug_assert_eq!(a.width, b.width);
+    let a_lo = (a.rows() / 5) as i64;
+    let a_hi = (a.rows() * 4 / 5) as i64;
+    let mut curve: Vec<(i64, f64)> = Vec::new();
     for lag in -max_lag..=max_lag {
         let start = a_lo.max(-lag);
-        let end = a_hi.min(b.len() as i64 - lag);
+        let end = a_hi.min(b.rows() as i64 - lag);
         if end - start < 16 {
             continue;
         }
-        let n = (end - start) as f64;
-        let (mut sa, mut sb) = (0.0, 0.0);
-        for i in start..end {
-            sa += a[i as usize];
-            sb += b[(i + lag) as usize];
-        }
-        let (ma, mb) = (sa / n, sb / n);
         let (mut num, mut va, mut vb) = (0.0, 0.0, 0.0);
         for i in start..end {
-            let da = a[i as usize] - ma;
-            let db = b[(i + lag) as usize] - mb;
-            num += da * db;
-            va += da * da;
-            vb += db * db;
+            // Rows are zero-mean by construction, so no window demeaning.
+            for (da, db) in a.row(i as usize).iter().zip(b.row((i + lag) as usize)) {
+                num += da * db;
+                va += da * da;
+                vb += db * db;
+            }
         }
         if va <= f64::EPSILON || vb <= f64::EPSILON {
             continue;
         }
-        let corr = num / (va * vb).sqrt();
-        if corr > best.1 {
-            best = (lag, corr);
-        }
+        curve.push((lag, num / (va * vb).sqrt()));
     }
-    best.0
+    let Some(peak) = curve
+        .iter()
+        .map(|&(_, c)| c)
+        .fold(None, |m: Option<f64>, c| Some(m.map_or(c, |m| m.max(c))))
+    else {
+        return 0;
+    };
+    curve
+        .iter()
+        .filter(|&&(_, c)| c >= peak - REG_PEAK_DELTA)
+        .map(|&(lag, _)| lag)
+        .min_by_key(|&lag| (lag.abs(), lag))
+        .unwrap_or(0)
 }
 
 pub struct DecodingPipeline {
@@ -323,11 +395,13 @@ mod tests {
     }
 
     fn banded_frame(height: u32, band_row: u32) -> PipelineResult {
+        // The band has structure *within* the scan line (a single bright
+        // pixel in the central columns): registration correlates per-line-
+        // demeaned blocks, so a row that is uniform across columns carries
+        // no registration signal.
         let width = 8u32;
         let mut pixels = vec![0u8; (width * height) as usize];
-        for x in 0..width {
-            pixels[(band_row * width + x) as usize] = 255;
-        }
+        pixels[(band_row * width + 3) as usize] = 255;
         PipelineResult {
             pixels,
             width,
@@ -355,20 +429,20 @@ mod tests {
 
     #[test]
     fn composite_registers_row_offsets_between_planes() {
-        // The same bright band sits at different rows in each plane;
-        // registration must line the planes up into one white band.
+        // The same bright mark sits at different rows in each plane;
+        // registration must line the planes up into one white pixel.
         let r = banded_frame(64, 20);
         let g = banded_frame(64, 26);
         let b = banded_frame(64, 17);
         let img = composite_rgb(&r, &g, &b).unwrap().to_rgb8();
         let white_rows: Vec<u32> = (0..img.height())
-            .filter(|&y| img.get_pixel(0, y) == &image::Rgb([255, 255, 255]))
+            .filter(|&y| img.get_pixel(3, y) == &image::Rgb([255, 255, 255]))
             .collect();
-        assert_eq!(white_rows.len(), 1, "expected one fully aligned band: {white_rows:?}");
+        assert_eq!(white_rows.len(), 1, "expected one fully aligned mark: {white_rows:?}");
         // No partially-colored rows: every other row must be black.
         for y in 0..img.height() {
             if y != white_rows[0] {
-                assert_eq!(img.get_pixel(0, y), &image::Rgb([0, 0, 0]), "row {y}");
+                assert_eq!(img.get_pixel(3, y), &image::Rgb([0, 0, 0]), "row {y}");
             }
         }
     }
