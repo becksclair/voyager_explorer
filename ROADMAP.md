@@ -225,15 +225,19 @@ functions surfaced as CLI subcommands, runnable against the real assets.
       `--decode-dir` decodes every candidate to PNG in one command
       (calibration circle, pulsar map/galaxy, definition slides all
       verified recognizable).
-- [ ] Frame-triplet color: port a reference color-group lookup table
-      (foodini `voyager.cpp` / amazing-rando `voyager-decoder.py`),
-      composite 3 successive frames as R/G/B (frame order to verify
-      empirically: refs disagree on RGB vs BGR), naive stacking first —
-      per-line sync lock does the registration work
-- [ ] **Gate 2 acceptance:** catalog both channels side-by-side against
-      published reference decodes (MarcBaeuerle `main.ts` has the full
-      78-entry names/credits arrays per channel); reconcile the
-      off-by-a-couple candidate counts
+- [x] Frame-triplet color (`catalog.rs`, `pipeline::composite_rgb`, CLI
+      `segment --color`): published 78-frame catalog with color roles and
+      labels (cross-validated across three reference decoders; R-G-B
+      frame order verified empirically on the Sunset triplet), row-offset
+      plane registration via luminance-profile correlation, all 20
+      triplets composited. Segmentation cleanup (merge false splits,
+      split fused runs against the median slot length) brings both
+      channels to exactly 78/78.
+- [ ] **Gate 2 acceptance:** review all 156 frames + 20 composites
+      side-by-side against published reference decodes; fix the residual
+      composite quality gaps (plane fringing on some triplets, hue casts
+      from per-frame percentile normalization — normalize planes jointly
+      per triplet)
 - [ ] Big-file streaming/mmap and decimated waveform cache (the 1.5 GB
       stereo rip currently implies ~3 GB resident)
 - [ ] Playback-speed detection (sync-interval median ≈ 4.15 ms ⇒ 2×
