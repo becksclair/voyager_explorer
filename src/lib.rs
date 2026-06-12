@@ -4,6 +4,7 @@ pub mod analysis;
 pub mod audio;
 pub mod audio_state;
 pub mod batch;
+pub mod cli;
 pub mod config;
 pub mod error;
 pub mod image_output;

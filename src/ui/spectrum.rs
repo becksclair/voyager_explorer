@@ -1,22 +1,32 @@
+//! Live spectrum analyzer around the current playhead position.
+
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
 use crate::audio::WavReader;
+use crate::ui::theme;
 
 pub struct SpectrumPanel {
     pub visible: bool,
     pub use_log_scale: bool,
     pub use_db_scale: bool,
     pub show_peak: bool,
+    /// (buffer address, buffer length, window start) of the cached spectrum.
+    /// The FFT (and its planner) only rerun when the analysis window moves —
+    /// not on every repaint, which during playback happens at frame rate.
+    spectrum_key: Option<(usize, usize, usize)>,
+    spectrum: Vec<(f64, f64)>,
 }
 
 impl Default for SpectrumPanel {
     fn default() -> Self {
         Self {
-            visible: false,
+            visible: true,
             use_log_scale: true,
             use_db_scale: true,
             show_peak: true,
+            spectrum_key: None,
+            spectrum: Vec::new(),
         }
     }
 }
@@ -30,108 +40,113 @@ fn to_db(magnitude: f64) -> f64 {
 }
 
 impl SpectrumPanel {
+    /// Drop the cached spectrum. Must be called when a new file is loaded:
+    /// the cache key uses buffer address + length, which a new same-length
+    /// allocation can collide with (ABA).
+    pub fn invalidate(&mut self) {
+        self.spectrum_key = None;
+        self.spectrum.clear();
+    }
+
+    /// Draw the analyzer plot and scale controls. Returns the dominant
+    /// `(frequency_hz, scaled_magnitude)` when peak tracking is enabled and
+    /// audio is loaded, so the caller can surface it in the Signal box.
     pub fn draw(
         &mut self,
         ui: &mut egui::Ui,
         wav_reader: &Option<WavReader>,
         current_position_samples: usize,
         selected_channel: crate::audio::WaveformChannel,
-    ) {
-        ui.heading("Signal Analysis (Spectrum)");
-
-        // Controls
+    ) -> Option<(f64, f64)> {
+        // Scale controls
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.use_log_scale, "Log Freq");
-            ui.checkbox(&mut self.use_db_scale, "dB Scale");
-            ui.checkbox(&mut self.show_peak, "Show Peak");
+            ui.checkbox(&mut self.use_log_scale, "Log");
+            ui.checkbox(&mut self.use_db_scale, "dB");
+            ui.checkbox(&mut self.show_peak, "Peak");
         });
 
-        ui.separator();
+        let Some(reader) = wav_reader else {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("No audio loaded").color(theme::TEXT_MUTED));
+            return None;
+        };
 
-        if let Some(reader) = wav_reader {
-            let samples = reader.get_samples(selected_channel);
+        let samples = reader.get_samples(selected_channel);
 
-            // Use a window around current position
-            let window_size = 4096;
-            let start = current_position_samples;
-            let end = (start + window_size).min(samples.len());
+        // Use a window around current position
+        let window_size = 4096;
+        let start = current_position_samples;
+        let end = (start + window_size).min(samples.len());
 
-            if start < end {
-                let window_samples = &samples[start..end];
-                let spectrum = crate::analysis::compute_spectrum(window_samples, reader.sample_rate);
+        if start >= end {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("No samples at current position").color(theme::TEXT_MUTED));
+            return None;
+        }
 
-                // Generate points for plotting and track peak in single pass
-                let mut peak: Option<(f64, f64)> = None;
-                let points: PlotPoints = spectrum
-                    .iter()
-                    .filter_map(|(f, m)| {
-                        let mut freq = *f;
-                        let mut mag = *m;
+        let key = (samples.as_ptr() as usize, samples.len(), start);
+        if self.spectrum_key != Some(key) {
+            let window_samples = &samples[start..end];
+            self.spectrum = crate::analysis::compute_spectrum(window_samples, reader.sample_rate);
+            self.spectrum_key = Some(key);
+        }
 
-                        if self.use_log_scale {
-                            if freq <= 0.0 {
-                                return None;
+        // Generate points for plotting and track peak in a single pass
+        let mut peak: Option<(f64, f64)> = None;
+        let points: PlotPoints = self
+            .spectrum
+            .iter()
+            .filter_map(|(f, m)| {
+                let mut freq = *f;
+                let mut mag = *m;
+
+                if self.use_log_scale {
+                    if freq <= 0.0 {
+                        return None;
+                    }
+                    freq = freq.log10();
+                }
+
+                if self.use_db_scale {
+                    mag = to_db(mag);
+                }
+
+                // Track peak during iteration (reuse already-scaled mag).
+                // Skip the DC bin (0 Hz) in both scale modes, matching
+                // analysis::stats dominant-frequency selection; otherwise a DC
+                // offset can report "0 Hz" as dominant when log scale is off.
+                if self.show_peak && *f > 0.0 {
+                    match peak {
+                        None => peak = Some((*f, mag)),
+                        Some((_, max_mag)) => {
+                            if mag > max_mag {
+                                peak = Some((*f, mag));
                             }
-                            freq = freq.log10();
                         }
-
-                        if self.use_db_scale {
-                            mag = to_db(mag);
-                        }
-
-                        // Track peak during iteration (reuse already-scaled mag)
-                        if self.show_peak {
-                            match peak {
-                                None => peak = Some((*f, mag)),
-                                Some((_, max_mag)) => {
-                                    if mag > max_mag {
-                                        peak = Some((*f, mag));
-                                    }
-                                }
-                            }
-                        }
-
-                        Some([freq, mag])
-                    })
-                    .collect();
-
-                if self.show_peak {
-                    if let Some((peak_freq, peak_mag)) = peak {
-                        ui.label(format!(
-                            "Peak: {:.1} Hz ({:.1} {})",
-                            peak_freq,
-                            peak_mag,
-                            if self.use_db_scale { "dB" } else { "mag" }
-                        ));
-                    } else {
-                        ui.label("Peak: N/A");
                     }
                 }
 
-                let line = Line::new("Magnitude", points).color(egui::Color32::from_rgb(100, 255, 100));
+                Some([freq, mag])
+            })
+            .collect();
 
-                let mut plot = Plot::new("spectrum_plot")
-                    .view_aspect(2.0)
-                    .x_axis_label(if self.use_log_scale {
-                        "Frequency (Log Hz)"
-                    } else {
-                        "Frequency (Hz)"
-                    })
-                    .y_axis_label(if self.use_db_scale { "Magnitude (dB)" } else { "Magnitude" });
+        let line = Line::new("Magnitude", points).color(theme::CYAN);
 
-                if self.use_log_scale {
-                    plot = plot.x_axis_formatter(|mark, _range| format_log_freq(mark.value));
-                }
+        let mut plot = Plot::new("spectrum_plot")
+            .height(190.0)
+            .show_x(true)
+            .show_y(true)
+            .y_axis_label(if self.use_db_scale { "dB" } else { "mag" });
 
-                plot.show(ui, |plot_ui| {
-                    plot_ui.line(line);
-                });
-            } else {
-                ui.label("No samples available at current position");
-            }
-        } else {
-            ui.label("No audio loaded");
+        if self.use_log_scale {
+            plot = plot.x_axis_formatter(|mark, _range| format_log_freq(mark.value));
         }
+
+        plot.show(ui, |plot_ui| {
+            plot_ui.line(line);
+        });
+
+        peak
     }
 }
 

@@ -37,7 +37,7 @@ fn test_sync_detection_with_synthetic_pattern() {
     let sync_signal = generate_sync_pattern(44100);
 
     // Find all sync positions
-    let positions = decoder.find_sync_positions(&sync_signal, 44100);
+    let positions = decoder.find_tone_regions(&sync_signal, 44100);
 
     // Should find at least 2 sync positions
     assert!(
@@ -64,9 +64,7 @@ fn test_decoding_produces_consistent_output() {
     let decoder = SstvDecoder::new();
     let params = DecoderParams {
         line_duration_ms: 8.3,
-        threshold: 0.2,
-        decode_window_secs: 2.0,
-        mode: DecoderMode::BinaryGrayscale,
+        mode: DecoderMode::Grayscale,
         ..Default::default()
     };
 
@@ -82,11 +80,6 @@ fn test_decoding_produces_consistent_output() {
     // Should produce identical output
     assert_eq!(pixels1.len(), pixels2.len());
     assert_eq!(pixels1, pixels2, "Decoder should be deterministic");
-
-    // All pixels should be 0 or 255 (binary)
-    for &pixel in &pixels1 {
-        assert!(pixel == 0 || pixel == 255, "Pixels should be binary");
-    }
 
     // Should have reasonable number of lines
     let num_lines = pixels1.len() / 512;
@@ -143,7 +136,7 @@ fn test_seek_positions_are_valid() {
     let total_samples = signal.len();
 
     // Find all sync positions
-    let positions = decoder.find_sync_positions(&signal, 44100);
+    let positions = decoder.find_tone_regions(&signal, 44100);
 
     // All positions should be within bounds
     for &pos in &positions {
@@ -155,9 +148,9 @@ fn test_seek_positions_are_valid() {
         );
     }
 
-    // Test find_next_sync from various positions
+    // Test find_next_tone_region from various positions
     for start_pos in [0, total_samples / 4, total_samples / 2] {
-        if let Some(next_pos) = decoder.find_next_sync(&signal, start_pos, 44100) {
+        if let Some(next_pos) = decoder.find_next_tone_region(&signal, start_pos, 44100) {
             assert!(next_pos > start_pos, "Next sync should be after start position");
             assert!(next_pos < total_samples, "Next sync should be in bounds");
         }
@@ -248,7 +241,7 @@ fn test_empty_audio_handling() {
     assert!(result.is_err(), "Empty input should return error");
 
     // Find sync in empty - should return empty
-    let positions = decoder.find_sync_positions(&empty, 44100);
+    let positions = decoder.find_tone_regions(&empty, 44100);
     assert!(positions.is_empty());
 }
 
@@ -259,7 +252,7 @@ fn test_very_short_audio() {
     // Just 100 samples (too short for meaningful decode)
     let short_signal: Vec<f32> = (0..100).map(|_| 0.5).collect();
 
-    let positions = decoder.find_sync_positions(&short_signal, 44100);
+    let positions = decoder.find_tone_regions(&short_signal, 44100);
     // May or may not find anything, but shouldn't crash
     assert!(positions.len() < 10, "Shouldn't find many syncs in noise");
 }
@@ -272,16 +265,14 @@ fn test_parameter_variation_affects_output() {
     // Decode with different line durations
     let params_short = DecoderParams {
         line_duration_ms: 5.0,
-        threshold: 0.3,
-        decode_window_secs: 2.0,
-        mode: DecoderMode::BinaryGrayscale,
+        sync_lock: false,
+        mode: DecoderMode::Grayscale,
         ..Default::default()
     };
     let params_long = DecoderParams {
         line_duration_ms: 15.0,
-        threshold: 0.3,
-        decode_window_secs: 2.0,
-        mode: DecoderMode::BinaryGrayscale,
+        sync_lock: false,
+        mode: DecoderMode::Grayscale,
         ..Default::default()
     };
 

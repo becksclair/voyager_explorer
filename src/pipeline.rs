@@ -23,7 +23,7 @@ impl PipelineResult {
     pub fn to_dynamic_image(&self) -> Result<DynamicImage, PipelineError> {
         // Compute expected length based on mode
         let expected_len = match self.mode {
-            DecoderMode::BinaryGrayscale => (self.width * self.height) as usize,
+            DecoderMode::Grayscale => (self.width * self.height) as usize,
             DecoderMode::PseudoColor => (self.width * self.height * 3) as usize,
         };
 
@@ -37,7 +37,7 @@ impl PipelineResult {
 
         // Proceed with current loops unchanged
         match self.mode {
-            DecoderMode::BinaryGrayscale => {
+            DecoderMode::Grayscale => {
                 let mut buffer = GrayImage::new(self.width, self.height);
                 for y in 0..self.height {
                     for x in 0..self.width {
@@ -70,7 +70,7 @@ impl PipelineResult {
 
     pub fn to_egui_image(&self) -> ColorImage {
         match self.mode {
-            DecoderMode::BinaryGrayscale => {
+            DecoderMode::Grayscale => {
                 let mut img = ColorImage::new(
                     [self.width as usize, self.height as usize],
                     vec![egui::Color32::BLACK; (self.width * self.height) as usize],
@@ -126,7 +126,7 @@ impl DecodingPipeline {
 
         let width = params.effective_width();
         let row_size = match params.mode {
-            DecoderMode::BinaryGrayscale => width,
+            DecoderMode::Grayscale => width,
             DecoderMode::PseudoColor => width * 3,
         };
 

@@ -7,9 +7,39 @@ pub fn format_duration(duration_secs: f32) -> String {
     format!("{:02}:{:05.2}", minutes, seconds)
 }
 
+/// Format duration in seconds as `HH:MM:SS.mmm` for the transport readout.
+pub fn format_timecode(duration_secs: f64) -> String {
+    let total_ms = (duration_secs.max(0.0) * 1000.0).round() as u64;
+    let ms = total_ms % 1000;
+    let s = (total_ms / 1000) % 60;
+    let m = (total_ms / 60_000) % 60;
+    let h = total_ms / 3_600_000;
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_timecode_zero() {
+        assert_eq!(format_timecode(0.0), "00:00:00.000");
+    }
+
+    #[test]
+    fn test_format_timecode_full() {
+        assert_eq!(format_timecode(3661.25), "01:01:01.250");
+    }
+
+    #[test]
+    fn test_format_timecode_rounds_millis() {
+        assert_eq!(format_timecode(12.3456), "00:00:12.346");
+    }
+
+    #[test]
+    fn test_format_timecode_negative_clamps() {
+        assert_eq!(format_timecode(-5.0), "00:00:00.000");
+    }
 
     #[test]
     fn test_format_duration_zero() {

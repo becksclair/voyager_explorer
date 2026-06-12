@@ -11,6 +11,7 @@ pub mod analysis;
 pub mod audio;
 pub mod audio_state;
 pub mod batch;
+pub mod cli;
 pub mod config;
 pub mod error;
 pub mod image_output;
@@ -18,6 +19,7 @@ pub mod metrics;
 pub mod pipeline;
 pub mod services;
 pub mod sstv;
+pub mod test_fixtures;
 pub mod ui;
 pub mod utils;
 
@@ -32,6 +34,10 @@ use crate::sstv::DecoderMode;
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Load this WAV file on startup (GUI mode)
+    #[arg(long, global = false)]
+    load: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -46,22 +52,26 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Decoder mode (BinaryGrayscale or PseudoColor)
-        #[arg(short, long, value_enum, default_value_t = ModeArg::BinaryGrayscale)]
+        /// Decoder mode (Grayscale or PseudoColor)
+        #[arg(short, long, value_enum, default_value_t = ModeArg::Grayscale)]
         mode: ModeArg,
     },
+
+    /// Diagnostics: decode windows, spectrograms, sync detection, stats
+    #[command(flatten)]
+    Diagnostics(cli::DiagnosticsCommand),
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
 enum ModeArg {
-    BinaryGrayscale,
+    Grayscale,
     PseudoColor,
 }
 
 impl From<ModeArg> for DecoderMode {
     fn from(val: ModeArg) -> Self {
         match val {
-            ModeArg::BinaryGrayscale => DecoderMode::BinaryGrayscale,
+            ModeArg::Grayscale => DecoderMode::Grayscale,
             ModeArg::PseudoColor => DecoderMode::PseudoColor,
         }
     }
@@ -80,34 +90,52 @@ fn main() -> eframe::Result {
 
     let cli = Cli::parse();
 
-    if let Some(Commands::Batch { input, output, mode }) = cli.command {
-        let args = batch::BatchArgs {
-            input_pattern: input,
-            output_dir: output,
-            mode: mode.into(),
-        };
+    match cli.command {
+        Some(Commands::Batch { input, output, mode }) => {
+            let args = batch::BatchArgs {
+                input_pattern: input,
+                output_dir: output,
+                mode: mode.into(),
+            };
 
-        if let Err(e) = batch::run_batch_processing(args) {
-            tracing::error!("Batch processing failed: {}", e);
-            std::process::exit(1);
+            if let Err(e) = batch::run_batch_processing(args) {
+                tracing::error!("Batch processing failed: {}", e);
+                std::process::exit(1);
+            }
+            return Ok(());
         }
-        return Ok(());
+        Some(Commands::Diagnostics(command)) => {
+            if let Err(e) = cli::run(command) {
+                eprintln!("error: {e:#}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        None => {}
     }
 
     tracing::info!("Starting Voyager Golden Record Explorer");
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1024.0, 720.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1400.0, 900.0])
+            .with_min_inner_size([1100.0, 700.0]),
         ..Default::default()
     };
     eframe::run_native(
         "Voyager Golden Record Explorer",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             // This gives us image support:
             egui_extras::install_image_loaders(&cc.egui_ctx);
+            // Apply the mission-console dark theme once at startup
+            ui::theme::apply_theme(&cc.egui_ctx);
             tracing::info!("UI context initialized");
-            Ok(Box::<VoyagerApp>::default())
+            let mut app = VoyagerApp::default();
+            if let Some(path) = cli.load {
+                app.load_wav_from_path(&path);
+            }
+            Ok(Box::new(app))
         }),
     )
 }

@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use hound::WavReader as HoundReader;
+use hound::{SampleFormat, WavReader as HoundReader, WavSpec};
 
 use crate::error::{AudioError, Result};
 
@@ -25,8 +25,9 @@ use crate::error::{AudioError, Result};
 ///
 /// # Sample Normalization
 ///
-/// All samples are normalized to f32 in the range `[-1.0, 1.0]` for consistent
-/// processing. Currently only 16-bit PCM WAV files are supported.
+/// All samples are normalized to f32 in the nominal range `[-1.0, 1.0]`.
+/// Supported encodings: IEEE float32 (the format of the Golden Record rips)
+/// and integer PCM up to 32 bits.
 pub struct WavReader {
     /// Left channel samples (or mono channel for mono files).
     /// Shared via Arc for zero-copy playback.
@@ -60,7 +61,33 @@ impl WavReader {
     /// # Ok::<(), voyager_explorer::error::VoyagerError>(())
     /// ```
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let path = path.as_ref();
+        Self::load(path.as_ref(), None, None)
+    }
+
+    /// Load only a time window of a WAV file, seeking past the leading frames.
+    ///
+    /// `start_secs` is clamped to the file length; `duration_secs` may run past
+    /// the end of the file (the result is simply shorter). This keeps the
+    /// multi-hundred-megabyte record rips usable without full streaming support.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`WavReader::from_file`]; additionally returns
+    /// [`AudioError::EmptyFile`] when the window contains no samples.
+    pub fn from_file_range<P: AsRef<Path>>(path: P, start_secs: f64, duration_secs: f64) -> Result<Self> {
+        Self::load(path.as_ref(), Some(start_secs), Some(duration_secs))
+    }
+
+    /// Load a WAV file from `start_secs` to the end of the file.
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`WavReader::from_file_range`].
+    pub fn from_file_start<P: AsRef<Path>>(path: P, start_secs: f64) -> Result<Self> {
+        Self::load(path.as_ref(), Some(start_secs), None)
+    }
+
+    fn load(path: &Path, start_secs: Option<f64>, duration_secs: Option<f64>) -> Result<Self> {
         let path_buf = path.to_path_buf();
 
         let mut reader = HoundReader::open(path).map_err(|source| AudioError::LoadFailed {
@@ -70,8 +97,9 @@ impl WavReader {
 
         let spec = reader.spec();
 
-        // Validate sample rate
-        if !(8000..=192_000).contains(&spec.sample_rate) {
+        // Reject only clearly-bogus rates. The Golden Record master rips are
+        // 384 kHz, so there is no useful upper bound to enforce here.
+        if spec.sample_rate < 8000 {
             return Err(AudioError::InvalidSampleRate { rate: spec.sample_rate }.into());
         }
 
@@ -80,49 +108,29 @@ impl WavReader {
             return Err(AudioError::UnsupportedChannels { channels: spec.channels }.into());
         }
 
-        // Sample-and-hold error recovery strategy:
-        // When a sample fails to decode, we reuse the last valid sample rather than
-        // emitting 0.0. This provides better audio continuity—sudden jumps to silence
-        // cause audible clicks/pops, whereas holding the previous value produces a
-        // brief "freeze" that's perceptually less jarring for occasional corruption.
-        // Trade-off: sustained corruption will sound like a stuck note rather than
-        // silence, but this is preferable for typical corruption patterns (sporadic).
-        let mut held_samples: usize = 0;
-        let mut last_valid_sample: f32 = 0.0;
-        let mut logged_errors: usize = 0;
-        const MAX_LOGGED_ERRORS: usize = 5;
-
-        let samples: Vec<f32> = reader
-            .samples::<i16>()
-            .enumerate()
-            .map(|(idx, s)| match s {
-                Ok(val) => {
-                    let normalized = val as f32 / i16::MAX as f32;
-                    last_valid_sample = normalized;
-                    normalized
-                }
-                Err(e) => {
-                    held_samples += 1;
-                    // Rate-limit error logging to avoid spam on heavily corrupted files
-                    if logged_errors < MAX_LOGGED_ERRORS {
-                        logged_errors += 1;
-                        tracing::debug!(
-                            sample_index = idx,
-                            error = %e,
-                            remaining_logs = MAX_LOGGED_ERRORS - logged_errors,
-                            "Failed to decode sample, using sample-and-hold"
-                        );
-                    }
-                    last_valid_sample
-                }
-            })
-            .collect();
-
-        if held_samples > 0 {
-            tracing::warn!("Recovered {} corrupt sample(s) via sample-and-hold", held_samples);
+        if let Some(start) = start_secs {
+            let start_frame_wide = (start.max(0.0) * spec.sample_rate as f64) as u64;
+            // hound's seek multiplies the frame index by the channel count in
+            // u32 internally; an out-of-range start would overflow there and
+            // silently land at the wrong position. Reject it instead.
+            if start_frame_wide > (u32::MAX / spec.channels as u32) as u64 {
+                return Err(AudioError::SeekOutOfRange { start_secs: start }.into());
+            }
+            reader
+                .seek(start_frame_wide as u32)
+                .map_err(|source| AudioError::LoadFailed {
+                    path: path_buf.clone(),
+                    source: hound::Error::IoError(source),
+                })?;
         }
 
-        // Check for empty file
+        let max_samples = duration_secs
+            .map(|d| ((d.max(0.0) * spec.sample_rate as f64) as usize).saturating_mul(spec.channels as usize))
+            .unwrap_or(usize::MAX);
+
+        let samples = decode_samples(&mut reader, &spec, max_samples);
+
+        // Check for empty file/window
         if samples.is_empty() {
             return Err(AudioError::EmptyFile { path: path_buf }.into());
         }
@@ -135,8 +143,8 @@ impl WavReader {
             }
             2 => {
                 // Stereo: split interleaved samples
-                let mut left = Vec::new();
-                let mut right = Vec::new();
+                let mut left = Vec::with_capacity(samples.len() / 2);
+                let mut right = Vec::with_capacity(samples.len() / 2);
 
                 for chunk in samples.chunks_exact(2) {
                     left.push(chunk[0]);
@@ -152,6 +160,8 @@ impl WavReader {
             path = %path.display(),
             sample_rate = spec.sample_rate,
             channels = spec.channels,
+            format = ?spec.sample_format,
+            bits = spec.bits_per_sample,
             samples = left_channel.len(),
             "Successfully loaded WAV file"
         );
@@ -170,6 +180,70 @@ impl WavReader {
             WaveformChannel::Right => &self.right_channel,
         }
     }
+}
+
+/// Decode up to `max_samples` interleaved samples as normalized f32, honoring
+/// the file's sample format and bit depth.
+///
+/// Sample-and-hold error recovery: when a sample fails to decode, the last
+/// valid sample is reused rather than emitting 0.0 — sudden jumps to silence
+/// cause audible clicks, whereas holding the previous value is perceptually
+/// less jarring for the sporadic corruption patterns this targets.
+fn decode_samples<R: std::io::Read>(reader: &mut HoundReader<R>, spec: &WavSpec, max_samples: usize) -> Vec<f32> {
+    match (spec.sample_format, spec.bits_per_sample) {
+        (SampleFormat::Float, _) => collect_normalized(reader.samples::<f32>(), max_samples, |v| v),
+        (SampleFormat::Int, bits @ 0..=16) => {
+            let scale = ((1u32 << (bits.max(1) - 1)) - 1).max(1) as f32;
+            collect_normalized(reader.samples::<i16>(), max_samples, move |v| v as f32 / scale)
+        }
+        (SampleFormat::Int, bits) => {
+            let scale = ((1u64 << (bits.min(32) - 1)) - 1) as f32;
+            collect_normalized(reader.samples::<i32>(), max_samples, move |v| v as f32 / scale)
+        }
+    }
+}
+
+fn collect_normalized<S, I, F>(samples: I, max_samples: usize, normalize: F) -> Vec<f32>
+where
+    I: Iterator<Item = hound::Result<S>>,
+    F: Fn(S) -> f32,
+{
+    let mut held_samples: usize = 0;
+    let mut last_valid_sample: f32 = 0.0;
+    let mut logged_errors: usize = 0;
+    const MAX_LOGGED_ERRORS: usize = 5;
+
+    let out: Vec<f32> = samples
+        .take(max_samples)
+        .enumerate()
+        .map(|(idx, s)| match s {
+            Ok(val) => {
+                let normalized = normalize(val);
+                last_valid_sample = normalized;
+                normalized
+            }
+            Err(e) => {
+                held_samples += 1;
+                // Rate-limit error logging to avoid spam on heavily corrupted files
+                if logged_errors < MAX_LOGGED_ERRORS {
+                    logged_errors += 1;
+                    tracing::debug!(
+                        sample_index = idx,
+                        error = %e,
+                        remaining_logs = MAX_LOGGED_ERRORS - logged_errors,
+                        "Failed to decode sample, using sample-and-hold"
+                    );
+                }
+                last_valid_sample
+            }
+        })
+        .collect();
+
+    if held_samples > 0 {
+        tracing::warn!("Recovered {} corrupt sample(s) via sample-and-hold", held_samples);
+    }
+
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -279,5 +353,65 @@ mod tests {
     fn test_invalid_wav_file() {
         let result = WavReader::from_file("nonexistent_file.wav");
         assert!(result.is_err());
+    }
+
+    fn create_f32_wav(samples: &[f32], sample_rate: u32, channels: u16) -> NamedTempFile {
+        let file = NamedTempFile::new().unwrap();
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = hound::WavWriter::create(file.path(), spec).unwrap();
+        for &s in samples {
+            writer.write_sample(s).unwrap();
+        }
+        writer.finalize().unwrap();
+        file
+    }
+
+    #[test]
+    fn test_float32_mono_loading() {
+        let samples = vec![0.0_f32, 0.25, -0.5, 1.0, -1.0];
+        let temp_file = create_f32_wav(&samples, 48000, 1);
+
+        let reader = WavReader::from_file(temp_file.path()).unwrap();
+
+        assert_eq!(reader.sample_rate, 48000);
+        assert_eq!(reader.left_channel.as_ref(), samples.as_slice());
+    }
+
+    #[test]
+    fn test_float32_stereo_high_rate_loading() {
+        // 384 kHz, the rate of the Golden Record master rips
+        let samples = vec![0.1_f32, -0.1, 0.2, -0.2, 0.3, -0.3];
+        let temp_file = create_f32_wav(&samples, 384_000, 2);
+
+        let reader = WavReader::from_file(temp_file.path()).unwrap();
+
+        assert_eq!(reader.sample_rate, 384_000);
+        assert_eq!(reader.left_channel.as_ref(), &[0.1, 0.2, 0.3]);
+        assert_eq!(reader.right_channel.as_ref(), &[-0.1, -0.2, -0.3]);
+    }
+
+    #[test]
+    fn test_from_file_range() {
+        // 1 second of mono at 1000 Hz... rates below 8 kHz are rejected, so use 8000.
+        let rate = 8000u32;
+        let samples: Vec<f32> = (0..rate * 2).map(|i| i as f32 / (rate * 2) as f32).collect();
+        let temp_file = create_f32_wav(&samples, rate, 1);
+
+        // Window: start at 0.5 s, take 0.25 s => 2000 samples starting at index 4000
+        let reader = WavReader::from_file_range(temp_file.path(), 0.5, 0.25).unwrap();
+        assert_eq!(reader.left_channel.len(), (rate as f64 * 0.25) as usize);
+        assert_eq!(reader.left_channel[0], samples[(rate as f64 * 0.5) as usize]);
+
+        // Duration past EOF is clamped to what exists
+        let reader = WavReader::from_file_range(temp_file.path(), 1.5, 10.0).unwrap();
+        assert_eq!(reader.left_channel.len(), (rate as f64 * 0.5) as usize);
+
+        // Window entirely past EOF is an empty-file error
+        assert!(WavReader::from_file_range(temp_file.path(), 5.0, 1.0).is_err());
     }
 }

@@ -144,26 +144,101 @@ pub fn generate_composite_signal(sample_rate: u32) -> Vec<f32> {
     signal
 }
 
-/// Encode a binary (0/255) image into SSTV-style audio samples using nearest-neighbor mapping.
-///
-/// This mirrors the decoder's line_duration/sample-rate relationship so round-trips in tests are exact.
-pub fn encode_image_to_audio(pixels: &[u8], width: usize, sample_rate: u32, line_duration_ms: f32) -> Vec<f32> {
-    // Keep in sync with decoder sampling: ensures preset/export/color roundtrips remain deterministic.
-    let samples_per_line = (line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
-    assert!(
-        samples_per_line >= width,
-        "samples_per_line must be at least image width for accurate mapping"
-    );
+/// Options for the forward image-to-audio model.
+#[derive(Debug, Clone, Copy)]
+pub struct EncodeOptions {
+    /// Per-line timing drift in samples (analog tape-speed slant). Each line's
+    /// period deviates from nominal by this amount, accumulating like real
+    /// hardware drift.
+    pub slant_samples_per_line: f32,
+    /// Additive deterministic noise amplitude.
+    pub noise_amplitude: f32,
+}
 
-    let mut audio = Vec::with_capacity(samples_per_line * (pixels.len() / width));
-
-    for line in pixels.chunks(width) {
-        for i in 0..samples_per_line {
-            let src_idx = (i * width) / samples_per_line;
-            let pix = line[src_idx];
-            let amp = if pix > 0 { 1.0 } else { 0.0 };
-            audio.push(amp);
+impl Default for EncodeOptions {
+    fn default() -> Self {
+        Self {
+            slant_samples_per_line: 0.0,
+            noise_amplitude: 0.0,
         }
+    }
+}
+
+/// Fraction of each line occupied by the sync structure (spike + dip).
+pub const ENCODE_SYNC_FRAC: f32 = 0.06;
+/// Peak level of the sync spike.
+const SYNC_SPIKE_LEVEL: f32 = 1.0;
+/// Bottom level of the falling-edge dip that marks the line start.
+const SYNC_DIP_LEVEL: f32 = -0.8;
+/// Maximum content level (pixel 255). Kept below the spike so sync detection
+/// has headroom, mirroring the real signal where sync exceeds the video band.
+const CONTENT_MAX_LEVEL: f32 = 0.7;
+
+/// Encode a grayscale image into record-style baseband audio.
+///
+/// True forward model of the Voyager encoding as understood from reference
+/// decodes: each scan line is a sync spike followed by a falling edge to a
+/// dip (the line start marker), then the pixel luminance trace as the
+/// instantaneous signal level. Intermediate gray levels map to intermediate
+/// amplitudes — deliberately NOT mirroring decoder internals, so round-trip
+/// tests exercise the decoder against an independent model.
+pub fn encode_image_to_audio(pixels: &[u8], width: usize, sample_rate: u32, line_duration_ms: f32) -> Vec<f32> {
+    encode_image_to_audio_with(pixels, width, sample_rate, line_duration_ms, &EncodeOptions::default())
+}
+
+/// [`encode_image_to_audio`] with slant and noise injection.
+pub fn encode_image_to_audio_with(
+    pixels: &[u8],
+    width: usize,
+    sample_rate: u32,
+    line_duration_ms: f32,
+    opts: &EncodeOptions,
+) -> Vec<f32> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    assert!(width > 0, "width must be non-zero");
+    let nominal = line_duration_ms / 1000.0 * sample_rate as f32;
+    assert!(nominal as usize >= 16, "line too short for sync structure");
+
+    let n_lines = pixels.len() / width;
+    let mut audio = Vec::with_capacity((nominal as usize + 1) * n_lines);
+
+    // Accumulate line boundaries in f64 so slant builds up like real drift.
+    let mut t = 0.0f64;
+    for (line_idx, line) in pixels.chunks_exact(width).enumerate() {
+        let period = nominal as f64 + opts.slant_samples_per_line as f64 * line_idx as f64;
+        let start = t.round() as usize;
+        let end = (t + period).round() as usize;
+        let samples_this_line = end.saturating_sub(start).max(16);
+
+        let sync_len = ((samples_this_line as f32 * ENCODE_SYNC_FRAC) as usize).max(4);
+        let spike_len = sync_len / 2;
+        let content_len = samples_this_line - sync_len;
+
+        for i in 0..samples_this_line {
+            let base = if i < spike_len {
+                SYNC_SPIKE_LEVEL
+            } else if i < sync_len {
+                SYNC_DIP_LEVEL
+            } else {
+                // Pixel luminance trace: nearest-pixel level
+                let ci = i - sync_len;
+                let px = (ci * width / content_len).min(width - 1);
+                line[px] as f32 / 255.0 * CONTENT_MAX_LEVEL
+            };
+
+            let noise = if opts.noise_amplitude > 0.0 {
+                let mut hasher = DefaultHasher::new();
+                (line_idx, i).hash(&mut hasher);
+                ((hasher.finish() % 2000) as f32 / 1000.0 - 1.0) * opts.noise_amplitude
+            } else {
+                0.0
+            };
+
+            audio.push(base + noise);
+        }
+        t += period;
     }
 
     audio
@@ -221,11 +296,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_encode_image_to_audio_length_and_mapping() {
+    fn test_encode_image_structure() {
         let width = 4;
         let pixels = vec![
-            0, 255, 0, 255, // line 1
-            255, 0, 255, 0, // line 2
+            0, 85, 170, 255, // line 1: gradient
+            255, 170, 85, 0, // line 2: reverse gradient
         ];
         let sample_rate = 40_000;
         let line_duration_ms = 10.0; // -> 400 samples/line
@@ -234,9 +309,34 @@ mod tests {
         let audio = encode_image_to_audio(&pixels, width, sample_rate, line_duration_ms);
         assert_eq!(audio.len(), samples_per_line * 2);
 
-        // Spot-check mapping: sample near 1/4 of line should map to pixel index 1 (value 255)
-        assert_eq!(audio[0], 0.0);
-        assert_eq!(audio[samples_per_line / 4], 1.0);
+        // Sync spike at line start, dip after it
+        assert_eq!(audio[0], 1.0);
+        let sync_len = ((samples_per_line as f32 * ENCODE_SYNC_FRAC) as usize).max(4);
+        assert_eq!(audio[sync_len - 1], -0.8);
+
+        // Gray levels map to intermediate amplitudes, not binary
+        let mid_line: Vec<f32> = audio[sync_len..samples_per_line].to_vec();
+        let distinct: std::collections::BTreeSet<i32> = mid_line.iter().map(|v| (v * 1000.0) as i32).collect();
+        assert!(distinct.len() >= 4, "expected >=4 gray levels, got {distinct:?}");
+    }
+
+    #[test]
+    fn test_encode_slant_accumulates() {
+        let width = 4;
+        let pixels = vec![128u8; width * 100];
+        let no_slant = encode_image_to_audio(&pixels, width, 48_000, 8.32);
+        let slanted = encode_image_to_audio_with(
+            &pixels,
+            width,
+            48_000,
+            8.32,
+            &EncodeOptions {
+                slant_samples_per_line: 1.0,
+                ..Default::default()
+            },
+        );
+        // 100 lines at +1 sample/line drift accumulate ~ n*(n-1)/2 extra samples
+        assert!(slanted.len() > no_slant.len() + 4000);
     }
 
     #[test]

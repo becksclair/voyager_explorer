@@ -36,8 +36,11 @@ pub struct DecoderConfig {
     /// Default line duration in milliseconds (1.0-100.0)
     pub default_line_duration_ms: f32,
 
-    /// Default amplitude threshold (0.0-1.0)
-    pub default_threshold: f32,
+    /// Default brightness polarity inversion (rip-dependent)
+    pub default_invert: bool,
+
+    /// Default gamma applied after normalization (0.1-10.0)
+    pub default_gamma: f32,
 
     /// Decode window duration in seconds
     pub decode_window_secs: f32,
@@ -132,8 +135,9 @@ fn default_decode_interval_ms() -> u64 {
 impl Default for DecoderConfig {
     fn default() -> Self {
         Self {
-            default_line_duration_ms: 8.3,
-            default_threshold: 0.2,
+            default_line_duration_ms: 8.32,
+            default_invert: false,
+            default_gamma: 1.0,
             decode_window_secs: 2.0,
             fft_chunk_size: 2048,
             sync_threshold_multiplier: 10.0,
@@ -255,15 +259,26 @@ impl AppConfig {
             });
         }
 
-        if !(0.0..=1.0).contains(&self.decoder.default_threshold) {
+        if !(0.1..=10.0).contains(&self.decoder.default_gamma) {
             return Err(ConfigError::ValidationFailed {
-                reason: format!("Threshold {} out of range 0.0-1.0", self.decoder.default_threshold),
+                reason: format!("Gamma {} out of range 0.1-10.0", self.decoder.default_gamma),
             });
         }
 
         if !(0.1..=60.0).contains(&self.decoder.decode_window_secs) {
             return Err(ConfigError::ValidationFailed {
                 reason: format!("Decode window {}s out of range 0.1-60s", self.decoder.decode_window_secs),
+            });
+        }
+
+        // Below this, any in-flight decode is declared dead before it can
+        // plausibly finish, and the worker restarts in a loop.
+        if self.worker.max_unresponsive_ms < 100 {
+            return Err(ConfigError::ValidationFailed {
+                reason: format!(
+                    "Worker unresponsive timeout {}ms too low (minimum 100ms)",
+                    self.worker.max_unresponsive_ms
+                ),
             });
         }
 
@@ -358,15 +373,15 @@ mod tests {
     }
 
     #[test]
-    fn test_validation_threshold() {
+    fn test_validation_gamma() {
         let mut config = AppConfig::default();
-        config.decoder.default_threshold = -0.1; // Too low
+        config.decoder.default_gamma = 0.05; // Too low
         assert!(config.validate().is_err());
 
-        config.decoder.default_threshold = 1.5; // Too high
+        config.decoder.default_gamma = 15.0; // Too high
         assert!(config.validate().is_err());
 
-        config.decoder.default_threshold = 0.5; // Valid
+        config.decoder.default_gamma = 1.3; // Valid
         assert!(config.validate().is_ok());
     }
 
@@ -414,7 +429,7 @@ image_width = 256
         assert_eq!(config.ui.image_width, 256);
 
         // Unspecified values should use defaults from struct field definitions
-        assert_eq!(config.decoder.default_threshold, 0.2); // Default from DecoderConfig::default()
+        assert_eq!(config.decoder.default_gamma, 1.0); // Default from DecoderConfig::default()
         assert_eq!(config.ui.max_image_height, 16384); // Default from UiConfig::default()
         assert_eq!(config.ui.waveform_height, 200.0); // Default from UiConfig::default()
 

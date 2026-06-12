@@ -4,20 +4,11 @@ use std::sync::{atomic::AtomicBool, Arc};
 use eframe::egui;
 
 use crate::sstv::DecoderMode;
+use crate::ui::theme;
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum BatchStatus {
-    Pending,
-    Processing,
-    Done,
-    Error(String),
-}
-
-#[derive(Debug, Clone)]
-pub struct BatchItem {
-    pub path: PathBuf,
-    pub status: BatchStatus,
-}
+// The batch domain types live in the service layer so the backend doesn't
+// depend on the UI; re-exported here for the panel and existing call sites.
+pub use crate::services::batch::{BatchItem, BatchStatus};
 
 pub struct BatchPanel {
     pub visible: bool,
@@ -36,7 +27,7 @@ impl Default for BatchPanel {
             visible: false,
             queue: Vec::new(),
             output_dir: None,
-            selected_mode: DecoderMode::BinaryGrayscale,
+            selected_mode: DecoderMode::Grayscale,
             is_processing: false,
             current_index: 0,
             progress: 0.0,
@@ -52,7 +43,7 @@ impl BatchPanel {
         }
 
         let mut visible = self.visible;
-        egui::Window::new("📦 Batch Processing")
+        egui::Window::new("Batch Processing")
             .open(&mut visible)
             .resize(|r| r.default_size([600.0, 400.0]))
             .show(ctx, |ui| {
@@ -62,13 +53,11 @@ impl BatchPanel {
     }
 
     fn draw_content(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Batch Processing");
-        ui.separator();
-
         // Configuration Section
-        ui.group(|ui| {
+        theme::section_label(ui, "Configuration");
+        theme::panel_frame().show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("📂 Add Files...").clicked() {
+                if ui.button("Add Files…").clicked() {
                     if let Some(paths) = rfd::FileDialog::new().add_filter("WAV", &["wav"]).pick_files() {
                         for path in paths {
                             if !self.queue.iter().any(|item| item.path == path) {
@@ -81,7 +70,7 @@ impl BatchPanel {
                     }
                 }
 
-                if ui.button("📂 Select Output Dir...").clicked() {
+                if ui.button("Select Output Dir…").clicked() {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() {
                         self.output_dir = Some(path);
                     }
@@ -89,23 +78,23 @@ impl BatchPanel {
             });
 
             ui.horizontal(|ui| {
-                ui.label("Output:");
+                ui.label(egui::RichText::new("Output:").color(theme::TEXT_MUTED));
                 if let Some(dir) = &self.output_dir {
                     ui.monospace(dir.to_string_lossy());
                 } else {
-                    ui.colored_label(egui::Color32::RED, "Not selected");
+                    ui.colored_label(theme::AMBER, "Not selected");
                 }
             });
 
             ui.horizontal(|ui| {
-                ui.label("Mode:");
-                egui::ComboBox::from_label("")
+                ui.label(egui::RichText::new("Mode:").color(theme::TEXT_MUTED));
+                egui::ComboBox::from_id_salt("batch_mode_combo")
                     .selected_text(match self.selected_mode {
-                        DecoderMode::BinaryGrayscale => "Binary (B/W)",
+                        DecoderMode::Grayscale => "Binary (B/W)",
                         DecoderMode::PseudoColor => "PseudoColor",
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.selected_mode, DecoderMode::BinaryGrayscale, "Binary (B/W)");
+                        ui.selectable_value(&mut self.selected_mode, DecoderMode::Grayscale, "Binary (B/W)");
                         ui.selectable_value(&mut self.selected_mode, DecoderMode::PseudoColor, "PseudoColor");
                     });
             });
@@ -114,8 +103,7 @@ impl BatchPanel {
         ui.add_space(10.0);
 
         // Queue Section
-        ui.heading(format!("Queue ({})", self.queue.len()));
-        ui.separator();
+        theme::section_label(ui, &format!("Queue ({})", self.queue.len()));
 
         egui::ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
             let mut items_to_remove = std::collections::HashSet::new();
@@ -126,20 +114,20 @@ impl BatchPanel {
 
                     match &item.status {
                         BatchStatus::Pending => {
-                            ui.label("⏳ Pending");
+                            ui.colored_label(theme::TEXT_MUTED, "Pending");
                             if !self.is_processing && ui.button("✖").clicked() {
                                 items_to_remove.insert(i);
                             }
                         }
                         BatchStatus::Processing => {
                             ui.spinner();
-                            ui.label("Processing...");
+                            ui.colored_label(theme::CYAN, "Processing…");
                         }
                         BatchStatus::Done => {
-                            ui.colored_label(egui::Color32::GREEN, "✅ Done");
+                            ui.colored_label(theme::ACCENT, "✔ Done");
                         }
                         BatchStatus::Error(e) => {
-                            ui.colored_label(egui::Color32::RED, format!("❌ Error: {}", e));
+                            ui.colored_label(theme::ERROR, format!("✖ Error: {}", e));
                         }
                     }
                 });
@@ -160,7 +148,8 @@ impl BatchPanel {
         ui.horizontal(|ui| {
             let can_start = !self.queue.is_empty() && self.output_dir.is_some() && !self.is_processing;
 
-            if ui.add_enabled(can_start, egui::Button::new("▶ Start Batch")).clicked() {
+            let start_text = egui::RichText::new("▶ Start Batch").color(theme::ACCENT);
+            if ui.add_enabled(can_start, egui::Button::new(start_text)).clicked() {
                 self.start_processing();
             }
 
@@ -172,7 +161,7 @@ impl BatchPanel {
                     }
                 }
 
-                ui.add(egui::ProgressBar::new(self.progress).show_percentage());
+                ui.add(egui::ProgressBar::new(self.progress).fill(theme::ACCENT).show_percentage());
             }
         });
     }

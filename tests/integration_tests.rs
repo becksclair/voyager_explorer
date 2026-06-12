@@ -95,9 +95,8 @@ fn test_full_workflow_wav_to_image() {
     let decoder = SstvDecoder::new();
     let params = DecoderParams {
         line_duration_ms: 20.0, // Longer lines for test data
-        threshold: 0.3,
-        decode_window_secs: 2.0,
-        mode: DecoderMode::BinaryGrayscale,
+        sync_lock: false,       // synthetic signal has no per-line sync structure
+        mode: DecoderMode::Grayscale,
         ..Default::default()
     };
 
@@ -106,7 +105,7 @@ fn test_full_workflow_wav_to_image() {
     assert!(!samples.is_empty());
 
     // Test sync detection
-    let sync_positions = decoder.find_sync_positions(samples, wav_reader.sample_rate);
+    let sync_positions = decoder.find_tone_regions(samples, wav_reader.sample_rate);
     println!("Found {} sync positions", sync_positions.len());
     // We should find at least one sync signal
     assert!(!sync_positions.is_empty(), "Should detect at least one sync signal");
@@ -117,20 +116,18 @@ fn test_full_workflow_wav_to_image() {
         .expect("Decode should succeed");
     assert!(!decoded_pixels.is_empty(), "Should decode some pixels");
 
-    // Verify pixel data is valid (all values should be 0 or 255 for binary decoding)
-    for &pixel in &decoded_pixels {
-        assert!(pixel == 0 || pixel == 255, "Pixel value should be 0 or 255, got {}", pixel);
-    }
+    // Width contract: full rows only
+    assert_eq!(decoded_pixels.len() % 512, 0, "Decoded pixels must form complete rows");
 
     // Test image creation
-    let image = image_from_pixels(&decoded_pixels, DecoderMode::BinaryGrayscale, 512);
+    let image = image_from_pixels(&decoded_pixels, DecoderMode::Grayscale, 512);
     assert_eq!(image.size[0], 512); // Width should be 512
     assert!(image.size[1] > 0); // Height should be positive
     assert_eq!(image.pixels.len(), image.size[0] * image.size[1]); // Correct pixel count
 
     // Test seeking functionality
     if sync_positions.len() > 1 {
-        let next_sync = decoder.find_next_sync(samples, sync_positions[0] + 1000, wav_reader.sample_rate);
+        let next_sync = decoder.find_next_tone_region(samples, sync_positions[0] + 1000, wav_reader.sample_rate);
         assert!(next_sync.is_some(), "Should find next sync after first one");
         assert!(next_sync.unwrap() > sync_positions[0], "Next sync should be after first sync");
     }
@@ -177,8 +174,8 @@ fn test_stereo_channel_selection() {
 
     // Test sync detection on left channel (should find sync)
     let decoder = SstvDecoder::new();
-    let left_sync = decoder.find_sync_positions(left_samples, wav_reader.sample_rate);
-    let right_sync = decoder.find_sync_positions(right_samples, wav_reader.sample_rate);
+    let left_sync = decoder.find_tone_regions(left_samples, wav_reader.sample_rate);
+    let right_sync = decoder.find_tone_regions(right_samples, wav_reader.sample_rate);
 
     // Left channel should have more sync detections than right
     assert!(
@@ -226,16 +223,14 @@ fn test_parameter_variations() {
     // Test with different line durations
     let params_fast = DecoderParams {
         line_duration_ms: 8.3,
-        threshold: 0.2,
-        decode_window_secs: 2.0,
-        mode: DecoderMode::BinaryGrayscale,
+        sync_lock: false,
+        mode: DecoderMode::Grayscale,
         ..Default::default()
     };
     let params_slow = DecoderParams {
         line_duration_ms: 50.0,
-        threshold: 0.3,
-        decode_window_secs: 2.0,
-        mode: DecoderMode::BinaryGrayscale,
+        sync_lock: false,
+        mode: DecoderMode::Grayscale,
         ..Default::default()
     };
 
@@ -252,38 +247,32 @@ fn test_parameter_variations() {
         "Fast decoding should produce more pixels than slow decoding"
     );
 
-    // Test with different thresholds
-    let params_low_thresh = DecoderParams {
+    // Test polarity inversion: same geometry, flipped brightness
+    let params_normal = DecoderParams {
         line_duration_ms: 10.0,
-        threshold: 0.1,
-        decode_window_secs: 2.0,
-        mode: DecoderMode::BinaryGrayscale,
+        sync_lock: false,
+        mode: DecoderMode::Grayscale,
         ..Default::default()
     };
-    let params_high_thresh = DecoderParams {
-        line_duration_ms: 10.0,
-        threshold: 0.9,
-        decode_window_secs: 2.0,
-        mode: DecoderMode::BinaryGrayscale,
-        ..Default::default()
+    let params_inverted = DecoderParams {
+        invert: true,
+        ..params_normal
     };
 
-    let pixels_low = decoder
-        .decode(samples, &params_low_thresh, wav_reader.sample_rate)
-        .expect("Low threshold decode should succeed");
-    let pixels_high = decoder
-        .decode(samples, &params_high_thresh, wav_reader.sample_rate)
-        .expect("High threshold decode should succeed");
+    let pixels_normal = decoder
+        .decode(samples, &params_normal, wav_reader.sample_rate)
+        .expect("Normal decode should succeed");
+    let pixels_inverted = decoder
+        .decode(samples, &params_inverted, wav_reader.sample_rate)
+        .expect("Inverted decode should succeed");
 
-    assert_eq!(pixels_low.len(), pixels_high.len()); // Same number of pixels
+    assert_eq!(pixels_normal.len(), pixels_inverted.len()); // Same geometry
 
-    // But different distributions of 0s and 255s
-    let white_pixels_low = pixels_low.iter().filter(|&&p| p == 255).count();
-    let white_pixels_high = pixels_high.iter().filter(|&&p| p == 255).count();
-
-    // Low threshold should produce more white pixels
+    // Mean brightness flips around the midpoint under inversion
+    let mean_normal = pixels_normal.iter().map(|&p| p as f64).sum::<f64>() / pixels_normal.len() as f64;
+    let mean_inverted = pixels_inverted.iter().map(|&p| p as f64).sum::<f64>() / pixels_inverted.len() as f64;
     assert!(
-        white_pixels_low >= white_pixels_high,
-        "Low threshold should produce more white pixels"
+        ((mean_normal + mean_inverted) - 255.0).abs() < 16.0,
+        "inversion should mirror brightness: {mean_normal:.1} + {mean_inverted:.1} != ~255"
     );
 }

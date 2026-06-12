@@ -1,7 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -18,22 +15,18 @@ use crate::audio_state::AudioPlaybackState;
 use crate::config::AppConfig;
 use crate::error::VoyagerError;
 use crate::metrics::AppMetrics;
+use crate::pipeline::PipelineResult;
 #[cfg(feature = "audio_playback")]
 use crate::services::audio::AudioBufferSource;
-use crate::services::decoder::{spawn_decode_worker, DecodeRequest, DecodeResult};
+use crate::services::batch::{BatchProgressMsg, BatchRunner};
+use crate::services::decoder::{DecodeOrchestrator, DecodeResult};
 use crate::sstv::{DecoderMode, DecoderParams, SstvDecoder};
-use crate::ui::batch::{BatchPanel, BatchStatus};
+use crate::ui::batch::BatchPanel;
 use crate::ui::controls::{ControlAction, ControlsPanel};
 use crate::ui::spectrum::SpectrumPanel;
+use crate::ui::theme;
 use crate::ui::waveform::WaveformPanel;
 use crate::utils::format_duration;
-
-// Batch progress messages
-enum BatchProgressMsg {
-    ItemStatus(usize, BatchStatus),
-    Progress(f32),
-    Error(String),
-}
 
 pub struct VoyagerApp {
     // Configuration
@@ -44,8 +37,15 @@ pub struct VoyagerApp {
     video_decoder: SstvDecoder,
     image_texture: Option<TextureHandle>,
     params: DecoderParams,
-    last_decoded: Option<Vec<u8>>,
+    last_decoded: Option<PipelineResult>,
     selected_channel: WaveformChannel,
+    /// Sync-tone positions cached at file load / channel switch; rendered as
+    /// amber markers in the waveform strip. Never recomputed per frame.
+    sync_positions: Vec<usize>,
+    /// Receiver for an in-flight background sync scan. The full-file scan can
+    /// take seconds on real Golden Record audio, so it must not block the UI;
+    /// replacing the receiver cancels delivery from a stale scan.
+    sync_scan_rx: Option<std::sync::mpsc::Receiver<Vec<usize>>>,
 
     // Audio playback state
     audio_state: AudioPlaybackState,
@@ -56,16 +56,24 @@ pub struct VoyagerApp {
     current_position_samples: usize,
     last_decode_position: usize,
     waveform_hover_position: Option<f32>,
+    /// Sample offset at which the current audio source was appended; the true
+    /// playhead is `playback_base_samples + sink.get_pos() · rate`.
+    #[cfg(feature = "audio_playback")]
+    playback_base_samples: usize,
+    /// Visual-only playback simulation clock (no audio device to anchor to).
+    #[cfg(not(feature = "audio_playback"))]
     playback_start_time: Option<Instant>,
+    #[cfg(not(feature = "audio_playback"))]
     playback_start_position: usize,
 
     // Background decoding worker
-    decode_tx: Option<Sender<DecodeRequest>>,
-    decode_rx: Option<Receiver<DecodeResult>>,
-    next_decode_id: u64,
-    pending_decode_requests: usize,
-    worker_handle: Option<JoinHandle<()>>,
-    worker_last_response: Instant,
+    decode_worker: DecodeOrchestrator,
+    /// Input-state generation: bumped on file load and channel switch so
+    /// stale worker results can be recognized and dropped.
+    decode_generation: u64,
+    /// Last decode error surfaced, to avoid re-raising the identical error
+    /// every live-decode interval (which would defeat the dismiss button).
+    last_decode_error: Option<String>,
 
     // Metrics and errors
     metrics: AppMetrics,
@@ -74,19 +82,15 @@ pub struct VoyagerApp {
 
     // Signal Analysis
     spectrum_panel: SpectrumPanel,
+    waveform_panel: WaveformPanel,
 
     // Batch Processing
     batch_panel: BatchPanel,
-    batch_worker: Option<JoinHandle<()>>,
-    batch_rx: Option<Receiver<BatchProgressMsg>>,
-    batch_cancel: Option<Arc<AtomicBool>>,
+    batch_runner: BatchRunner,
 }
 
 impl Default for VoyagerApp {
     fn default() -> Self {
-        // Spawn background decoding worker
-        let (decode_tx, decode_rx, worker_handle) = spawn_decode_worker();
-
         // Load configuration from file or use defaults
         let mut config = AppConfig::load_or_default(AppConfig::default_path());
         if let Err(e) = config.validate() {
@@ -102,9 +106,10 @@ impl Default for VoyagerApp {
         // Initialize decoder params from config
         let params = DecoderParams {
             line_duration_ms: config.decoder.default_line_duration_ms,
-            threshold: config.decoder.default_threshold,
+            invert: config.decoder.default_invert,
+            gamma: config.decoder.default_gamma,
             decode_window_secs: config.decoder.decode_window_secs as f64,
-            mode: DecoderMode::BinaryGrayscale,
+            mode: DecoderMode::Grayscale,
             ..Default::default()
         };
 
@@ -116,6 +121,8 @@ impl Default for VoyagerApp {
             params,
             last_decoded: None,
             selected_channel: WaveformChannel::Left,
+            sync_positions: Vec::new(),
+            sync_scan_rx: None,
             audio_state: AudioPlaybackState::Uninitialized,
             #[cfg(feature = "audio_playback")]
             audio_stream: None,
@@ -124,22 +131,22 @@ impl Default for VoyagerApp {
             current_position_samples: 0,
             last_decode_position: 0,
             waveform_hover_position: None,
+            #[cfg(feature = "audio_playback")]
+            playback_base_samples: 0,
+            #[cfg(not(feature = "audio_playback"))]
             playback_start_time: None,
+            #[cfg(not(feature = "audio_playback"))]
             playback_start_position: 0,
-            decode_tx: Some(decode_tx),
-            decode_rx: Some(decode_rx),
-            next_decode_id: 0,
-            pending_decode_requests: 0,
-            worker_handle: Some(worker_handle),
-            worker_last_response: Instant::now(),
+            decode_worker: DecodeOrchestrator::new(),
+            decode_generation: 0,
+            last_decode_error: None,
             metrics: AppMetrics::new(),
             error_message: None,
             frame_start: None,
             spectrum_panel: SpectrumPanel::default(),
+            waveform_panel: WaveformPanel::default(),
             batch_panel: BatchPanel::default(),
-            batch_worker: None,
-            batch_rx: None,
-            batch_cancel: None,
+            batch_runner: BatchRunner::default(),
         }
     }
 }
@@ -147,28 +154,70 @@ impl Default for VoyagerApp {
 impl VoyagerApp {
     fn handle_load_wav(&mut self) {
         if let Some(path) = rfd::FileDialog::new().add_filter("WAV", &["wav"]).pick_file() {
-            match WavReader::from_file(&path) {
-                Ok(reader) => {
-                    tracing::info!(path = %path.display(), "WAV file loaded successfully");
-                    self.wav_reader = Some(reader);
-                    self.image_texture = None;
-                    self.last_decoded = None;
-                    // Update audio state to Ready when WAV is loaded
-                    self.audio_state = AudioPlaybackState::Ready;
-                    // Clear any previous error and reset decode position
-                    self.error_message = None;
-                    self.last_decode_position = 0;
-                }
-                Err(e) => {
-                    tracing::error!(path = %path.display(), error = %e, "Failed to load WAV file");
-                    self.audio_state = AudioPlaybackState::Uninitialized;
+            self.load_wav_from_path(&path);
+        }
+    }
 
-                    // Extract user-friendly error message
-                    self.error_message = Some(match e {
-                        VoyagerError::Audio(audio_err) => audio_err.user_message(),
-                        _ => format!("Failed to load audio file: {}", e),
-                    });
+    /// Load a WAV file directly by path (shared by the file dialog and the
+    /// `--load` startup flag).
+    pub fn load_wav_from_path(&mut self, path: &std::path::Path) {
+        match WavReader::from_file(path) {
+            Ok(reader) => {
+                tracing::info!(path = %path.display(), "WAV file loaded successfully");
+                self.wav_reader = Some(reader);
+                self.image_texture = None;
+                self.last_decoded = None;
+                // In-flight worker results now belong to the previous input
+                self.decode_generation += 1;
+                self.last_decode_error = None;
+                // Pointer-keyed caches must not survive a buffer swap (ABA)
+                self.waveform_panel.invalidate();
+                self.spectrum_panel.invalidate();
+                // Update audio state to Ready when WAV is loaded
+                self.audio_state = AudioPlaybackState::Ready;
+                // Clear any previous error and reset decode position
+                self.error_message = None;
+                self.last_decode_position = 0;
+                // Cache sync markers once per load (not per frame)
+                self.refresh_sync_positions();
+            }
+            Err(e) => {
+                tracing::error!(path = %path.display(), error = %e, "Failed to load WAV file");
+                // Keep any previously loaded file fully usable — only the new
+                // load failed. Reset state only when nothing was loaded.
+                if self.wav_reader.is_none() {
+                    self.audio_state = AudioPlaybackState::Uninitialized;
+                    self.sync_positions.clear();
+                    self.sync_scan_rx = None;
                 }
+
+                // Extract user-friendly error message
+                self.error_message = Some(match e {
+                    VoyagerError::Audio(audio_err) => audio_err.user_message(),
+                    _ => format!("Failed to load audio file: {}", e),
+                });
+            }
+        }
+    }
+
+    /// Apply one batch-progress message to panel state.
+    fn apply_batch_message(&mut self, msg: BatchProgressMsg, ctx: &egui::Context) {
+        match msg {
+            BatchProgressMsg::ItemStatus(index, status) => {
+                if let Some(item) = self.batch_panel.queue.get_mut(index) {
+                    item.status = status;
+                }
+                ctx.request_repaint();
+            }
+            BatchProgressMsg::Progress(progress) => {
+                self.batch_panel.progress = progress;
+                ctx.request_repaint();
+            }
+            BatchProgressMsg::Error(error_msg) => {
+                tracing::error!("Batch worker error: {}", error_msg);
+                self.error_message = Some(format!("Batch error: {}", error_msg));
+                self.batch_panel.is_processing = false;
+                ctx.request_repaint();
             }
         }
     }
@@ -180,10 +229,6 @@ impl VoyagerApp {
             // Clear any previous errors
             self.error_message = None;
 
-            // Detect sync presence
-            let sync_detected = self.video_decoder.detect_sync(samples, reader.sample_rate);
-            tracing::debug!(sync_detected, "Sync detection completed");
-
             // Perform decode with error handling using unified pipeline
             let pipeline = crate::pipeline::DecodingPipeline::new();
             match pipeline.process(samples, &self.params, reader.sample_rate) {
@@ -191,7 +236,7 @@ impl VoyagerApp {
                     tracing::info!(pixels = result.pixels.len(), "Decode completed successfully");
                     let img = result.to_egui_image();
                     self.image_texture = Some(ctx.load_texture("decoded", img, Default::default()));
-                    self.last_decoded = Some(result.pixels);
+                    self.last_decoded = Some(result);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "Decode failed");
@@ -205,74 +250,79 @@ impl VoyagerApp {
         }
     }
 
-    /// Check if the worker thread is healthy and responsive.
-    ///
-    /// Returns true if the worker is healthy, false if it needs restart.
-    ///
-    /// Health checks:
-    /// 1. Thread has not panicked (checked via JoinHandle::is_finished())
-    /// 2. No response timeout (worker_last_response within max_unresponsive_ms)
-    fn check_worker_health(&mut self) -> bool {
-        let Some(handle) = &self.worker_handle else {
-            tracing::warn!("Worker handle is None, needs restart");
-            return false;
-        };
-
-        // Check if thread has panicked or exited
-        if handle.is_finished() {
-            tracing::error!("Worker thread has exited/panicked, needs restart");
-            return false;
-        }
-
-        // Only check timeout if we have pending requests
-        if self.pending_decode_requests > 0 {
-            // Check for response timeout
-            let elapsed = self.worker_last_response.elapsed();
-            let timeout_threshold = Duration::from_millis(self.config.worker.max_unresponsive_ms);
-
-            if elapsed > timeout_threshold {
-                tracing::warn!(
-                    elapsed_ms = elapsed.as_millis(),
-                    threshold_ms = timeout_threshold.as_millis(),
-                    "Worker thread unresponsive, needs restart"
-                );
-                return false;
-            }
-        }
-
-        true
+    /// Restart the decode worker after a crash or timeout, recording metrics.
+    fn restart_worker(&mut self) {
+        self.decode_worker.restart();
+        self.metrics.record_worker_restart();
     }
 
-    /// Restart the worker thread after a crash or timeout.
-    ///
-    /// This recreates the channels and spawns a new worker thread.
-    /// Any pending decode requests in the old channels are lost.
-    fn restart_worker(&mut self) {
-        tracing::warn!("Restarting worker thread");
+    /// Kick off a background scan of the selected channel for sync tones,
+    /// caching the positions for the waveform markers. Called on file load
+    /// and channel switch only; the full-file FFT scan can take seconds on
+    /// real recordings, so it runs off the UI thread and the result is
+    /// collected in `update()`.
+    fn refresh_sync_positions(&mut self) {
+        self.sync_positions.clear();
+        self.sync_scan_rx = None;
 
-        let discarded = self.decode_rx.as_ref().map(|rx| rx.try_iter().count()).unwrap_or(0);
-        if discarded > 0 {
-            tracing::debug!("Discarding {} pending results on worker restart", discarded);
+        let Some(reader) = &self.wav_reader else {
+            return;
+        };
+        let samples: Arc<[f32]> = match self.selected_channel {
+            WaveformChannel::Left => Arc::clone(&reader.left_channel),
+            WaveformChannel::Right => Arc::clone(&reader.right_channel),
+        };
+        if samples.is_empty() {
+            return;
         }
+        let sample_rate = reader.sample_rate;
 
-        // Drop old channels and handle to clean up resources
-        self.decode_tx = None;
-        self.decode_rx = None;
-        self.worker_handle = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let decoder = SstvDecoder::new();
+            let positions = decoder.find_tone_regions(&samples, sample_rate);
+            tracing::info!(
+                count = positions.len(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "Background sync scan completed"
+            );
+            // Receiver may have been replaced by a newer scan; ignore failure.
+            let _ = tx.send(positions);
+        });
+        self.sync_scan_rx = Some(rx);
+    }
 
-        // Spawn new worker with fresh channels
-        let (decode_tx, decode_rx, worker_handle) = spawn_decode_worker();
+    /// Export the last decoded image as a PNG via a save dialog.
+    fn handle_export(&mut self) {
+        let Some(result) = &self.last_decoded else {
+            self.error_message = Some("No decoded image to export".to_string());
+            return;
+        };
 
-        self.decode_tx = Some(decode_tx);
-        self.decode_rx = Some(decode_rx);
-        self.worker_handle = Some(worker_handle);
-        self.pending_decode_requests = 0;
-        self.worker_last_response = Instant::now();
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("PNG", &["png"])
+            .set_file_name("voyager_decode.png")
+            .save_file()
+        else {
+            return;
+        };
 
-        // Record restart in metrics
-        self.metrics.record_worker_restart();
-
-        tracing::info!("Worker thread restarted successfully");
+        match result.to_dynamic_image() {
+            Ok(img) => {
+                if let Err(e) = img.save(&path) {
+                    tracing::error!(path = %path.display(), error = %e, "Failed to save PNG");
+                    self.error_message = Some(format!("Export failed: {}", e));
+                } else {
+                    tracing::info!(path = %path.display(), "Exported decoded image");
+                    self.error_message = None;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to convert decoded pixels to image");
+                self.error_message = Some(format!("Export failed: {}", e));
+            }
+        }
     }
 
     #[cfg(feature = "audio_playback")]
@@ -311,17 +361,15 @@ impl VoyagerApp {
                 AudioPlaybackState::Paused => {
                     // Resume playback
                     if let Some(sink) = &self.audio_sink {
+                        // The sink's get_pos persists across pause; the base
+                        // offset is still valid, so no clock bookkeeping.
                         sink.play();
                         self.audio_state = AudioPlaybackState::Playing;
-                        self.playback_start_time = Some(Instant::now());
-                        self.playback_start_position = self.current_position_samples;
                         tracing::info!("Resuming playback");
                     } else {
                         // No sink means the user seeked while paused (the
                         // stale sink was dropped); rebuild from the current
                         // position so audio matches the visuals.
-                        self.playback_start_time = Some(Instant::now());
-                        self.playback_start_position = self.current_position_samples;
                         self.audio_state = AudioPlaybackState::Playing;
                         self.restart_audio_from_current_position();
                         tracing::info!("Resuming playback after paused seek");
@@ -350,8 +398,7 @@ impl VoyagerApp {
                         sink.play();
                         self.audio_sink = Some(sink);
                         self.audio_state = AudioPlaybackState::Playing;
-                        self.playback_start_time = Some(Instant::now());
-                        self.playback_start_position = self.current_position_samples;
+                        self.playback_base_samples = self.current_position_samples;
                         tracing::info!("Starting playback");
                     } else {
                         tracing::error!("No audio samples available to start playback");
@@ -403,8 +450,15 @@ impl VoyagerApp {
         }
         self.current_position_samples = 0;
         self.last_decode_position = 0;
-        self.playback_start_time = None;
-        self.playback_start_position = 0;
+        #[cfg(feature = "audio_playback")]
+        {
+            self.playback_base_samples = 0;
+        }
+        #[cfg(not(feature = "audio_playback"))]
+        {
+            self.playback_start_time = None;
+            self.playback_start_position = 0;
+        }
         tracing::info!("Stopping playback");
     }
 
@@ -431,66 +485,49 @@ impl VoyagerApp {
     /// - UI frame time: <16ms (previously spiked to 100-500ms during decode)
     /// - Responsiveness: Immediate (no blocking operations)
     fn decode_at_position(&mut self, _ctx: &egui::Context, position: usize) {
-        // Check queue size before enqueuing
-        if self.pending_decode_requests >= self.config.worker.max_queue_size {
-            tracing::debug!("Decode queue full, skipping request");
-            return;
-        }
-
         if let Some(reader) = &self.wav_reader {
-            if let Some(decode_tx) = &self.decode_tx {
-                // Get shared reference to samples (Arc enables zero-copy sharing with worker)
-                let samples: Arc<[f32]> = match self.selected_channel {
-                    WaveformChannel::Left => Arc::clone(&reader.left_channel),
-                    WaveformChannel::Right => Arc::clone(&reader.right_channel),
-                };
+            // Get shared reference to samples (Arc enables zero-copy sharing with worker)
+            let samples: Arc<[f32]> = match self.selected_channel {
+                WaveformChannel::Left => Arc::clone(&reader.left_channel),
+                WaveformChannel::Right => Arc::clone(&reader.right_channel),
+            };
 
-                // Bounds check - ensure we have samples and position is valid
-                if samples.is_empty() {
-                    tracing::warn!("No samples available for decoding");
-                    return;
-                }
-
-                if position >= samples.len() {
-                    tracing::warn!(
-                        position = position,
-                        samples_len = samples.len(),
-                        "Decode position out of bounds"
-                    );
-                    return;
-                }
-
-                // Ensure we have enough samples for a meaningful decode window
-                let min_window_samples = (reader.sample_rate as f64 * 0.1) as usize; // 100ms minimum
-                let remaining_samples = samples.len() - position;
-                if remaining_samples < min_window_samples {
-                    tracing::debug!(
-                        remaining = remaining_samples,
-                        min_required = min_window_samples,
-                        "Insufficient samples remaining for decode window"
-                    );
-                    return;
-                }
-
-                // Create decode request (all fields copied/cloned, O(1) operation)
-                let request = DecodeRequest {
-                    id: self.next_decode_id,
-                    samples,
-                    start_offset: position,
-                    params: self.params,
-                    sample_rate: reader.sample_rate,
-                };
-
-                self.next_decode_id += 1;
-                self.pending_decode_requests += 1;
-
-                // Send to worker thread (non-blocking, returns immediately)
-                // If worker is busy, request queues up in channel
-                if decode_tx.send(request).is_err() {
-                    tracing::warn!("Decode worker thread has terminated");
-                    self.pending_decode_requests = self.pending_decode_requests.saturating_sub(1);
-                }
+            // Bounds check - ensure we have samples and position is valid
+            if samples.is_empty() {
+                tracing::warn!("No samples available for decoding");
+                return;
             }
+
+            if position >= samples.len() {
+                tracing::warn!(
+                    position = position,
+                    samples_len = samples.len(),
+                    "Decode position out of bounds"
+                );
+                return;
+            }
+
+            // Ensure we have enough samples for a meaningful decode window
+            let min_window_samples = (reader.sample_rate as f64 * 0.1) as usize; // 100ms minimum
+            let remaining_samples = samples.len() - position;
+            if remaining_samples < min_window_samples {
+                tracing::debug!(
+                    remaining = remaining_samples,
+                    min_required = min_window_samples,
+                    "Insufficient samples remaining for decode window"
+                );
+                return;
+            }
+
+            let sample_rate = reader.sample_rate;
+            self.decode_worker.request(
+                samples,
+                position,
+                self.params,
+                sample_rate,
+                self.config.worker.max_queue_size,
+                self.decode_generation,
+            );
         }
     }
 
@@ -513,9 +550,15 @@ impl VoyagerApp {
                 self.current_position_samples = 0;
             }
 
-            let next_sync = self
-                .video_decoder
-                .find_next_sync(samples, self.current_position_samples, reader.sample_rate);
+            // Prefer the cached sync markers (the same ones drawn on the
+            // waveform) so the jump matches what the user sees and costs
+            // nothing; fall back to a live scan only while the background
+            // marker scan hasn't finished yet.
+            let min_jump = self.current_position_samples + (reader.sample_rate as usize / 100); // skip the marker we're on
+            let next_sync = self.sync_positions.iter().copied().find(|&p| p > min_jump).or_else(|| {
+                self.video_decoder
+                    .find_next_tone_region(samples, self.current_position_samples, reader.sample_rate)
+            });
 
             if let Some(sync_position) = next_sync {
                 // Validate sync position
@@ -613,177 +656,76 @@ impl VoyagerApp {
             sink.append(source);
             sink.play();
             self.audio_sink = Some(sink);
-            self.playback_start_time = Some(Instant::now());
-            self.playback_start_position = self.current_position_samples;
+            self.playback_base_samples = self.current_position_samples;
         } else {
             tracing::error!("No audio samples available after seek");
         }
     }
 }
 
-impl Drop for VoyagerApp {
-    fn drop(&mut self) {
-        // Drop channels first to signal worker thread to shut down
-        self.decode_tx = None;
-        self.decode_rx = None;
+impl VoyagerApp {
+    /// Current playhead in samples, anchored to the audio device clock.
+    #[cfg(feature = "audio_playback")]
+    fn live_position(&self) -> Option<usize> {
+        let sink = self.audio_sink.as_ref()?;
+        let reader = self.wav_reader.as_ref()?;
+        Some(crate::services::playback::position_samples(
+            self.playback_base_samples,
+            sink.get_pos(),
+            reader.sample_rate,
+        ))
+    }
 
-        // Give worker thread a short time to finish gracefully, then detach
-        // This prevents blocking the UI thread indefinitely on shutdown
-        if let Some(handle) = self.worker_handle.take() {
-            if !handle.is_finished() {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            // The thread will be detached when handle is dropped
-            // If it hasn't finished by now, it will continue in background
-            if !handle.is_finished() {
-                tracing::warn!("Worker thread still running after timeout, detaching");
-            } else if let Err(e) = handle.join() {
-                tracing::error!("Worker thread panicked on shutdown: {:?}", e);
-            }
-        }
-
-        // Join batch worker thread if active
-        if let Some(handle) = self.batch_worker.take() {
-            // Signal cancellation
-            if let Some(flag) = &self.batch_cancel {
-                flag.store(true, Ordering::Release);
-            }
-            // Drop the receiver to potentially signal the sender
-            self.batch_rx = None;
-            if let Err(e) = handle.join() {
-                tracing::error!("Batch worker thread panicked on shutdown: {:?}", e);
-            }
-        }
+    /// Visual-only simulated playhead (no audio device to anchor to).
+    #[cfg(not(feature = "audio_playback"))]
+    fn live_position(&self) -> Option<usize> {
+        let start_time = self.playback_start_time?;
+        let reader = self.wav_reader.as_ref()?;
+        let samples_elapsed = (start_time.elapsed().as_secs_f32() * reader.sample_rate as f32) as usize;
+        Some(self.playback_start_position + samples_elapsed)
     }
 }
 
 impl eframe::App for VoyagerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // --- Batch Processing Logic ---
-        // Check if user wants to start processing
-        if self.batch_panel.is_processing && self.batch_worker.is_none() {
-            // Start new batch processing
-            let queue = self.batch_panel.queue.clone();
-            let output_dir = match self.batch_panel.output_dir.clone() {
-                Some(dir) => dir,
+        // Check if user wants to start processing. A missing output dir only
+        // skips the batch start — never the rest of the frame, because
+        // returning out of update() would render a blank window.
+        if self.batch_panel.is_processing && !self.batch_runner.is_running() {
+            match self.batch_panel.output_dir.clone() {
+                Some(output_dir) => {
+                    let queue = self.batch_panel.queue.clone();
+                    let mode = self.batch_panel.selected_mode;
+                    let cancel_flag = self.batch_runner.start(queue, output_dir, mode);
+                    self.batch_panel.cancel_flag = Some(cancel_flag);
+                    ctx.request_repaint();
+                }
                 None => {
                     self.batch_panel.is_processing = false;
-                    return;
                 }
-            };
-            let mode = self.batch_panel.selected_mode;
-
-            // Create cancellation flag - clear old one first to avoid stale references
-            self.batch_cancel = None;
-            let cancel_flag = Arc::new(AtomicBool::new(false));
-            self.batch_cancel = Some(cancel_flag.clone());
-            self.batch_panel.cancel_flag = Some(cancel_flag.clone());
-
-            // Create progress channel
-            let (tx, rx) = std::sync::mpsc::channel();
-            self.batch_rx = Some(rx);
-
-            // Spawn worker thread
-            self.batch_worker = Some(std::thread::spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let params = crate::sstv::DecoderParams {
-                        mode,
-                        ..Default::default()
-                    };
-
-                    let total = queue.len();
-
-                    for (index, item) in queue.iter().enumerate() {
-                        // Check cancellation
-                        if cancel_flag.load(Ordering::Acquire) {
-                            tracing::info!("Batch processing cancelled by user");
-                            break;
-                        }
-
-                        // Mark as processing
-                        let _ = tx.send(BatchProgressMsg::ItemStatus(index, BatchStatus::Processing));
-
-                        // Process the file
-                        let result = crate::batch::process_single_file(&item.path, &output_dir, &params);
-
-                        // Send status update
-                        let status = match result {
-                            Ok(_) => BatchStatus::Done,
-                            Err(e) => BatchStatus::Error(e.to_string()),
-                        };
-                        let _ = tx.send(BatchProgressMsg::ItemStatus(index, status));
-
-                        // Update progress
-                        let progress = (index + 1) as f32 / total.max(1) as f32;
-                        let _ = tx.send(BatchProgressMsg::Progress(progress));
-                    }
-
-                    tracing::info!("Batch processing thread completed");
-                }));
-
-                if let Err(e) = result {
-                    let panic_msg = if let Some(s) = e.downcast_ref::<String>() {
-                        s.clone()
-                    } else if let Some(s) = e.downcast_ref::<&str>() {
-                        s.to_string()
-                    } else {
-                        "Unknown panic".to_string()
-                    };
-                    let _ = tx.send(BatchProgressMsg::Error(format!("Worker panicked: {}", panic_msg)));
-                    tracing::error!("Batch worker panicked: {}", panic_msg);
-                }
-            }));
-
-            ctx.request_repaint();
+            }
         }
 
         if self.batch_panel.is_processing {
-            // Poll for messages from worker
-            if let Some(rx) = &self.batch_rx {
-                while let Ok(msg) = rx.try_recv() {
-                    match msg {
-                        BatchProgressMsg::ItemStatus(index, status) => {
-                            // Update item status
-                            if let Some(item) = self.batch_panel.queue.get_mut(index) {
-                                item.status = status;
-                            }
-                            ctx.request_repaint();
-                        }
-                        BatchProgressMsg::Progress(progress) => {
-                            // Update progress bar
-                            self.batch_panel.progress = progress;
-                            ctx.request_repaint();
-                        }
-                        BatchProgressMsg::Error(error_msg) => {
-                            // Log and display batch worker error
-                            tracing::error!("Batch worker error: {}", error_msg);
-                            self.error_message = Some(format!("Batch error: {}", error_msg));
-                            self.batch_panel.is_processing = false;
-                            ctx.request_repaint();
-                        }
-                    }
-                }
+            for msg in self.batch_runner.poll() {
+                self.apply_batch_message(msg, ctx);
             }
         }
 
         // Reap the batch worker whenever it has finished — deliberately
         // outside the is_processing gate, because the Error branch above
-        // clears that flag and a stale Some(handle) would otherwise block
-        // the next Start click (the spawn guard requires is_none()).
-        if let Some(handle) = &self.batch_worker {
-            if handle.is_finished() {
-                // Join the worker and clean up
-                if let Some(handle) = self.batch_worker.take() {
-                    if let Err(e) = handle.join() {
-                        tracing::error!("Batch worker thread panicked: {:?}", e);
-                    }
-                }
-                self.batch_rx = None;
-                self.batch_cancel = None;
-                self.batch_panel.cancel_flag = None;
-                self.batch_panel.is_processing = false;
-                ctx.request_repaint();
+        // clears that flag and a stale running worker would otherwise block
+        // the next Start click. The reap returns any final messages that
+        // raced the finish check; apply them so the last item doesn't stay
+        // stuck at "Processing".
+        if let Some(remaining) = self.batch_runner.reap_if_finished() {
+            for msg in remaining {
+                self.apply_batch_message(msg, ctx);
             }
+            self.batch_panel.cancel_flag = None;
+            self.batch_panel.is_processing = false;
+            ctx.request_repaint();
         }
 
         // Record frame time for performance metrics
@@ -793,76 +735,115 @@ impl eframe::App for VoyagerApp {
         self.frame_start = Some(Instant::now());
 
         // Check worker health and restart if needed
-        if self.config.worker.auto_restart_on_panic && !self.check_worker_health() {
+        let max_unresponsive = Duration::from_millis(self.config.worker.max_unresponsive_ms);
+        if self.config.worker.auto_restart_on_panic && !self.decode_worker.is_healthy(max_unresponsive) {
             self.error_message = Some("Worker thread crashed or timed out, restarting...".to_string());
             self.restart_worker();
         }
 
-        // Poll for decode results from background worker (non-blocking)
-        if let Some(decode_rx) = &self.decode_rx {
-            // try_recv() returns immediately without blocking the UI thread
-            // If a result is available, apply it; otherwise continue normally
-            while let Ok(decode_result) = decode_rx.try_recv() {
-                let DecodeResult {
-                    id: _,
-                    result: pipeline_result,
-                    decode_duration,
-                    error,
-                } = decode_result;
-
-                let success = error.is_none();
-                let pixel_count = pipeline_result.as_ref().map(|r| r.pixels.len()).unwrap_or(0);
-
-                // Log performance metrics and record in metrics system
-                if success {
-                    tracing::debug!(
-                        duration_ms = decode_duration.as_millis(),
-                        pixels = pixel_count,
-                        "Decode completed successfully"
-                    );
-                } else {
-                    tracing::warn!(
-                        duration_ms = decode_duration.as_millis(),
-                        error = error.as_deref().unwrap_or("unknown"),
-                        "Decode failed"
-                    );
+        // Collect the background sync scan result, if one is in flight
+        if let Some(rx) = &self.sync_scan_rx {
+            match rx.try_recv() {
+                Ok(positions) => {
+                    self.sync_positions = positions;
+                    self.sync_scan_rx = None;
+                    ctx.request_repaint();
                 }
-
-                // Record metrics (track both success and failure)
-                self.metrics.record_decode(decode_duration, pixel_count, success);
-                self.pending_decode_requests = self.pending_decode_requests.saturating_sub(1);
-                self.worker_last_response = Instant::now();
-
-                // Handle error or update texture
-                if let Some(err_msg) = error {
-                    self.error_message = Some(format!("Decode failed: {}", err_msg));
-                } else if let Some(res) = pipeline_result {
-                    let img = res.to_egui_image();
-                    self.image_texture = Some(ctx.load_texture("decoded_realtime", img, Default::default()));
-                    self.last_decoded = Some(res.pixels);
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Keep polling at a low rate while the scan runs
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    tracing::warn!("Sync scan thread exited without a result");
+                    self.sync_scan_rx = None;
                 }
             }
         }
 
-        // Update playback position if playing
-        if self.audio_state.is_playing() {
-            if let (Some(start_time), Some(wav_reader)) = (self.playback_start_time, &self.wav_reader) {
-                let elapsed = start_time.elapsed();
-                let samples_elapsed = (elapsed.as_secs_f32() * wav_reader.sample_rate as f32) as usize;
-                // Compute position based on start position and elapsed time (no timer reset)
-                let new_position = self.playback_start_position + samples_elapsed;
+        // Poll for decode results from background worker (non-blocking)
+        for decode_result in self.decode_worker.poll() {
+            let DecodeResult {
+                id: _,
+                generation,
+                result: pipeline_result,
+                decode_duration,
+                error,
+            } = decode_result;
 
-                if new_position >= wav_reader.left_channel.len() {
+            let success = error.is_none();
+            let pixel_count = pipeline_result.as_ref().map(|r| r.pixels.len()).unwrap_or(0);
+
+            // Log performance metrics and record in metrics system
+            if success {
+                tracing::debug!(
+                    duration_ms = decode_duration.as_millis(),
+                    pixels = pixel_count,
+                    "Decode completed successfully"
+                );
+            } else {
+                tracing::warn!(
+                    duration_ms = decode_duration.as_millis(),
+                    error = error.as_deref().unwrap_or("unknown"),
+                    "Decode failed"
+                );
+            }
+
+            // Record metrics (track both success and failure)
+            self.metrics.record_decode(decode_duration, pixel_count, success);
+
+            // Results from a previous file/channel generation are stale:
+            // displaying (or exporting) them would attribute old audio's
+            // pixels to the current input.
+            if generation != self.decode_generation {
+                tracing::debug!(generation, current = self.decode_generation, "Dropping stale decode result");
+                continue;
+            }
+
+            // Handle error or update texture. Identical consecutive errors are
+            // not re-raised — live decode retries every interval and would
+            // otherwise make the dismiss button useless.
+            if let Some(err_msg) = error {
+                let msg = format!("Decode failed: {}", err_msg);
+                if self.last_decode_error.as_deref() != Some(msg.as_str()) {
+                    self.error_message = Some(msg.clone());
+                    self.last_decode_error = Some(msg);
+                }
+            } else if let Some(res) = pipeline_result {
+                self.last_decode_error = None;
+                let img = res.to_egui_image();
+                self.image_texture = Some(ctx.load_texture("decoded_realtime", img, Default::default()));
+                self.last_decoded = Some(res);
+            }
+        }
+
+        // Update playback position if playing. The position comes from the
+        // audio device clock (sink.get_pos), not a UI-frame timer, so it
+        // cannot drift under frame-rate jitter; the live decode window is
+        // anchored to the same value.
+        if self.audio_state.is_playing() {
+            // A drained sink means the source ran out even if rounding in the
+            // position math never quite reaches total_samples — without this,
+            // playback can stall in Playing forever at end of file.
+            #[cfg(feature = "audio_playback")]
+            let sink_drained = self.audio_sink.as_ref().map(|s| s.empty()).unwrap_or(false);
+            #[cfg(not(feature = "audio_playback"))]
+            let sink_drained = false;
+
+            if let (Some(new_position), Some(total_samples), Some(sample_rate)) = (
+                self.live_position(),
+                self.wav_reader.as_ref().map(|r| r.left_channel.len()),
+                self.wav_reader.as_ref().map(|r| r.sample_rate),
+            ) {
+                if new_position >= total_samples || sink_drained {
                     // Reached end of audio, stop playback
                     self.stop_playback();
                 } else {
-                    // Only update current position, keep start_time and start_position fixed
                     self.current_position_samples = new_position;
 
                     // Real-time decoding: decode from current position only if significant change
                     // Decode at configurable interval to avoid flooding worker thread
                     let decode_threshold_samples =
-                        (wav_reader.sample_rate as f32 * (self.config.worker.decode_interval_ms as f32 / 1000.0)) as usize;
+                        (sample_rate as f32 * (self.config.worker.decode_interval_ms as f32 / 1000.0)) as usize;
                     let position_change = new_position.abs_diff(self.last_decode_position);
 
                     if position_change >= decode_threshold_samples {
@@ -878,152 +859,77 @@ impl eframe::App for VoyagerApp {
             ctx.request_repaint();
         }
 
-        // Draw Batch Panel
+        // Draw Batch Panel (floating window)
         self.batch_panel.draw(ctx);
 
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("🚀 Voyager Golden Record Explorer");
-
-                if ui.button("📂 Load WAV").clicked() {
-                    self.handle_load_wav();
-                }
-
-                if ui.button("🧠 Decode").clicked() {
-                    self.handle_decode(ctx);
-                }
-
-                if ui.button("📦 Batch").clicked() {
-                    self.batch_panel.visible = !self.batch_panel.visible;
-                }
-
-                ui.separator();
-                if ui.selectable_label(self.spectrum_panel.visible, "📈 Spectrum").clicked() {
-                    self.spectrum_panel.visible = !self.spectrum_panel.visible;
-                }
-            });
-
-            // Display error message if present
-            let mut dismiss_error = false;
-            if let Some(error) = &self.error_message {
+        // --- Header bar ---
+        egui::TopBottomPanel::top("header_bar")
+            .frame(theme::strip_frame())
+            .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.colored_label(egui::Color32::from_rgb(255, 100, 100), format!("⚠️ {}", error));
-                    if ui.button("✖").clicked() {
-                        dismiss_error = true;
-                    }
+                    ui.label(
+                        egui::RichText::new("Voyager Golden Record Explorer")
+                            .size(19.0)
+                            .strong()
+                            .color(theme::TEXT_BRIGHT),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new("Interactive image recovery from the Golden Record audio")
+                            .size(12.0)
+                            .color(theme::TEXT_MUTED),
+                    );
                 });
-            }
-            if dismiss_error {
-                self.error_message = None;
-            }
-
-            ui.separator();
-
-            ui.horizontal(|ui| {
-                ui.label("📏 Line Duration (ms):");
-                ui.add(egui::DragValue::new(&mut self.params.line_duration_ms).range(1..=100));
-                ui.label("🔪 Threshold:");
-                ui.add(egui::Slider::new(&mut self.params.threshold, 0.0..=1.0));
-
-                ui.separator();
-                ui.label("🎨 Mode:");
-                egui::ComboBox::from_label("")
-                    .selected_text(match self.params.mode {
-                        DecoderMode::BinaryGrayscale => "Binary (B/W)",
-                        DecoderMode::PseudoColor => "PseudoColor",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.params.mode, DecoderMode::BinaryGrayscale, "Binary (B/W)");
-                        ui.selectable_value(&mut self.params.mode, DecoderMode::PseudoColor, "PseudoColor");
-                    });
-
-                ui.separator();
-                ui.label("📻 Channel:");
-                egui::ComboBox::from_label("")
-                    .selected_text(match self.selected_channel {
-                        WaveformChannel::Left => "Left",
-                        WaveformChannel::Right => "Right",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.selected_channel, WaveformChannel::Left, "Left");
-                        ui.selectable_value(&mut self.selected_channel, WaveformChannel::Right, "Right");
-                    });
             });
-        });
 
-        egui::TopBottomPanel::bottom("debug_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                // Audio status indicator
-                let status_icon = self.audio_state.status_icon();
-                let status_message = self.audio_state.status_message();
-                ui.label(format!("{} {}", status_icon, status_message));
-                ui.separator();
-
-                if let Some(reader) = &self.wav_reader {
-                    let duration_secs = reader.left_channel.len() as f32 / reader.sample_rate as f32;
-                    ui.label(format!(
-                        "📦 {} samples @ {} Hz ({}) - {}",
-                        reader.left_channel.len(),
-                        reader.sample_rate,
-                        if reader.channels == 1 { "mono" } else { "stereo" },
-                        format_duration(duration_secs)
-                    ));
-                } else {
-                    ui.label("📦 No file loaded");
-                }
-
-                if let Some(pixels) = &self.last_decoded {
-                    ui.label(format!("🖼️ Decoded size: {}x{}", 512, pixels.len() / 512));
-                }
-            });
-        });
-
-        // Left panel for decoded image
-        egui::SidePanel::left("image_panel")
-            .default_width(ctx.input(|i| i.viewport().inner_rect.map(|r| r.width() * 0.6).unwrap_or(800.0)))
+        // --- Transport bar ---
+        egui::TopBottomPanel::top("transport_bar")
+            .frame(theme::strip_frame())
             .show(ctx, |ui| {
-                ui.heading("Decoded Image");
-                ui.separator();
-                if let Some(texture) = &self.image_texture {
-                    ui.image(texture);
-                } else {
-                    ui.label("🖼️ No image decoded yet.");
-                }
-            });
+                let (current_secs, total_secs) = match &self.wav_reader {
+                    Some(reader) => {
+                        let rate = reader.sample_rate.max(1) as f64;
+                        (
+                            self.current_position_samples as f64 / rate,
+                            reader.left_channel.len() as f64 / rate,
+                        )
+                    }
+                    None => (0.0, 0.0),
+                };
 
-        // Spectrum Analysis Panel (Right Side)
-        if self.spectrum_panel.visible {
-            egui::SidePanel::right("spectrum_panel").default_width(400.0).show(ctx, |ui| {
-                self.spectrum_panel
-                    .draw(ui, &self.wav_reader, self.current_position_samples, self.selected_channel);
-            });
-        }
-
-        // Bottom panel for waveform visualization
-        egui::TopBottomPanel::bottom("waveform_panel")
-            .default_height(200.0)
-            .show(ctx, |ui| {
-                ui.heading("Audio Waveform");
-                ui.separator();
-
-                // Playback controls
-                if let Some(action) = ControlsPanel::draw(ui, self.audio_state.is_playing()) {
+                if let Some(action) = ControlsPanel::draw(
+                    ui,
+                    self.audio_state.is_playing(),
+                    self.wav_reader.is_some(),
+                    current_secs,
+                    total_secs,
+                ) {
                     match action {
+                        ControlAction::OpenWav => self.handle_load_wav(),
                         ControlAction::TogglePlayback => self.toggle_playback(),
                         ControlAction::StopPlayback => self.stop_playback(),
                         ControlAction::SeekToNextSync => self.seek_to_next_sync(),
                     }
                 }
+            });
 
-                ui.separator();
-
-                // Waveform visualization
-                if let Some(new_pos) = WaveformPanel::draw(
+        // --- Waveform strip ---
+        egui::TopBottomPanel::top("waveform_strip")
+            .exact_height(200.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
+            )
+            .show(ctx, |ui| {
+                theme::section_label(ui, "Waveform");
+                if let Some(new_pos) = self.waveform_panel.draw(
                     ui,
                     &self.wav_reader,
                     self.selected_channel,
                     self.current_position_samples,
                     &mut self.waveform_hover_position,
+                    &self.sync_positions,
                 ) {
                     self.current_position_samples = new_pos;
 
@@ -1042,11 +948,266 @@ impl eframe::App for VoyagerApp {
                 }
             });
 
-        // Central panel for controls and info
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("🚀 Voyager Golden Record Explorer");
-            ui.separator();
-            ui.label("Use the controls in the top panel to load audio files and adjust decoder settings.");
-        });
+        // --- Status bar ---
+        egui::TopBottomPanel::bottom("status_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
+            )
+            .show(ctx, |ui| {
+                let mut dismiss_error = false;
+                ui.horizontal(|ui| {
+                    let status_color = if self.audio_state.is_playing() {
+                        theme::ACCENT
+                    } else if self.audio_state.is_error() {
+                        theme::ERROR
+                    } else {
+                        theme::TEXT_MUTED
+                    };
+                    ui.colored_label(
+                        status_color,
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            self.audio_state.status_icon(),
+                            self.audio_state.status_message()
+                        ))
+                        .size(12.0),
+                    );
+
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("Worker: {} pending", self.decode_worker.pending()))
+                            .size(12.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+
+                    if let Some(reader) = &self.wav_reader {
+                        ui.separator();
+                        let duration_secs = reader.left_channel.len() as f32 / reader.sample_rate as f32;
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} Hz · {} · {}",
+                                reader.sample_rate,
+                                if reader.channels == 1 { "mono" } else { "stereo" },
+                                format_duration(duration_secs)
+                            ))
+                            .size(12.0)
+                            .color(theme::TEXT_MUTED),
+                        );
+                    }
+
+                    ui.separator();
+                    let summary = self.metrics.summary();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "frame p99 {:.0} ms · decode p50 {:.0} ms",
+                            summary.frame_p99_ms, summary.decode_p50_ms
+                        ))
+                        .size(12.0)
+                        .color(theme::TEXT_MUTED),
+                    );
+
+                    if let Some(error) = self.error_message.clone() {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("✖").clicked() {
+                                dismiss_error = true;
+                            }
+                            ui.colored_label(theme::ERROR, egui::RichText::new(error).size(12.0));
+                        });
+                    }
+                });
+                if dismiss_error {
+                    self.error_message = None;
+                }
+            });
+
+        // --- Left column: spectrum analyzer + signal info ---
+        egui::SidePanel::left("analysis_panel")
+            .exact_width(280.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
+            )
+            .show(ctx, |ui| {
+                let mut peak = None;
+                theme::panel_frame().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        theme::section_label(ui, "Spectrum Analyzer");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let toggle_text = if self.spectrum_panel.visible { "Hide" } else { "Show" };
+                            if ui.small_button(toggle_text).clicked() {
+                                self.spectrum_panel.visible = !self.spectrum_panel.visible;
+                            }
+                        });
+                    });
+                    if self.spectrum_panel.visible {
+                        peak =
+                            self.spectrum_panel
+                                .draw(ui, &self.wav_reader, self.current_position_samples, self.selected_channel);
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                theme::panel_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    theme::section_label(ui, "Signal");
+                    ui.add_space(2.0);
+                    if let Some(reader) = &self.wav_reader {
+                        let duration_secs = reader.left_channel.len() as f32 / reader.sample_rate as f32;
+                        theme::key_value(ui, "Sample rate", &format!("{} Hz", reader.sample_rate));
+                        theme::key_value(ui, "Channels", if reader.channels == 1 { "mono" } else { "stereo" });
+                        theme::key_value(ui, "Duration", &format_duration(duration_secs));
+                        let sync_marks = if self.sync_scan_rx.is_some() {
+                            "scanning…".to_string()
+                        } else {
+                            self.sync_positions.len().to_string()
+                        };
+                        theme::key_value(ui, "Sync marks", &sync_marks);
+                        if let Some((freq, mag)) = peak {
+                            theme::key_value(ui, "Dominant", &format!("{:.0} Hz ({:.1})", freq, mag));
+                        }
+                    } else {
+                        ui.label(egui::RichText::new("No audio loaded").size(12.0).color(theme::TEXT_MUTED));
+                    }
+                });
+            });
+
+        // --- Right column: decode controls + export ---
+        egui::SidePanel::right("decode_controls_panel")
+            .exact_width(280.0)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
+            )
+            .show(ctx, |ui| {
+                theme::panel_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    theme::section_label(ui, "Decode Controls");
+                    ui.add_space(2.0);
+
+                    egui::Grid::new("decode_params_grid")
+                        .num_columns(2)
+                        .spacing([10.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("Line (ms)").size(12.0).color(theme::TEXT_MUTED));
+                            ui.add(
+                                egui::DragValue::new(&mut self.params.line_duration_ms)
+                                    .range(1..=100)
+                                    .speed(0.01),
+                            );
+                            ui.end_row();
+
+                            ui.label(egui::RichText::new("Gamma").size(12.0).color(theme::TEXT_MUTED));
+                            ui.add(egui::Slider::new(&mut self.params.gamma, 0.2..=3.0));
+                            ui.end_row();
+
+                            ui.label(egui::RichText::new("Mode").size(12.0).color(theme::TEXT_MUTED));
+                            egui::ComboBox::from_id_salt("decode_mode_combo")
+                                .selected_text(match self.params.mode {
+                                    DecoderMode::Grayscale => "Grayscale",
+                                    DecoderMode::PseudoColor => "PseudoColor",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.params.mode, DecoderMode::Grayscale, "Grayscale");
+                                    ui.selectable_value(&mut self.params.mode, DecoderMode::PseudoColor, "PseudoColor");
+                                });
+                            ui.end_row();
+
+                            ui.label(egui::RichText::new("Channel").size(12.0).color(theme::TEXT_MUTED));
+                            let previous_channel = self.selected_channel;
+                            egui::ComboBox::from_id_salt("channel_combo")
+                                .selected_text(match self.selected_channel {
+                                    WaveformChannel::Left => "Left",
+                                    WaveformChannel::Right => "Right",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.selected_channel, WaveformChannel::Left, "Left");
+                                    ui.selectable_value(&mut self.selected_channel, WaveformChannel::Right, "Right");
+                                });
+                            if self.selected_channel != previous_channel {
+                                // Sync markers are channel-specific; rescan once.
+                                self.refresh_sync_positions();
+                                // In-flight decode results are for the old channel
+                                self.decode_generation += 1;
+                                // The sink was built from the old channel's
+                                // buffer; rebuild so audio matches the decode.
+                                #[cfg(feature = "audio_playback")]
+                                self.restart_audio_from_current_position();
+                            }
+                            ui.end_row();
+                        });
+
+                    ui.checkbox(&mut self.params.invert, "Invert");
+                    ui.checkbox(&mut self.params.sync_lock, "Sync lock");
+                });
+
+                ui.add_space(8.0);
+
+                theme::panel_frame().show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    theme::section_label(ui, "Export");
+                    ui.add_space(2.0);
+                    let can_export = self.last_decoded.is_some();
+                    if ui
+                        .add_enabled(can_export, egui::Button::new("Export Current Image…"))
+                        .clicked()
+                    {
+                        self.handle_export();
+                    }
+                    if ui.button("Batch…").clicked() {
+                        self.batch_panel.visible = !self.batch_panel.visible;
+                    }
+                });
+            });
+
+        // --- Center: decoded image ---
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
+            )
+            .show(ctx, |ui| {
+                theme::panel_frame().show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    ui.horizontal(|ui| {
+                        theme::section_label(ui, "Image Decode");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Decode").clicked() {
+                                self.handle_decode(ctx);
+                            }
+                            let lines = self.last_decoded.as_ref().map(|r| r.height).unwrap_or(0);
+                            ui.label(
+                                egui::RichText::new(format!("Lines: {}", lines))
+                                    .size(12.0)
+                                    .monospace()
+                                    .color(theme::TEXT_BRIGHT),
+                            );
+                        });
+                    });
+                    ui.add_space(4.0);
+
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        if let Some(texture) = &self.image_texture {
+                            ui.add(egui::Image::new(texture).max_width(ui.available_width()));
+                        } else {
+                            ui.centered_and_justified(|ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "No image decoded yet — load a WAV and press Decode, or play to decode live",
+                                    )
+                                    .color(theme::TEXT_MUTED),
+                                );
+                            });
+                        }
+                    });
+                });
+            });
     }
 }

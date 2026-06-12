@@ -22,10 +22,6 @@ pub enum VoyagerError {
     #[error("Configuration error: {0}")]
     Config(#[from] ConfigError),
 
-    /// Worker thread errors
-    #[error("Worker thread error: {0}")]
-    Worker(#[from] WorkerError),
-
     /// I/O errors
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -37,8 +33,11 @@ pub enum AudioError {
     #[error("Failed to load WAV file '{path}': {source}")]
     LoadFailed { path: PathBuf, source: hound::Error },
 
-    #[error("Invalid sample rate: {rate} Hz (must be 8kHz-192kHz)")]
+    #[error("Invalid sample rate: {rate} Hz (must be at least 8 kHz)")]
     InvalidSampleRate { rate: u32 },
+
+    #[error("Seek offset {start_secs:.1}s exceeds the seekable range for this file")]
+    SeekOutOfRange { start_secs: f64 },
 
     #[error("Unsupported channel count: {channels} (only mono/stereo supported)")]
     UnsupportedChannels { channels: u16 },
@@ -65,20 +64,8 @@ pub enum DecoderError {
     #[error("Line duration out of range: {duration_ms}ms (must be 1-100ms)")]
     InvalidLineDuration { duration_ms: f32 },
 
-    #[error("Threshold out of range: {threshold} (must be 0.0-1.0)")]
-    InvalidThreshold { threshold: f32 },
-
-    #[error("FFT processing failed: {reason}")]
-    FftError { reason: String },
-
     #[error("Insufficient samples for decoding: needed {needed}, got {actual}")]
     InsufficientSamples { needed: usize, actual: usize },
-
-    #[error("Decode operation timed out after {timeout_ms}ms")]
-    Timeout { timeout_ms: u64 },
-
-    #[error("No sync signals detected in audio")]
-    NoSyncDetected,
 }
 
 /// Configuration errors
@@ -98,25 +85,6 @@ pub enum ConfigError {
 
     #[error("Config serialization failed: {source}")]
     SerializationFailed { source: toml::ser::Error },
-}
-
-/// Worker thread errors
-#[derive(Error, Debug)]
-pub enum WorkerError {
-    #[error("Worker thread panicked: {reason}")]
-    Panicked { reason: String },
-
-    #[error("Worker thread channel disconnected")]
-    ChannelDisconnected,
-
-    #[error("Worker thread failed to start: {reason}")]
-    StartFailed { reason: String },
-
-    #[error("Worker thread health check failed: last response {last_response_ms}ms ago")]
-    HealthCheckFailed { last_response_ms: u64 },
-
-    #[error("Worker queue full: {queue_size} pending requests")]
-    QueueFull { queue_size: usize },
 }
 
 /// Result type alias for Voyager operations
@@ -140,6 +108,9 @@ impl AudioError {
             AudioError::InvalidSampleRate { rate } => {
                 format!("Audio file has unsupported sample rate: {} Hz", rate)
             }
+            AudioError::SeekOutOfRange { start_secs } => {
+                format!("Start offset {start_secs:.1}s is beyond the seekable range of this file")
+            }
             AudioError::UnsupportedChannels { channels } => {
                 format!("Audio file has unsupported {} channels", channels)
             }
@@ -158,9 +129,7 @@ impl DecoderError {
     pub fn recovery_hint(&self) -> Option<&str> {
         match self {
             DecoderError::InvalidLineDuration { .. } => Some("Try adjusting line duration between 1-100ms"),
-            DecoderError::InvalidThreshold { .. } => Some("Try adjusting threshold between 0.0-1.0"),
             DecoderError::InsufficientSamples { .. } => Some("Load a longer audio file or adjust decode window"),
-            DecoderError::NoSyncDetected => Some("Try adjusting threshold or verify this is SSTV audio"),
             _ => None,
         }
     }
@@ -174,7 +143,7 @@ mod tests {
     fn test_error_display() {
         let err = AudioError::InvalidSampleRate { rate: 999 };
         assert!(err.to_string().contains("999"));
-        assert!(err.to_string().contains("8kHz-192kHz"));
+        assert!(err.to_string().contains("8 kHz"));
     }
 
     #[test]

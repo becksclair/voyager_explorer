@@ -1,3 +1,20 @@
+//! Signal analysis and diagnostics: one-shot spectra, spectrograms, rolling
+//! statistics, segment classification, and scan-line sync detection.
+//!
+//! Everything here is pure library code; the CLI subcommands and the GUI
+//! diagnostics panel are thin shims over these functions.
+
+pub mod classify;
+mod font;
+pub mod spectrogram;
+pub mod stats;
+pub mod sync;
+
+pub use classify::{classify_segments, ClassifyParams, Segment, SegmentLabel};
+pub use spectrogram::{compute_spectrogram, render_spectrogram, Spectrogram, SpectrogramParams};
+pub use stats::{compute_stats, rolling_stats, SignalStats};
+pub use sync::{detect_line_syncs, interval_summary, IntervalSummary, SyncParams};
+
 use realfft::RealFftPlanner;
 
 /// Compute the magnitude spectrum of a signal.
@@ -14,9 +31,13 @@ pub fn compute_spectrum(samples: &[f32], sample_rate: u32) -> Vec<(f64, f64)> {
         return Vec::new();
     }
 
-    // Create a planner
-    let mut planner = RealFftPlanner::<f32>::new();
-    let r2c = planner.plan_fft_forward(n);
+    // Reuse one planner per thread: RealFftPlanner caches plans per length,
+    // so repeat callers (the live spectrum panel repaints at frame rate)
+    // skip the expensive plan construction.
+    thread_local! {
+        static PLANNER: std::cell::RefCell<RealFftPlanner<f32>> = std::cell::RefCell::new(RealFftPlanner::new());
+    }
+    let r2c = PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n));
 
     // Prepare input and output buffers
     let mut input_vector = samples.to_vec();
