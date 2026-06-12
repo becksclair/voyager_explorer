@@ -530,11 +530,11 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                     Some(_) => crate::catalog::color_triplets(channel.into()),
                     None => Vec::new(),
                 };
-                let member_idxs: std::collections::HashSet<usize> = triplets.iter().flatten().copied().collect();
 
                 let decoder = crate::sstv::SstvDecoder::new();
                 let plane_width = decode_params.effective_width();
-                let mut member_levels: std::collections::HashMap<usize, Vec<f32>> = std::collections::HashMap::new();
+                // Dense by frame index; only triplet members keep their levels.
+                let mut member_levels: Vec<Option<Vec<f32>>> = vec![None; bounds.len()];
                 for (idx, b) in bounds.iter().enumerate() {
                     let window = &samples[b.start_sample..b.end_sample];
                     let levels = match decoder.decode_levels(window, &decode_params, sample_rate) {
@@ -552,8 +552,8 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                         height: (levels.len() / plane_width) as u32,
                         mode: DecoderMode::Grayscale,
                     };
-                    if member_idxs.contains(&idx) {
-                        member_levels.insert(idx, levels);
+                    if triplets.iter().any(|t| t.contains(&idx)) {
+                        member_levels[idx] = Some(levels);
                     }
                     let img = orient(frame.to_dynamic_image().context("building image")?);
                     let name = match catalog {
@@ -568,10 +568,7 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                 if let Some(cat) = catalog {
                     for triplet in triplets {
                         let [r, _, bl] = triplet;
-                        let planes: Vec<&[f32]> = triplet
-                            .iter()
-                            .filter_map(|idx| member_levels.get(idx).map(Vec::as_slice))
-                            .collect();
+                        let planes: Vec<&[f32]> = triplet.iter().filter_map(|&idx| member_levels[idx].as_deref()).collect();
                         let [pr, pg, pb] = planes.as_slice() else {
                             tracing::warn!("triplet {r}-{bl}: missing decoded frame, skipping composite");
                             continue;
