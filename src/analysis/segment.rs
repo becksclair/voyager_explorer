@@ -28,7 +28,19 @@ pub struct SegmentImagesParams {
     /// lead-in calibration tone is line-periodic enough to sync-lock, so
     /// cadence alone cannot reject it.
     pub filter_tones: bool,
+    /// Repair false splits and fused runs against the median run length
+    /// (needs at least [`MIN_RUNS_FOR_CLEANUP`] runs to establish it): two
+    /// adjacent short runs whose combined span fits one slot are merged; a
+    /// run spanning k slots is split at its weakest cadence points.
+    pub cleanup: bool,
+    /// Maximum silence between two runs for them to be merge candidates,
+    /// in seconds.
+    pub merge_gap_secs: f32,
 }
+
+/// Minimum number of runs before the median run length is trusted for
+/// merge/split cleanup.
+pub const MIN_RUNS_FOR_CLEANUP: usize = 5;
 
 impl Default for SegmentImagesParams {
     fn default() -> Self {
@@ -38,6 +50,8 @@ impl Default for SegmentImagesParams {
             min_lines: 200,
             expected_lines: 600,
             filter_tones: true,
+            cleanup: true,
+            merge_gap_secs: 1.0,
         }
     }
 }
@@ -72,20 +86,28 @@ pub fn find_image_bounds(samples: &[f32], sample_rate: u32, params: &SegmentImag
     let break_threshold = summary.median_samples * params.gap_factor as f64;
 
     // Split the sync sequence into runs at cadence breaks.
-    let mut runs: Vec<&[usize]> = Vec::new();
+    let mut runs: Vec<Vec<usize>> = Vec::new();
     let mut run_start = 0usize;
     for i in 1..syncs.len() {
         if (syncs[i] - syncs[i - 1]) as f64 > break_threshold {
-            runs.push(&syncs[run_start..i]);
+            runs.push(syncs[run_start..i].to_vec());
             run_start = i;
         }
     }
-    runs.push(&syncs[run_start..]);
+    runs.push(syncs[run_start..].to_vec());
+
+    runs.retain(|run| run.len() >= params.min_lines.max(2));
+    runs.retain(|run| !params.filter_tones || !is_mostly_tone(samples, sample_rate, run));
+
+    if params.cleanup && runs.len() >= MIN_RUNS_FOR_CLEANUP {
+        let merge_gap = (params.merge_gap_secs as f64 * sample_rate as f64) as usize;
+        runs = merge_false_splits(runs, merge_gap);
+        runs = split_fused_runs(runs);
+    }
 
     runs.into_iter()
-        .filter(|run| run.len() >= params.min_lines.max(2))
-        .filter(|run| !params.filter_tones || !is_mostly_tone(samples, sample_rate, run))
         .map(|run| {
+            let run = run.as_slice();
             // Per-run median is more faithful than the global one when tape
             // speed drifts across the file.
             let run_summary = interval_summary(run, sample_rate).expect("run has >= 2 syncs");
@@ -110,6 +132,74 @@ pub fn find_image_bounds(samples: &[f32], sample_rate: u32, params: &SegmentImag
             }
         })
         .collect()
+}
+
+/// Median run length in lines. Caller guarantees `runs` is non-empty.
+fn median_run_lines(runs: &[Vec<usize>]) -> f64 {
+    let mut lens: Vec<usize> = runs.iter().map(Vec::len).collect();
+    lens.sort_unstable();
+    if lens.len().is_multiple_of(2) {
+        (lens[lens.len() / 2 - 1] + lens[lens.len() / 2]) as f64 / 2.0
+    } else {
+        lens[lens.len() / 2] as f64
+    }
+}
+
+/// Merge adjacent short runs that together span one image slot: the cadence
+/// detector sometimes splits a single image in half at a weak-sync patch,
+/// leaving two sub-slot runs separated by a small gap.
+fn merge_false_splits(runs: Vec<Vec<usize>>, merge_gap_samples: usize) -> Vec<Vec<usize>> {
+    let slot = median_run_lines(&runs);
+    let mut merged: Vec<Vec<usize>> = Vec::with_capacity(runs.len());
+    for run in runs {
+        if let Some(prev) = merged.last_mut() {
+            let gap = run[0].saturating_sub(*prev.last().unwrap());
+            let both_short = (prev.len() as f64) < 0.75 * slot && (run.len() as f64) < 0.75 * slot;
+            let combined_fits = ((prev.len() + run.len()) as f64) < 1.3 * slot;
+            if both_short && combined_fits && gap < merge_gap_samples {
+                prev.extend(run);
+                continue;
+            }
+        }
+        merged.push(run);
+    }
+    merged
+}
+
+/// Split runs spanning multiple image slots (images so close together that
+/// no cadence break separates them). Each split lands on the run's weakest
+/// cadence point near the expected slot boundary.
+fn split_fused_runs(runs: Vec<Vec<usize>>) -> Vec<Vec<usize>> {
+    let slot = median_run_lines(&runs);
+    let mut out: Vec<Vec<usize>> = Vec::with_capacity(runs.len());
+    for run in runs {
+        let parts = (run.len() as f64 / slot).round() as usize;
+        if parts < 2 || (run.len() as f64) < 1.6 * slot {
+            out.push(run);
+            continue;
+        }
+        // Cut before the sync with the largest preceding interval within
+        // ±10% of each expected boundary; falls back to a mid-slot cut when
+        // the cadence is perfectly steady across the join.
+        let mut cuts = Vec::with_capacity(parts - 1);
+        for j in 1..parts {
+            let target = j * run.len() / parts;
+            let radius = run.len() / 10;
+            let lo = target.saturating_sub(radius).max(1);
+            let hi = (target + radius).min(run.len() - 1);
+            let cut = (lo..=hi)
+                .max_by_key(|&i| (run[i] - run[i - 1], std::cmp::Reverse(i.abs_diff(target))))
+                .expect("split window is non-empty");
+            cuts.push(cut);
+        }
+        let mut prev = 0usize;
+        for cut in cuts {
+            out.push(run[prev..cut].to_vec());
+            prev = cut;
+        }
+        out.push(run[prev..].to_vec());
+    }
+    out
 }
 
 /// True when more than half of the run's duration classifies as steady tone.
@@ -149,6 +239,66 @@ mod tests {
             min_lines,
             expected_lines,
             ..SegmentImagesParams::default()
+        }
+    }
+
+    #[test]
+    fn merges_a_false_split_back_into_one_image() {
+        // Four full images plus one split in half by a 30 ms dropout: the
+        // dropout breaks the cadence (>1.5x line period) but the halves
+        // together span one slot, so cleanup must rejoin them.
+        let gap = vec![0.0f32; (0.05 * RATE as f32) as usize];
+        let dropout = vec![0.0f32; (0.03 * RATE as f32) as usize];
+        let mut audio = Vec::new();
+        for seed in 0..2u8 {
+            audio.extend(encode_image_to_audio(&test_image(256, seed), WIDTH, RATE, LINE_MS));
+            audio.extend(&gap);
+        }
+        audio.extend(encode_image_to_audio(&test_image(126, 2), WIDTH, RATE, LINE_MS));
+        audio.extend(&dropout);
+        audio.extend(encode_image_to_audio(&test_image(126, 3), WIDTH, RATE, LINE_MS));
+        audio.extend(&gap);
+        for seed in 4..6u8 {
+            audio.extend(encode_image_to_audio(&test_image(256, seed), WIDTH, RATE, LINE_MS));
+            audio.extend(&gap);
+        }
+
+        let bounds = find_image_bounds(&audio, RATE, &params(100, 256));
+        assert_eq!(bounds.len(), 5, "{bounds:?}");
+        let rejoined = &bounds[2];
+        assert!(
+            rejoined.line_count > 230,
+            "halves should merge into ~252 lines, got {}",
+            rejoined.line_count
+        );
+    }
+
+    #[test]
+    fn splits_a_fused_double_image() {
+        // Four full images plus one back-to-back pair with no gap: the pair
+        // sync-locks as one 512-line run and must be split near its middle.
+        let gap = vec![0.0f32; (0.05 * RATE as f32) as usize];
+        let mut audio = Vec::new();
+        for seed in 0..2u8 {
+            audio.extend(encode_image_to_audio(&test_image(256, seed), WIDTH, RATE, LINE_MS));
+            audio.extend(&gap);
+        }
+        audio.extend(encode_image_to_audio(&test_image(256, 2), WIDTH, RATE, LINE_MS));
+        audio.extend(encode_image_to_audio(&test_image(256, 3), WIDTH, RATE, LINE_MS));
+        audio.extend(&gap);
+        for seed in 4..6u8 {
+            audio.extend(encode_image_to_audio(&test_image(256, seed), WIDTH, RATE, LINE_MS));
+            audio.extend(&gap);
+        }
+
+        let bounds = find_image_bounds(&audio, RATE, &params(100, 256));
+        assert_eq!(bounds.len(), 6, "{bounds:?}");
+        for b in &bounds {
+            assert!(
+                (b.line_count as i64 - 256).abs() <= 30,
+                "expected ~256 lines per part, got {} ({b:?})",
+                b.line_count
+            );
         }
     }
 

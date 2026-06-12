@@ -102,6 +102,126 @@ impl PipelineResult {
     }
 }
 
+/// Composite three grayscale frames (red, green, blue members of a Voyager
+/// color triplet) into one RGB image.
+///
+/// Per-line sync locking aligns content *within* each scan line, but the
+/// frames start at their own segmentation boundaries, so the planes can be
+/// offset from each other by tens of scan lines (rows). Registration:
+/// cross-correlate each plane's row-mean luminance profile against the red
+/// plane and shift by the best lag before stacking, cropping to the common
+/// overlap.
+pub fn composite_rgb(red: &PipelineResult, grn: &PipelineResult, blu: &PipelineResult) -> Result<DynamicImage> {
+    for (name, frame) in [("red", red), ("green", grn), ("blue", blu)] {
+        anyhow::ensure!(
+            frame.mode == DecoderMode::Grayscale,
+            "{name} frame is {:?}, composite needs Grayscale",
+            frame.mode
+        );
+    }
+    anyhow::ensure!(
+        red.width == grn.width && grn.width == blu.width,
+        "frame widths differ: {} / {} / {}",
+        red.width,
+        grn.width,
+        blu.width
+    );
+    let min_height = red.height.min(grn.height).min(blu.height);
+    anyhow::ensure!(min_height > 0, "empty frame in triplet");
+
+    // Row offsets of green/blue relative to red, from profile correlation.
+    let max_lag = (min_height / 4).clamp(1, 128) as i64;
+    let profile_r = row_profile(red);
+    let lag_g = best_row_lag(&profile_r, &row_profile(grn), max_lag);
+    let lag_b = best_row_lag(&profile_r, &row_profile(blu), max_lag);
+    tracing::debug!(lag_g, lag_b, "composite registration offsets (rows vs red)");
+
+    // Overlap in red-plane row coordinates: row y reads green at y+lag_g and
+    // blue at y+lag_b, all of which must be in range.
+    let y_min = 0.max(-lag_g).max(-lag_b);
+    let y_max = (red.height as i64)
+        .min(grn.height as i64 - lag_g)
+        .min(blu.height as i64 - lag_b);
+    anyhow::ensure!(y_max > y_min, "no overlapping rows after registration");
+
+    let width = red.width;
+    let height = (y_max - y_min) as u32;
+    let mut buffer = image::RgbImage::new(width, height);
+    for y in 0..height {
+        let ry = (y as i64 + y_min) as usize;
+        for x in 0..width {
+            let x = x as usize;
+            let r = red.pixels[ry * width as usize + x];
+            let g = grn.pixels[(ry as i64 + lag_g) as usize * width as usize + x];
+            let b = blu.pixels[(ry as i64 + lag_b) as usize * width as usize + x];
+            buffer.put_pixel(x as u32, y, image::Rgb([r, g, b]));
+        }
+    }
+    Ok(DynamicImage::ImageRgb8(buffer))
+}
+
+/// Mean luminance per row (scan line) of a grayscale frame, computed over
+/// the central columns only: the line-start region holds sync residue and
+/// the row ends hold edge junk, both of which would dominate the profile.
+fn row_profile(frame: &PipelineResult) -> Vec<f64> {
+    let width = frame.width as usize;
+    let lo = width / 5;
+    let hi = (width * 9) / 10;
+    let span = (hi - lo).max(1) as f64;
+    frame
+        .pixels
+        .chunks_exact(width)
+        .map(|row| {
+            row[lo.min(row.len() - 1)..hi.min(row.len())]
+                .iter()
+                .map(|&p| p as f64)
+                .sum::<f64>()
+                / span
+        })
+        .collect()
+}
+
+/// Lag of `b` relative to `a` (in rows) maximizing normalized correlation:
+/// a[i] aligns with b[i + lag]. Correlates only over the central 60% of
+/// `a`'s rows — the first/last rows of a segmented frame are inter-image
+/// leader junk whose strong, repetitive structure can outweigh the picture
+/// content. Returns 0 for degenerate (flat) profiles.
+fn best_row_lag(a: &[f64], b: &[f64], max_lag: i64) -> i64 {
+    let a_lo = (a.len() / 5) as i64;
+    let a_hi = (a.len() * 4 / 5) as i64;
+    let mut best = (0i64, f64::NEG_INFINITY);
+    for lag in -max_lag..=max_lag {
+        let start = a_lo.max(-lag);
+        let end = a_hi.min(b.len() as i64 - lag);
+        if end - start < 16 {
+            continue;
+        }
+        let n = (end - start) as f64;
+        let (mut sa, mut sb) = (0.0, 0.0);
+        for i in start..end {
+            sa += a[i as usize];
+            sb += b[(i + lag) as usize];
+        }
+        let (ma, mb) = (sa / n, sb / n);
+        let (mut num, mut va, mut vb) = (0.0, 0.0, 0.0);
+        for i in start..end {
+            let da = a[i as usize] - ma;
+            let db = b[(i + lag) as usize] - mb;
+            num += da * db;
+            va += da * da;
+            vb += db * db;
+        }
+        if va <= f64::EPSILON || vb <= f64::EPSILON {
+            continue;
+        }
+        let corr = num / (va * vb).sqrt();
+        if corr > best.1 {
+            best = (lag, corr);
+        }
+    }
+    best.0
+}
+
 pub struct DecodingPipeline {
     decoder: SstvDecoder,
 }
@@ -153,5 +273,82 @@ impl DecodingPipeline {
 impl Default for DecodingPipeline {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gray_frame(width: u32, height: u32, value: u8) -> PipelineResult {
+        PipelineResult {
+            pixels: vec![value; (width * height) as usize],
+            width,
+            height,
+            mode: DecoderMode::Grayscale,
+        }
+    }
+
+    #[test]
+    fn composite_crops_to_smallest_height_and_maps_planes() {
+        // Flat planes: degenerate profiles, no registration shift.
+        let r = gray_frame(4, 10, 200);
+        let g = gray_frame(4, 8, 100);
+        let b = gray_frame(4, 9, 50);
+        let img = composite_rgb(&r, &g, &b).unwrap();
+        assert_eq!((img.width(), img.height()), (4, 8));
+        let rgb = img.to_rgb8();
+        assert_eq!(rgb.get_pixel(0, 0), &image::Rgb([200, 100, 50]));
+    }
+
+    fn banded_frame(height: u32, band_row: u32) -> PipelineResult {
+        let width = 8u32;
+        let mut pixels = vec![0u8; (width * height) as usize];
+        for x in 0..width {
+            pixels[(band_row * width + x) as usize] = 255;
+        }
+        PipelineResult {
+            pixels,
+            width,
+            height,
+            mode: DecoderMode::Grayscale,
+        }
+    }
+
+    #[test]
+    fn composite_registers_row_offsets_between_planes() {
+        // The same bright band sits at different rows in each plane;
+        // registration must line the planes up into one white band.
+        let r = banded_frame(64, 20);
+        let g = banded_frame(64, 26);
+        let b = banded_frame(64, 17);
+        let img = composite_rgb(&r, &g, &b).unwrap().to_rgb8();
+        let white_rows: Vec<u32> = (0..img.height())
+            .filter(|&y| img.get_pixel(0, y) == &image::Rgb([255, 255, 255]))
+            .collect();
+        assert_eq!(white_rows.len(), 1, "expected one fully aligned band: {white_rows:?}");
+        // No partially-colored rows: every other row must be black.
+        for y in 0..img.height() {
+            if y != white_rows[0] {
+                assert_eq!(img.get_pixel(0, y), &image::Rgb([0, 0, 0]), "row {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn composite_rejects_mismatched_widths() {
+        let r = gray_frame(4, 8, 0);
+        let g = gray_frame(5, 8, 0);
+        let b = gray_frame(4, 8, 0);
+        assert!(composite_rgb(&r, &g, &b).is_err());
+    }
+
+    #[test]
+    fn composite_rejects_pseudocolor_frames() {
+        let r = gray_frame(4, 8, 0);
+        let g = gray_frame(4, 8, 0);
+        let mut b = gray_frame(4, 8, 0);
+        b.mode = DecoderMode::PseudoColor;
+        assert!(composite_rgb(&r, &g, &b).is_err());
     }
 }

@@ -162,6 +162,11 @@ pub enum DiagnosticsCommand {
         /// Decode each detected image to PNG files in this directory
         #[arg(long)]
         decode_dir: Option<PathBuf>,
+        /// With --decode-dir: name files from the reference catalog and
+        /// composite R/G/B frame triplets into color images (requires the
+        /// candidate count to match the published 78 frames per channel)
+        #[arg(long, default_value_t = false)]
+        color: bool,
         /// Image width in pixels (decode)
         #[arg(long, default_value_t = 512)]
         width: u32,
@@ -445,6 +450,7 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
             expected_lines,
             keep_tones,
             decode_dir,
+            color,
             width,
             invert,
             gamma,
@@ -461,6 +467,7 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                 min_lines,
                 expected_lines,
                 filter_tones: !keep_tones,
+                ..SegmentImagesParams::default()
             };
             let bounds = find_image_bounds(&samples, sample_rate, &params);
             println!("{} image candidates", bounds.len());
@@ -492,25 +499,76 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                     ..DecoderParams::default()
                 };
                 let pipeline = DecodingPipeline::new();
-                for (idx, b) in bounds.iter().enumerate() {
-                    let window = &samples[b.start_sample..b.end_sample];
-                    let result = match pipeline.process(window, &decode_params, sample_rate) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!("image {idx} at {:.3}s failed to decode: {e:#}", start + b.start_secs);
-                            continue;
-                        }
-                    };
-                    let mut img = result.to_dynamic_image().context("building image")?;
+
+                let catalog = if color {
+                    if bounds.len() == crate::catalog::FRAMES_PER_CHANNEL {
+                        Some(crate::catalog::channel_catalog(channel.into()))
+                    } else {
+                        tracing::warn!(
+                            "--color: {} candidates != {} catalog frames; falling back to plain naming",
+                            bounds.len(),
+                            crate::catalog::FRAMES_PER_CHANNEL
+                        );
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let orient = |mut img: image::DynamicImage| {
                     if rotate {
                         img = img.rotate90();
                     }
                     if flip {
                         img = img.fliph();
                     }
-                    let path = dir.join(format!("image_{idx:03}_{:.3}s.png", start + b.start_secs));
+                    img
+                };
+
+                // Decode every frame first (pre-rotation), then composite
+                // triplets from the raw frames so plane geometry matches.
+                let mut frames: Vec<Option<crate::pipeline::PipelineResult>> = Vec::with_capacity(bounds.len());
+                for (idx, b) in bounds.iter().enumerate() {
+                    let window = &samples[b.start_sample..b.end_sample];
+                    match pipeline.process(window, &decode_params, sample_rate) {
+                        Ok(r) => frames.push(Some(r)),
+                        Err(e) => {
+                            tracing::warn!("image {idx} at {:.3}s failed to decode: {e:#}", start + b.start_secs);
+                            frames.push(None);
+                        }
+                    }
+                }
+
+                for (idx, (b, frame)) in bounds.iter().zip(&frames).enumerate() {
+                    let Some(frame) = frame else { continue };
+                    let img = orient(frame.to_dynamic_image().context("building image")?);
+                    let name = match catalog {
+                        Some(cat) => format!("image_{idx:03}_{}.png", slugify(cat[idx].label)),
+                        None => format!("image_{idx:03}_{:.3}s.png", start + b.start_secs),
+                    };
+                    let path = dir.join(name);
                     img.save(&path).with_context(|| format!("writing {}", path.display()))?;
-                    println!("  [{idx:03}] {} lines -> {}", result.height, path.display());
+                    println!("  [{idx:03}] {} lines -> {}", frame.height, path.display());
+                }
+
+                if let Some(cat) = catalog {
+                    for triplet in crate::catalog::color_triplets(channel.into()) {
+                        let [r, g, bl] = triplet;
+                        let (Some(fr), Some(fg), Some(fb)) = (&frames[r], &frames[g], &frames[bl]) else {
+                            tracing::warn!("triplet {r}-{bl}: missing decoded frame, skipping composite");
+                            continue;
+                        };
+                        let img = match crate::pipeline::composite_rgb(fr, fg, fb) {
+                            Ok(img) => orient(img),
+                            Err(e) => {
+                                tracing::warn!("triplet {r}-{bl}: composite failed: {e:#}");
+                                continue;
+                            }
+                        };
+                        let path = dir.join(format!("color_{r:03}-{bl:03}_{}.png", slugify(cat[r].label)));
+                        img.save(&path).with_context(|| format!("writing {}", path.display()))?;
+                        println!("  [color {r:03}-{bl:03}] -> {}", path.display());
+                    }
                 }
             }
         }
@@ -544,6 +602,25 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// File-name slug from a catalog label's title (the part before the credit).
+fn slugify(label: &str) -> String {
+    let title = label.split(',').next().unwrap_or(label);
+    let mut slug: String = title
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    while slug.contains("__") {
+        slug = slug.replace("__", "_");
+    }
+    slug.trim_matches('_').chars().take(48).collect()
 }
 
 fn print_stats_row(t: Option<f64>, s: &SignalStats) {
