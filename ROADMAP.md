@@ -215,12 +215,27 @@ functions surfaced as CLI subcommands, runnable against the real assets.
       cached waveform markers instead of rescanning with the FFT tone
       detector)
 
-### Phase 14 — Future
+### Phase 14 — Gate 2 at scale (in progress)
 
+- [x] Image-boundary segmentation (`analysis/segment.rs`, CLI `segment`):
+      sync-cadence-break detection splits the record into per-image
+      sample ranges; tone-classified runs (lead-in tone) are rejected.
+      On `golden_record_stereo_48k.wav` it finds 80 left / 77 right
+      candidates against the published 78 + 78 frame catalog, and
+      `--decode-dir` decodes every candidate to PNG in one command
+      (calibration circle, pulsar map/galaxy, definition slides all
+      verified recognizable).
+- [ ] Frame-triplet color: port a reference color-group lookup table
+      (foodini `voyager.cpp` / amazing-rando `voyager-decoder.py`),
+      composite 3 successive frames as R/G/B (frame order to verify
+      empirically: refs disagree on RGB vs BGR), naive stacking first —
+      per-line sync lock does the registration work
+- [ ] **Gate 2 acceptance:** catalog both channels side-by-side against
+      published reference decodes (MarcBaeuerle `main.ts` has the full
+      78-entry names/credits arrays per channel); reconcile the
+      off-by-a-couple candidate counts
 - [ ] Big-file streaming/mmap and decimated waveform cache (the 1.5 GB
       stereo rip currently implies ~3 GB resident)
-- [ ] **Gate 2 at scale:** catalog both channels against published
-      reference decodes; hardcoded color-group table
 - [ ] Playback-speed detection (sync-interval median ≈ 4.15 ms ⇒ 2×
       speed rip)
 - [ ] Decoder presets and session save/load (single-image export from

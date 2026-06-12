@@ -21,6 +21,7 @@ Prefer small, incremental changes that keep the app running.
   subcommands (flattened from `cli.rs`), and a `--load <wav>` GUI flag.
 - `cli.rs` — diagnostics harness: `decode` (time window → PNG with
   rotate/flip/invert/gamma), `spectrogram`, `syncs`, `classify`, `stats`,
+  `segment` (auto image-boundary catalog, optional per-image PNG decode),
   `carve`. Thin shims over `analysis/` + `pipeline`; this is the
   agent-facing iteration loop against the real assets in `assets/`.
 - `app.rs` (`VoyagerApp`) — composition root: UI layout, playback state,
@@ -41,8 +42,10 @@ Prefer small, incremental changes that keep the app running.
 - `analysis/` — `spectrogram` (STFT → labeled PNG), `stats` (RMS/peak/
   ZCR/crest/dominant), `classify` (silence/tone/image-periodic/broadband
   segments), `sync` (spike+falling-edge line detector, interval summary),
-  plus the one-shot `compute_spectrum` (linear magnitude; UI converts to
-  dB).
+  `segment` (per-image boundaries from sync-cadence breaks: split sync
+  runs where an interval exceeds `gap_factor`× the median, drop short
+  runs and tone-classified runs), plus the one-shot `compute_spectrum`
+  (linear magnitude; UI converts to dB).
 - `pipeline.rs`, `batch.rs` — decode pipeline (`PipelineResult` →
   egui/PNG images) and batch file processing; cancellation via
   `Arc<AtomicBool>` with Release/Acquire ordering.
@@ -64,7 +67,12 @@ Prefer small, incremental changes that keep the app running.
 Rip-specific decoding facts (verified): assets are float32 WAV; the
 48 kHz remaster needs no polarity inversion; decoded images need
 rotate90 + horizontal flip for correct orientation; lines are ~8.32 ms
-(≈400 samples at 48 kHz).
+(≈400 samples at 48 kHz). Catalog slots are ~5.8 s apart with ~550–750
+sync-locked lines per image (not the nominal 512); inter-image gaps
+show as 1.5–4× interval breaks in the sync cadence; the lead-in
+calibration tone sync-locks like an image and must be rejected by
+classification, not cadence. "Location of Our Solar System" is one
+published image containing both the galaxy picture and the pulsar map.
 
 ## Conventions
 

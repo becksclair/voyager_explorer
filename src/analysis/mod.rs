@@ -6,11 +6,13 @@
 
 pub mod classify;
 mod font;
+pub mod segment;
 pub mod spectrogram;
 pub mod stats;
 pub mod sync;
 
 pub use classify::{classify_segments, ClassifyParams, Segment, SegmentLabel};
+pub use segment::{find_image_bounds, ImageBounds, SegmentImagesParams};
 pub use spectrogram::{compute_spectrogram, render_spectrogram, Spectrogram, SpectrogramParams};
 pub use stats::{compute_stats, rolling_stats, SignalStats};
 pub use sync::{detect_line_syncs, interval_summary, IntervalSummary, SyncParams};

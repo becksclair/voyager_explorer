@@ -8,8 +8,8 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 
 use crate::analysis::{
-    classify_segments, compute_stats, detect_line_syncs, interval_summary, rolling_stats, ClassifyParams, SignalStats,
-    SpectrogramParams, SyncParams,
+    classify_segments, compute_stats, detect_line_syncs, find_image_bounds, interval_summary, rolling_stats, ClassifyParams,
+    SegmentImagesParams, SignalStats, SpectrogramParams, SyncParams,
 };
 use crate::audio::{WavReader, WaveformChannel};
 use crate::pipeline::DecodingPipeline;
@@ -131,6 +131,52 @@ pub enum DiagnosticsCommand {
         /// Also print rolling stats with this window length in seconds
         #[arg(long)]
         rolling: Option<f64>,
+    },
+
+    /// Find per-image boundaries from sync-cadence breaks; optionally decode
+    /// each detected image to a PNG
+    Segment {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long, default_value_t = 0.0)]
+        start: f64,
+        #[arg(short, long)]
+        duration: Option<f64>,
+        #[arg(short, long, value_enum, default_value_t = ChannelArg::Left)]
+        channel: ChannelArg,
+        /// Expected line duration in milliseconds
+        #[arg(long, default_value_t = 8.32)]
+        line_ms: f32,
+        /// Cadence-break threshold as a multiple of the median sync interval
+        #[arg(long, default_value_t = 1.5)]
+        gap_factor: f32,
+        /// Minimum scan lines for a run to count as an image
+        #[arg(long, default_value_t = 200)]
+        min_lines: usize,
+        /// Nominal lines per image (used for the confidence column)
+        #[arg(long, default_value_t = 600)]
+        expected_lines: usize,
+        /// Keep runs that classify as steady tone (lead-in/calibration tone)
+        #[arg(long, default_value_t = false)]
+        keep_tones: bool,
+        /// Decode each detected image to PNG files in this directory
+        #[arg(long)]
+        decode_dir: Option<PathBuf>,
+        /// Image width in pixels (decode)
+        #[arg(long, default_value_t = 512)]
+        width: u32,
+        /// Invert brightness polarity (decode, rip-dependent)
+        #[arg(long, default_value_t = false)]
+        invert: bool,
+        /// Gamma applied after normalization (decode)
+        #[arg(long, default_value_t = 1.0)]
+        gamma: f32,
+        /// Rotate output 90° clockwise (decode)
+        #[arg(long, default_value_t = false)]
+        rotate: bool,
+        /// Mirror the output horizontally (decode)
+        #[arg(long, default_value_t = false)]
+        flip: bool,
     },
 
     /// Cut a time window out of a WAV file into a new (mono) WAV file
@@ -384,6 +430,87 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                 println!("rolling ({window_secs}s windows):");
                 for (t, row) in rolling_stats(&samples, sample_rate, window_secs) {
                     print_stats_row(Some(start + t), &row);
+                }
+            }
+        }
+
+        DiagnosticsCommand::Segment {
+            input,
+            start,
+            duration,
+            channel,
+            line_ms,
+            gap_factor,
+            min_lines,
+            expected_lines,
+            keep_tones,
+            decode_dir,
+            width,
+            invert,
+            gamma,
+            rotate,
+            flip,
+        } => {
+            let (samples, sample_rate) = load_window(&input, start, duration, channel)?;
+            let params = SegmentImagesParams {
+                sync: SyncParams {
+                    expected_line_ms: line_ms,
+                    ..SyncParams::default()
+                },
+                gap_factor,
+                min_lines,
+                expected_lines,
+                filter_tones: !keep_tones,
+            };
+            let bounds = find_image_bounds(&samples, sample_rate, &params);
+            println!("{} image candidates", bounds.len());
+            println!(
+                "{:>4} {:>10} {:>10} {:>8} {:>7} {:>10} {:>6}",
+                "idx", "start_s", "end_s", "dur_s", "lines", "line_ms", "conf"
+            );
+            for (idx, b) in bounds.iter().enumerate() {
+                println!(
+                    "{idx:>4} {:>10.3} {:>10.3} {:>8.3} {:>7} {:>10.3} {:>6.2}",
+                    start + b.start_secs,
+                    start + b.end_secs,
+                    b.end_secs - b.start_secs,
+                    b.line_count,
+                    b.median_interval_samples / sample_rate as f64 * 1000.0,
+                    b.confidence,
+                );
+            }
+
+            if let Some(dir) = decode_dir {
+                std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+                let decode_params = DecoderParams {
+                    line_duration_ms: line_ms,
+                    invert,
+                    gamma,
+                    sync_lock: true,
+                    mode: DecoderMode::Grayscale,
+                    width,
+                    ..DecoderParams::default()
+                };
+                let pipeline = DecodingPipeline::new();
+                for (idx, b) in bounds.iter().enumerate() {
+                    let window = &samples[b.start_sample..b.end_sample];
+                    let result = match pipeline.process(window, &decode_params, sample_rate) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!("image {idx} at {:.3}s failed to decode: {e:#}", start + b.start_secs);
+                            continue;
+                        }
+                    };
+                    let mut img = result.to_dynamic_image().context("building image")?;
+                    if rotate {
+                        img = img.rotate90();
+                    }
+                    if flip {
+                        img = img.fliph();
+                    }
+                    let path = dir.join(format!("image_{idx:03}_{:.3}s.png", start + b.start_secs));
+                    img.save(&path).with_context(|| format!("writing {}", path.display()))?;
+                    println!("  [{idx:03}] {} lines -> {}", result.height, path.display());
                 }
             }
         }
