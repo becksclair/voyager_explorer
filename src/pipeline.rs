@@ -302,8 +302,12 @@ fn best_block_lag(a: &RegistrationBlock, b: &RegistrationBlock, max_lag: i64) ->
     let a_hi = (a.rows() * 4 / 5) as i64;
     // NCC noise scales with 1/sqrt(window); a tiny overlap at an extreme
     // lag can out-correlate the true peak by chance, so windows below
-    // half the central span don't compete.
-    let min_window = ((a_hi - a_lo) / 2).max(16);
+    // half the central span don't compete. The floor is capped at the
+    // lag-0 window: when `b` is much shorter than `a`, a half-span floor
+    // would disqualify lag 0 (or empty the curve entirely) while leaving
+    // only extreme lags eligible — a structurally forced misregistration.
+    let window_at_zero = a_hi.min(b.rows() as i64) - a_lo;
+    let min_window = ((a_hi - a_lo) / 2).min(window_at_zero).max(16);
     let mut curve: Vec<(i64, f64)> = Vec::new();
     for lag in -max_lag..=max_lag {
         let start = a_lo.max(-lag);
@@ -461,6 +465,26 @@ mod tests {
             .collect();
         assert_eq!(white_rows.len(), 1, "expected one fully aligned mark: {white_rows:?}");
         // No partially-colored rows: every other row must be black.
+        for y in 0..img.height() {
+            if y != white_rows[0] {
+                assert_eq!(img.get_pixel(3, y), &image::Rgb([0, 0, 0]), "row {y}");
+            }
+        }
+    }
+
+    #[test]
+    fn composite_registers_when_one_plane_is_much_shorter() {
+        // A blue plane a third the height of the others: the noise floor
+        // on the correlation window must not disqualify the small lags
+        // that are the only ones a short plane can support.
+        let r = banded_frame(900, 250);
+        let g = banded_frame(900, 256);
+        let b = banded_frame(300, 240);
+        let img = composite_rgb(&r, &g, &b).unwrap().to_rgb8();
+        let white_rows: Vec<u32> = (0..img.height())
+            .filter(|&y| img.get_pixel(3, y) == &image::Rgb([255, 255, 255]))
+            .collect();
+        assert_eq!(white_rows.len(), 1, "expected one fully aligned mark: {white_rows:?}");
         for y in 0..img.height() {
             if y != white_rows[0] {
                 assert_eq!(img.get_pixel(3, y), &image::Rgb([0, 0, 0]), "row {y}");
