@@ -227,17 +227,25 @@ functions surfaced as CLI subcommands, runnable against the real assets.
       verified recognizable).
 - [x] Frame-triplet color (`catalog.rs`, `pipeline::composite_rgb`, CLI
       `segment --color`): published 78-frame catalog with color roles and
-      labels (cross-validated across three reference decoders; R-G-B
-      frame order verified empirically on the Sunset triplet), row-offset
-      plane registration via luminance-profile correlation, all 20
-      triplets composited. Segmentation cleanup (merge false splits,
-      split fused runs against the median slot length) brings both
-      channels to exactly 78/78.
+      labels (cross-validated across three reference decoders),
+      row-offset plane registration via luminance-profile correlation,
+      all 20 triplets composited with bounds normalized jointly across
+      the three planes. Triplet frame order is **blue, green, red** —
+      verified empirically (Sunset, Monument Valley, Fallen Leaves);
+      foodini's and MarcBaeuerle's red-first labels are wrong for this
+      rip, amazing-rando's README is right. Segmentation cleanup (merge
+      false splits, split fused runs against the median slot length)
+      brings both channels to exactly 78/78.
+- [x] Predictive sync tracking (`track_line_syncs`): per-line lock with
+      coasting fixes the frames that decoded as vertical shreds (dark
+      photographs: Microscope, Sunset members) and removes composite
+      ghosting (Human Anatomy).
 - [ ] **Gate 2 acceptance:** review all 156 frames + 20 composites
-      side-by-side against published reference decodes; fix the residual
-      composite quality gaps (plane fringing on some triplets, hue casts
-      from per-frame percentile normalization — normalize planes jointly
-      per triplet)
+      side-by-side against published reference decodes. Known composite
+      gaps: washed-out saturation / blown highlights (joint bounds are
+      stretched by the junk/leader regions that dominate the pixel
+      population — compute bounds over registered content only), and
+      registration failure on triplets with large junk bands (Sunset)
 - [ ] Big-file streaming/mmap and decimated waveform cache (the 1.5 GB
       stereo rip currently implies ~3 GB resident)
 - [ ] Playback-speed detection (sync-interval median ≈ 4.15 ms ⇒ 2×

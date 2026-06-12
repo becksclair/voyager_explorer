@@ -240,80 +240,14 @@ impl SstvDecoder {
     /// Returns [`DecoderError::InvalidParams`] if gamma is out of range 0.1-10.
     /// Returns [`DecoderError::InsufficientSamples`] if buffer is too short.
     pub fn decode(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Result<Vec<u8>> {
-        // Validate parameters
-        if !(1.0..=100.0).contains(&params.line_duration_ms) {
-            return Err(VoyagerError::Decoder(DecoderError::InvalidLineDuration {
-                duration_ms: params.line_duration_ms,
-            }));
-        }
-
-        if !(0.1..=10.0).contains(&params.gamma) {
-            return Err(VoyagerError::Decoder(DecoderError::InvalidParams {
-                reason: format!("gamma {} out of range 0.1-10.0", params.gamma),
-            }));
-        }
-
-        // Validate samples
-        if samples.is_empty() {
-            return Err(VoyagerError::Decoder(DecoderError::InsufficientSamples {
-                needed: 1,
-                actual: 0,
-            }));
-        }
-
-        let samples_per_line = (params.line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
-        if samples_per_line == 0 {
-            return Err(VoyagerError::Decoder(DecoderError::InvalidParams {
-                reason: format!(
-                    "Calculated samples_per_line is 0 (line_duration={}, sample_rate={})",
-                    params.line_duration_ms, sample_rate
-                ),
-            }));
-        }
-
-        if samples.len() < samples_per_line {
-            return Err(VoyagerError::Decoder(DecoderError::InsufficientSamples {
-                needed: samples_per_line,
-                actual: samples.len(),
-            }));
-        }
-
+        let levels = self.decode_levels(samples, params, sample_rate)?;
         let width = params.effective_width();
-        let max_lines = 16_384; // GPU texture limit
-
-        // --- Line segmentation ---
-        // Sync-locked when the detector finds a consistent line cadence;
-        // otherwise fixed-period slicing at the nominal duration. Re-anchoring
-        // at every detected sync keeps timing error from accumulating (slant).
-        let line_ranges = self.segment_lines(samples, params, sample_rate, samples_per_line, max_lines);
-        let lines_decoded = line_ranges.len();
-
-        // --- Per-line level extraction ---
-        // Resample each line to `width` luminance levels. Bin-averaging on
-        // downsample doubles as the anti-alias filter; linear interpolation
-        // covers the upsample case (e.g. 400 samples/line at 48 kHz -> 512 px).
-        let mut levels: Vec<f32> = Vec::with_capacity(width * lines_decoded);
-        for range in &line_ranges {
-            let slice = &samples[range.clone()];
-            resample_line(slice, width, &mut levels);
-        }
+        let lines_decoded = levels.len() / width;
 
         // --- Normalization ---
         // Percentile contrast stretch is robust to sync-spike outliers.
         let (lo, hi) = percentile_bounds(&levels, 0.01, 0.99);
-        let span = (hi - lo).max(1e-6);
-        let inv_gamma = 1.0 / params.gamma;
-        let mut image: Vec<u8> = Vec::with_capacity(levels.len());
-        for &level in &levels {
-            let mut v = ((level - lo) / span).clamp(0.0, 1.0);
-            if params.invert {
-                v = 1.0 - v;
-            }
-            if params.gamma != 1.0 {
-                v = v.powf(inv_gamma);
-            }
-            image.push((v * 255.0).round() as u8);
-        }
+        let mut image = normalize_levels(&levels, lo, hi, params.invert, params.gamma);
 
         // Post-process for PseudoColor mode
         if params.mode == DecoderMode::PseudoColor {
@@ -361,6 +295,71 @@ impl SstvDecoder {
         tracing::debug!(lines_decoded, pixels = image.len(), "Decode operation completed");
 
         Ok(image)
+    }
+
+    /// Decode to raw per-pixel luminance levels (row-major, `width` per
+    /// line), before any normalization, inversion, or gamma. This is the
+    /// input for joint normalization across the frames of a color triplet,
+    /// where stretching each frame by its own bounds would skew the color
+    /// balance.
+    pub fn decode_levels(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Result<Vec<f32>> {
+        // Validate parameters
+        if !(1.0..=100.0).contains(&params.line_duration_ms) {
+            return Err(VoyagerError::Decoder(DecoderError::InvalidLineDuration {
+                duration_ms: params.line_duration_ms,
+            }));
+        }
+
+        if !(0.1..=10.0).contains(&params.gamma) {
+            return Err(VoyagerError::Decoder(DecoderError::InvalidParams {
+                reason: format!("gamma {} out of range 0.1-10.0", params.gamma),
+            }));
+        }
+
+        // Validate samples
+        if samples.is_empty() {
+            return Err(VoyagerError::Decoder(DecoderError::InsufficientSamples {
+                needed: 1,
+                actual: 0,
+            }));
+        }
+
+        let samples_per_line = (params.line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
+        if samples_per_line == 0 {
+            return Err(VoyagerError::Decoder(DecoderError::InvalidParams {
+                reason: format!(
+                    "Calculated samples_per_line is 0 (line_duration={}, sample_rate={})",
+                    params.line_duration_ms, sample_rate
+                ),
+            }));
+        }
+
+        if samples.len() < samples_per_line {
+            return Err(VoyagerError::Decoder(DecoderError::InsufficientSamples {
+                needed: samples_per_line,
+                actual: samples.len(),
+            }));
+        }
+
+        let width = params.effective_width();
+        let max_lines = 16_384; // GPU texture limit
+
+        // --- Line segmentation ---
+        // Sync-locked when the detector finds a consistent line cadence;
+        // otherwise fixed-period slicing at the nominal duration. Re-anchoring
+        // at every detected sync keeps timing error from accumulating (slant).
+        let line_ranges = self.segment_lines(samples, params, sample_rate, samples_per_line, max_lines);
+
+        // --- Per-line level extraction ---
+        // Resample each line to `width` luminance levels. Bin-averaging on
+        // downsample doubles as the anti-alias filter; linear interpolation
+        // covers the upsample case (e.g. 400 samples/line at 48 kHz -> 512 px).
+        let mut levels: Vec<f32> = Vec::with_capacity(width * line_ranges.len());
+        for range in &line_ranges {
+            let slice = &samples[range.clone()];
+            resample_line(slice, width, &mut levels);
+        }
+        Ok(levels)
     }
 
     /// Segment samples into per-line ranges. Prefers sync-locked boundaries;
@@ -466,11 +465,33 @@ fn resample_line(slice: &[f32], width: usize, out: &mut Vec<f32>) {
     }
 }
 
+/// Map raw luminance levels to 8-bit pixels: linear stretch over `[lo, hi]`,
+/// optional inversion, optional gamma. Shared by per-frame decoding (bounds
+/// from the frame itself) and color-triplet compositing (bounds computed
+/// jointly over the three planes).
+pub fn normalize_levels(levels: &[f32], lo: f32, hi: f32, invert: bool, gamma: f32) -> Vec<u8> {
+    let span = (hi - lo).max(1e-6);
+    let inv_gamma = 1.0 / gamma;
+    levels
+        .iter()
+        .map(|&level| {
+            let mut v = ((level - lo) / span).clamp(0.0, 1.0);
+            if invert {
+                v = 1.0 - v;
+            }
+            if gamma != 1.0 {
+                v = v.powf(inv_gamma);
+            }
+            (v * 255.0).round() as u8
+        })
+        .collect()
+}
+
 /// Robust lower/upper bounds of `values` at the given percentiles.
 ///
 /// Non-finite values (NaN/Inf from corrupt float WAVs) are excluded so they
 /// cannot poison the normalization span and silently black out the image.
-fn percentile_bounds(values: &[f32], lo_pct: f64, hi_pct: f64) -> (f32, f32) {
+pub fn percentile_bounds(values: &[f32], lo_pct: f64, hi_pct: f64) -> (f32, f32) {
     let mut finite: Vec<f32> = values.iter().copied().filter(|v| v.is_finite()).collect();
     if finite.is_empty() {
         return (0.0, 1.0);

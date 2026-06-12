@@ -552,22 +552,52 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                 }
 
                 if let Some(cat) = catalog {
+                    // Composite from raw levels with bounds computed jointly
+                    // over the three planes: stretching each frame by its own
+                    // bounds (what the individual PNGs get) skews the color
+                    // balance between planes.
+                    let decoder = crate::sstv::SstvDecoder::new();
+                    let plane_width = decode_params.effective_width();
                     for triplet in crate::catalog::color_triplets(channel.into()) {
-                        let [r, g, bl] = triplet;
-                        let (Some(fr), Some(fg), Some(fb)) = (&frames[r], &frames[g], &frames[bl]) else {
-                            tracing::warn!("triplet {r}-{bl}: missing decoded frame, skipping composite");
+                        let [r, _, bl] = triplet;
+                        let mut planes: Vec<Vec<f32>> = Vec::with_capacity(3);
+                        for &idx in &triplet {
+                            let b = &bounds[idx];
+                            let window = &samples[b.start_sample..b.end_sample];
+                            match decoder.decode_levels(window, &decode_params, sample_rate) {
+                                Ok(levels) => planes.push(levels),
+                                Err(e) => {
+                                    tracing::warn!("triplet {r}-{bl}: frame {idx} failed to decode: {e:#}");
+                                    break;
+                                }
+                            }
+                        }
+                        if planes.len() != 3 {
                             continue;
-                        };
-                        let img = match crate::pipeline::composite_rgb(fr, fg, fb) {
+                        }
+                        let joint: Vec<f32> = planes.iter().flatten().copied().collect();
+                        let (lo, hi) = crate::sstv::percentile_bounds(&joint, 0.01, 0.99);
+                        let triplet_frames: Vec<crate::pipeline::PipelineResult> = planes
+                            .iter()
+                            .map(|levels| crate::pipeline::PipelineResult {
+                                pixels: crate::sstv::normalize_levels(levels, lo, hi, invert, gamma),
+                                width: plane_width as u32,
+                                height: (levels.len() / plane_width) as u32,
+                                mode: DecoderMode::Grayscale,
+                            })
+                            .collect();
+                        let img = match crate::pipeline::composite_rgb(&triplet_frames[0], &triplet_frames[1], &triplet_frames[2])
+                        {
                             Ok(img) => orient(img),
                             Err(e) => {
                                 tracing::warn!("triplet {r}-{bl}: composite failed: {e:#}");
                                 continue;
                             }
                         };
-                        let path = dir.join(format!("color_{r:03}-{bl:03}_{}.png", slugify(cat[r].label)));
+                        let (first, last) = (triplet.iter().min().unwrap(), triplet.iter().max().unwrap());
+                        let path = dir.join(format!("color_{first:03}-{last:03}_{}.png", slugify(cat[*first].label)));
                         img.save(&path).with_context(|| format!("writing {}", path.display()))?;
-                        println!("  [color {r:03}-{bl:03}] -> {}", path.display());
+                        println!("  [color {first:03}-{last:03}] -> {}", path.display());
                     }
                 }
             }
