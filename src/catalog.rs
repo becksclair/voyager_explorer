@@ -54,9 +54,12 @@ pub fn color_triplets(channel: WaveformChannel) -> Vec<[usize; 3]> {
     let mut i = 0;
     while i < catalog.len() {
         if catalog[i].color == ColorRole::Blu {
-            debug_assert!(i + 2 < catalog.len());
-            debug_assert_eq!(catalog[i + 1].color, ColorRole::Grn);
-            debug_assert_eq!(catalog[i + 2].color, ColorRole::Red);
+            // Real asserts, not debug_assert: the pushed indices are used as
+            // unchecked subscripts downstream, so a mis-transcribed table
+            // must fail loudly here in every build profile.
+            assert!(i + 2 < catalog.len(), "trailing Blu at {i} has no Grn/Red");
+            assert_eq!(catalog[i + 1].color, ColorRole::Grn, "malformed triplet at {i}");
+            assert_eq!(catalog[i + 2].color, ColorRole::Red, "malformed triplet at {i}");
             triplets.push([i + 2, i + 1, i]);
             i += 3;
         } else {
