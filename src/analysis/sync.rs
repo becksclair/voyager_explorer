@@ -87,6 +87,122 @@ pub fn detect_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams)
         .collect()
 }
 
+/// Track scan-line sync positions with a predictive lock.
+///
+/// The global detector ([`detect_line_syncs`]) picks the tallest peaks
+/// anywhere, which mistimes or drops lines whenever image content rivals
+/// the sync spike (dark photographs, dropouts). Reference decoders instead
+/// predict each next sync at `previous + period` and search only a narrow
+/// window around the prediction, coasting on the prediction when no
+/// credible peak appears. This does that: it seeds from the global
+/// detector's first coherent position, then walks the buffer line by line,
+/// slowly adapting the period estimate (slant) from accepted peaks.
+pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) -> Vec<usize> {
+    let detected = detect_line_syncs(samples, sample_rate, params);
+    let Some(summary) = interval_summary(&detected, sample_rate) else {
+        return detected;
+    };
+
+    let nominal = (params.expected_line_ms / 1000.0 * sample_rate as f32) as f64;
+    // Start from the detected cadence when it is plausibly the line cadence.
+    // When it is not — weak-sync lines get swallowed by the detector's
+    // min-spacing dedup, doubling the apparent median — trust the nominal
+    // period and let per-line locking prove itself (the lock-fraction guard
+    // below rejects the result if it can't).
+    let mut period = if (summary.median_samples - nominal).abs() / nominal < 0.3 {
+        summary.median_samples
+    } else {
+        nominal
+    };
+
+    let robust_max = percentile_abs(samples, 0.999);
+    if robust_max <= 0.0 {
+        return detected;
+    }
+    let threshold = robust_max * params.peak_height;
+    // Search radius around each prediction: tight enough that content peaks
+    // elsewhere in the line can't capture the lock (reference decoders use
+    // 1-6% of the period).
+    let search = ((period * 0.06) as usize).max(2);
+    // The dip follows the spike within a few samples; searching further
+    // lets dark content masquerade as the falling edge.
+    let edge_search = ((period * 0.05) as usize).max(4);
+
+    // Seed at the first detected sync that starts a coherent pair.
+    let seed = detected
+        .windows(2)
+        .find(|w| ((w[1] - w[0]) as f64 - period).abs() / period < 0.1)
+        .map(|w| w[0])
+        .unwrap_or(detected[0]);
+
+    let mut positions = vec![seed];
+    let mut pos = seed as f64;
+    let mut locked = 0usize;
+    loop {
+        let predict = pos + period;
+        if predict + period > samples.len() as f64 {
+            break;
+        }
+        let center = predict.round() as usize;
+        let lo = center.saturating_sub(search);
+        let hi = (center + search).min(samples.len() - 1);
+
+        // Always take the window maximum as the spike candidate — real sync
+        // spikes persist even in dark lines, just attenuated, and the tight
+        // window is what keeps content peaks from capturing the lock.
+        // Thresholding here would force long coasts through dark regions,
+        // and the accumulated period error shears the image.
+        // Ties (flat plateaus) break toward the prediction so featureless
+        // stretches don't walk the anchor to the window edge.
+        let peak = (lo..=hi)
+            .max_by(|&a, &b| {
+                samples[a]
+                    .partial_cmp(&samples[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.abs_diff(center).cmp(&a.abs_diff(center)))
+            })
+            .expect("window is non-empty");
+
+        // Falling edge after the peak marks the true line start.
+        let end = (peak + edge_search).min(samples.len());
+        let mut min_idx = peak;
+        for j in peak..end {
+            if samples[j] < samples[min_idx] {
+                min_idx = j;
+            }
+        }
+        // Re-anchor only on a sync-like event: a genuine spike-to-dip swing
+        // (attenuated syncs in dark lines still swing harder than content
+        // noise) at a plausible interval. Anchoring on anything weaker
+        // randomizes line starts in dark regions; coasting there is what
+        // keeps the image coherent.
+        let swing = samples[peak] - samples[min_idx];
+        let interval = min_idx as f64 - pos;
+        let next = if swing > threshold * 0.6 && (interval - period).abs() / period < 0.06 {
+            // Adapt the period gently: locks at the tolerance edge must not
+            // drag the cadence estimate the coasting depends on.
+            period = period * 0.95 + interval * 0.05;
+            if swing > threshold {
+                locked += 1;
+            }
+            min_idx as f64
+        } else {
+            // No credible sync (dark line, dropout, boundary junk): coast.
+            predict
+        };
+        positions.push(next.round() as usize);
+        pos = next;
+    }
+
+    // A track that mostly coasted never found real line structure (music,
+    // noise): hand back the raw detections so the caller's cadence check
+    // can reject sync lock and fall through to fixed-period slicing.
+    if locked < positions.len() / 4 {
+        return detected;
+    }
+    positions
+}
+
 /// Summary of intervals between consecutive sync positions.
 #[derive(Debug, Clone)]
 pub struct IntervalSummary {
@@ -192,6 +308,73 @@ mod tests {
             let offset = p % 400;
             assert!((5..=8).contains(&offset), "line start at offset {offset} not in dip");
         }
+    }
+
+    /// Lines where some sync spikes are attenuated and the content holds a
+    /// bright distractor peak mid-line: the global detector mistimes these,
+    /// the tracker must hold the cadence.
+    fn weak_sync_lines(n_lines: usize, period: usize) -> Vec<f32> {
+        let mut out = Vec::with_capacity(n_lines * period);
+        for line in 0..n_lines {
+            let weak = line % 3 == 1;
+            for i in 0..period {
+                let v = match i {
+                    0..=4 => {
+                        if weak {
+                            0.25
+                        } else {
+                            1.0
+                        }
+                    }
+                    5..=8 => -0.8,
+                    200..=210 if weak => 0.95, // bright content distractor
+                    _ => 0.2,
+                };
+                out.push(v);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn tracker_holds_cadence_through_weak_syncs() {
+        let period = 400usize;
+        let n_lines = 60;
+        let samples = weak_sync_lines(n_lines, period);
+
+        let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
+        assert!(
+            (tracked.len() as i64 - n_lines as i64).abs() <= 3,
+            "expected ~{n_lines} lines, got {}",
+            tracked.len()
+        );
+        // Every tracked start must sit at the line cadence (dip region of
+        // its line), within a couple of samples of coasting error.
+        for &p in &tracked {
+            let offset = p % period;
+            assert!((4..=11).contains(&offset), "tracked start at offset {offset} is off-cadence");
+        }
+
+        // Sanity: the global detector alone fails this fixture — its
+        // min-spacing dedup swallows the weak lines (taller distractor or
+        // neighbor wins), losing roughly every third line. If this starts
+        // passing, the fixture stopped stressing the tracker.
+        let detected = detect_line_syncs(&samples, 48_000, &SyncParams::default());
+        let mistimed = detected.iter().filter(|&&p| !(4..=11).contains(&(p % period))).count();
+        assert!(
+            mistimed > 0 || detected.len() < n_lines - 5,
+            "global detector unexpectedly perfect on weak-sync fixture ({} positions)",
+            detected.len()
+        );
+    }
+
+    #[test]
+    fn tracker_matches_detector_on_clean_signal() {
+        let samples = synthetic_lines(50, 400);
+        let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
+        let summary = interval_summary(&tracked, 48_000).unwrap();
+        assert!((summary.median_samples - 400.0).abs() < 2.0);
+        assert!(summary.std_samples < 3.0, "jitter {}", summary.std_samples);
     }
 
     #[test]

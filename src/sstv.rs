@@ -2,7 +2,7 @@ use std::f32::consts::PI;
 
 use realfft::{RealFftPlanner, RealToComplex};
 
-use crate::analysis::sync::{detect_line_syncs, interval_summary, SyncParams};
+use crate::analysis::sync::{interval_summary, track_line_syncs, SyncParams};
 use crate::error::{DecoderError, Result, VoyagerError};
 
 /// Calibration tone frequency in Hz. Long ~1200 Hz tone regions precede image
@@ -379,7 +379,7 @@ impl SstvDecoder {
                 expected_line_ms: params.line_duration_ms,
                 ..SyncParams::default()
             };
-            let positions = detect_line_syncs(samples, sample_rate, &sync_params);
+            let positions = track_line_syncs(samples, sample_rate, &sync_params);
             if let Some(summary) = interval_summary(&positions, sample_rate) {
                 let median = summary.median_samples;
                 let nominal = samples_per_line as f64;
