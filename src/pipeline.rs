@@ -119,6 +119,7 @@ pub fn composite_rgb(red: &PipelineResult, grn: &PipelineResult, blu: &PipelineR
             frame.mode
         );
     }
+    anyhow::ensure!(red.width > 0, "zero-width frame in triplet");
     anyhow::ensure!(
         red.width == grn.width && grn.width == blu.width,
         "frame widths differ: {} / {} / {}",
@@ -129,11 +130,11 @@ pub fn composite_rgb(red: &PipelineResult, grn: &PipelineResult, blu: &PipelineR
     let min_height = red.height.min(grn.height).min(blu.height);
     anyhow::ensure!(min_height > 0, "empty frame in triplet");
 
-    let max_lag = (min_height / 3).clamp(1, 256) as i64;
-    let width = red.width as usize;
-    let block_r = registration_block(&red.pixels, width);
-    let lag_g = best_block_lag(&block_r, &registration_block(&grn.pixels, width), max_lag);
-    let lag_b = best_block_lag(&block_r, &registration_block(&blu.pixels, width), max_lag);
+    let (lag_g, lag_b) = registration_lags(
+        [red.pixels.as_slice(), grn.pixels.as_slice(), blu.pixels.as_slice()],
+        red.width as usize,
+        min_height as usize,
+    );
     stack_registered(red, grn, blu, lag_g, lag_b)
 }
 
@@ -175,9 +176,11 @@ fn stack_registered(
 
 /// Composite a color triplet from raw decoded levels (red, green, blue
 /// planes, row-major at `width` per line). Percentile bounds are computed
-/// jointly over the three planes — stretching each frame by its own bounds
-/// would skew the color balance — then the planes are normalized with the
-/// shared transform, registered, and stacked via [`composite_rgb`].
+/// jointly over the three planes' content regions — stretching each frame
+/// by its own bounds would skew the color balance. Registration runs on
+/// the raw levels *before* normalization (clipping to the joint bounds
+/// can flatten a plane and starve the correlation); the planes are then
+/// normalized with the shared transform and stacked at the found lags.
 pub fn composite_triplet_levels(planes: [&[f32]; 3], width: usize, invert: bool, gamma: f32) -> Result<DynamicImage> {
     anyhow::ensure!(width > 0, "width must be non-zero");
     let mut joint: Vec<f32> = planes.iter().flat_map(|p| content_levels(p, width)).collect();
@@ -186,15 +189,9 @@ pub fn composite_triplet_levels(planes: [&[f32]; 3], width: usize, invert: bool,
     }
     let (lo, hi) = crate::sstv::percentile_bounds(&joint, 0.01, 0.99);
 
-    // Register on the raw levels, not the normalized pixels: the
-    // content-region bounds clip levels outside [lo, hi] to 0/255, which
-    // can flatten a plane's structure and starve the correlation.
     let min_height = planes.iter().map(|p| p.len() / width).min().unwrap_or(0);
     anyhow::ensure!(min_height > 0, "empty plane in triplet");
-    let max_lag = (min_height as u32 / 3).clamp(1, 256) as i64;
-    let block_r = registration_block(planes[0], width);
-    let lag_g = best_block_lag(&block_r, &registration_block(planes[1], width), max_lag);
-    let lag_b = best_block_lag(&block_r, &registration_block(planes[2], width), max_lag);
+    let (lag_g, lag_b) = registration_lags(planes, width, min_height);
 
     let frames: Vec<PipelineResult> = planes
         .iter()
@@ -208,23 +205,33 @@ pub fn composite_triplet_levels(planes: [&[f32]; 3], width: usize, invert: bool,
     stack_registered(&frames[0], &frames[1], &frames[2], lag_g, lag_b)
 }
 
-/// Levels from a plane's content region: central columns (line-start sync
-/// residue and row-end junk, as in [`row_profile`]) and central rows
-/// (inter-image leader bands sit at the frame edges) are excluded.
-/// Segmented frames can carry 15–25% junk pixels; letting them into the
-/// percentile population stretches the bounds far past the content range
-/// and washes the composite out.
+/// Central-column window shared by content-bounds gathering and plane
+/// registration: line starts hold sync residue, line ends hold edge junk.
+/// Non-empty and within `0..width` for every `width >= 1`.
+fn content_cols(width: usize) -> std::ops::Range<usize> {
+    let lo = width / 5;
+    let hi = ((width * 9) / 10).max(lo + 1).min(width);
+    lo..hi
+}
+
+/// Levels from a plane's content region: central columns (see
+/// [`content_cols`]) and central rows (inter-image leader bands sit at
+/// the frame edges; the 15–85% row window is looser than the 20–80%
+/// correlation window in [`best_block_lag`] because the bounds only need
+/// the junk *minority*, not exclusion of every edge row). Segmented
+/// frames can carry 15–25% junk pixels; letting them into the percentile
+/// population stretches the bounds far past the content range and washes
+/// the composite out.
 fn content_levels(levels: &[f32], width: usize) -> impl Iterator<Item = f32> + '_ {
     let rows = levels.len() / width;
     let row_lo = rows * 3 / 20;
     let row_hi = ((rows * 17) / 20).max((row_lo + 1).min(rows));
-    let col_lo = width / 5;
-    let col_hi = ((width * 9) / 10).max(col_lo + 1).min(width);
+    let cols = content_cols(width);
     levels
         .chunks_exact(width)
         .skip(row_lo)
         .take(row_hi.saturating_sub(row_lo))
-        .flat_map(move |row| row[col_lo.min(col_hi)..col_hi].iter().copied())
+        .flat_map(move |row| row[cols.clone()].iter().copied())
 }
 
 /// Per-scan-line-demeaned content block for plane registration: the
@@ -251,23 +258,37 @@ impl RegistrationBlock {
 }
 
 fn registration_block<T: Copy + Into<f64>>(levels: &[T], width: usize) -> RegistrationBlock {
-    let col_lo = width / 5;
-    let col_hi = ((width * 9) / 10).max(col_lo + 1).min(width);
-    let col_lo = col_lo.min(col_hi);
-    let bw = col_hi - col_lo;
-    let mut data = Vec::with_capacity((levels.len() / width.max(1)) * bw);
+    let cols = content_cols(width);
+    let bw = cols.len();
+    let mut data = Vec::with_capacity((levels.len() / width) * bw);
     for row in levels.chunks_exact(width) {
-        let seg = &row[col_lo..col_hi];
+        let seg = &row[cols.clone()];
         let mean = seg.iter().map(|&v| v.into()).sum::<f64>() / bw as f64;
         data.extend(seg.iter().map(|&v| v.into() - mean));
     }
     RegistrationBlock { data, width: bw }
 }
 
+/// Lag search radius: a third of the shortest plane, capped. Real plane
+/// offsets on the 48 kHz rip reach ~170 lines (Human Anatomy), so a
+/// tighter cap silently pins the search at its bound.
+const REG_MAX_LAG_CAP: i64 = 256;
+
+/// Row offsets of the green and blue planes relative to the red plane,
+/// from 2D NCC over the planes' registration blocks.
+fn registration_lags<T: Copy + Into<f64>>(planes: [&[T]; 3], width: usize, min_height: usize) -> (i64, i64) {
+    let max_lag = ((min_height / 3) as i64).clamp(1, REG_MAX_LAG_CAP);
+    let block_r = registration_block(planes[0], width);
+    let lag_g = best_block_lag(&block_r, &registration_block(planes[1], width), max_lag);
+    let lag_b = best_block_lag(&block_r, &registration_block(planes[2], width), max_lag);
+    (lag_g, lag_b)
+}
+
 /// How close to the correlation peak a lag must be to count as equivalent.
-/// Among equivalent lags the smallest |lag| wins: when the correlation
-/// curve is flat (featureless slides) the argmax is noise, and a small
-/// shift is always the safer choice.
+/// Among equivalent lags the smallest |lag| wins (a tie between ±k
+/// resolves to -k): when the correlation curve is flat (featureless
+/// slides) the argmax is noise, and a small shift is always the safer
+/// choice.
 const REG_PEAK_DELTA: f64 = 0.002;
 
 /// Row offset of `b` relative to `a` maximizing the 2D normalized
@@ -279,11 +300,15 @@ fn best_block_lag(a: &RegistrationBlock, b: &RegistrationBlock, max_lag: i64) ->
     debug_assert_eq!(a.width, b.width);
     let a_lo = (a.rows() / 5) as i64;
     let a_hi = (a.rows() * 4 / 5) as i64;
+    // NCC noise scales with 1/sqrt(window); a tiny overlap at an extreme
+    // lag can out-correlate the true peak by chance, so windows below
+    // half the central span don't compete.
+    let min_window = ((a_hi - a_lo) / 2).max(16);
     let mut curve: Vec<(i64, f64)> = Vec::new();
     for lag in -max_lag..=max_lag {
         let start = a_lo.max(-lag);
         let end = a_hi.min(b.rows() as i64 - lag);
-        if end - start < 16 {
+        if end - start < min_window {
             continue;
         }
         let (mut num, mut va, mut vb) = (0.0, 0.0, 0.0);
@@ -300,11 +325,7 @@ fn best_block_lag(a: &RegistrationBlock, b: &RegistrationBlock, max_lag: i64) ->
         }
         curve.push((lag, num / (va * vb).sqrt()));
     }
-    let Some(peak) = curve
-        .iter()
-        .map(|&(_, c)| c)
-        .fold(None, |m: Option<f64>, c| Some(m.map_or(c, |m| m.max(c))))
-    else {
+    let Some(peak) = curve.iter().map(|&(_, c)| c).reduce(f64::max) else {
         return 0;
     };
     curve
@@ -384,7 +405,7 @@ mod tests {
 
     #[test]
     fn composite_crops_to_smallest_height_and_maps_planes() {
-        // Flat planes: degenerate profiles, no registration shift.
+        // Flat planes: degenerate registration blocks, no shift.
         let r = gray_frame(4, 10, 200);
         let g = gray_frame(4, 8, 100);
         let b = gray_frame(4, 9, 50);
