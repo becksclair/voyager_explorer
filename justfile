@@ -101,6 +101,16 @@ coverage:
 docs:
     cargo doc --open
 
+# Regenerate the multi-image test excerpt from the 48 kHz stereo rip:
+# left channel, lead-in tone + 16 frames (calibration circle through the
+# "Home"/Earth color triplet). Both WAVs are gitignored; this needs the
+# source rip present in assets/.
+fixtures:
+    cargo run --quiet -- carve --input assets/golden_record_stereo_48k.wav \
+        --start 11.0 --duration 98.0 --channel left \
+        --out assets/golden_record_excerpt_48k.wav
+    @echo "✓ assets/golden_record_excerpt_48k.wav — 16 frames (calibration → Earth)"
+
 # Run all CI checks (excluding builds) - run this before pushing
 ci: fmt-check clippy-all test-all check-all
     @echo "✓ All CI checks passed!"
