@@ -14,6 +14,14 @@ Prefer small, incremental changes that keep the app running.
 - **Before declaring any task complete, run `just ci`** — format check,
   clippy and tests on both feature configurations, type checks.
   `just --list` shows all recipes.
+- Test assets (gitignored): `assets/sync_image1.wav` is the
+  calibration-circle-only oracle; `assets/golden_record_excerpt_48k.wav`
+  is the multi-image fixture (left channel, lead-in tone + 16 frames,
+  calibration circle through the "Home"/Earth color triplet, including the
+  ill-posed Solar Spectrum triplet). Regenerate it with `just fixtures`
+  from the source 48 kHz rip. Ignored integration tests in
+  `tests/excerpt_fixture_tests.rs` (segments-into-16, Earth-triplet
+  composites) run with `cargo test --test excerpt_fixture_tests -- --ignored`.
 
 ## Architecture
 
@@ -25,7 +33,10 @@ Prefer small, incremental changes that keep the app running.
   `carve`. Thin shims over `analysis/` + `pipeline`; this is the
   agent-facing iteration loop against the real assets in `assets/`.
 - `app.rs` (`VoyagerApp`) — composition root: UI layout, playback state,
-  and panel wiring. Orchestration lives in `services/`.
+  and panel wiring. Orchestration lives in `services/`. The preview
+  decodes one whole image at the playhead, from per-image ranges
+  (`find_image_bounds`) scanned in the background on load/channel switch;
+  until they arrive it decodes a `decode_window_secs` window instead.
 - `audio.rs` (`WavReader`) — WAV loading/normalization: float32 and
   integer PCM at any rate ≥ 8 kHz (the masters are 384 kHz float32);
   `from_file_range` for windowed reads of huge files; samples live in
@@ -41,13 +52,16 @@ Prefer small, incremental changes that keep the app running.
   real Voyager color (frame triplets) is Phase 14.
 - `analysis/` — `spectrogram` (STFT → labeled PNG), `stats` (RMS/peak/
   ZCR/crest/dominant), `classify` (silence/tone/image-periodic/broadband
-  segments), `sync` (spike+falling-edge line detector, interval summary),
+  segments), `sync` (spike+falling-edge line detector, predictive
+  tracker with per-line jitter smoothing, interval summary),
   `segment` (per-image boundaries from sync-cadence breaks: split sync
   runs where an interval exceeds `gap_factor`× the median, drop short
   runs and tone-classified runs), plus the one-shot `compute_spectrum`
   (linear magnitude; UI converts to dB).
 - `pipeline.rs`, `batch.rs` — decode pipeline (`PipelineResult` →
-  egui/PNG images), triplet compositing (`composite_triplet_levels`:
+  egui/PNG images; `to_egui_image(crop_sync)` transposes to the published
+  orientation and optionally crops the sync/leader margins, display-only),
+  triplet compositing (`composite_triplet_levels`:
   joint percentile bounds over the content region only, plane
   registration via 2D normalized cross-correlation of per-scan-line-
   demeaned content blocks computed on raw levels before normalization

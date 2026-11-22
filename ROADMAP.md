@@ -4,7 +4,7 @@ Multi-phase implementation plan for Voyager Golden Record Explorer.
 Completed phases are kept as a record of what was built; unchecked items
 are future work. Keep this file current when milestones land.
 
-## Status (June 2026): the decoder works
+## Status
 
 The repair plan (Phases 8–13 below) is complete. The app decodes real
 Voyager Golden Record audio end-to-end:
@@ -12,10 +12,10 @@ Voyager Golden Record audio end-to-end:
 - **Gate 1 passed** — a clean, round calibration circle decodes from
   `assets/sync_image1.wav`, both via the diagnostics CLI and live in
   the GUI.
-- **Gate 2 demonstrated** — recon decodes from the full 48 kHz stereo
-  rip produced the pulsar map, the M31 galaxy photograph, and readable
-  mathematical/physical-unit definition slides matching published
-  reference decodes. The full 116-image catalog is Phase 14 work.
+- **Gate 2 passed on the 48 kHz stereo rip** — the CLI decodes all 156
+  source frames (78 per channel) and registers all 20 color triplets,
+  yielding the full 116-image catalog. The decoded subjects were checked
+  against the published catalog in Phase 14.
 
 How it works now: `WavReader` reads float32 and integer WAVs at any
 rate including the 384 kHz masters, with windowed range reads for the
@@ -40,9 +40,9 @@ see the annotated history in Phases 1–7 and the git history.
 
 - **Gate 1 (passed):** decode a recognizable calibration circle from
   `assets/sync_image1.wav` via the diagnostics CLI.
-- **Gate 2 (in progress):** decode known images from the full record
-  rips that are recognizable side-by-side against published reference
-  decodes — demonstrated for several images; full catalog pending.
+- **Gate 2 (passed on the 48 kHz stereo rip):** decode the full catalog
+  from `assets/golden_record_stereo_48k.wav`, check all 156 source frames
+  against the published catalog, and register the 20 color composites.
 
 ## Reference ground truth (encoding facts the decoder is built on)
 
@@ -165,10 +165,9 @@ functions surfaced as CLI subcommands, runnable against the real assets.
       decoded the pulsar map, M31 galaxy, and the readable mathematical/
       physical-unit definition slides — matching published references
       (Gate 2 partially demonstrated).
-- [ ] Frame-triplet color mode (3 successive frames → R/G/B with
-      registration) — moved to Phase 14: needs image-boundary
-      segmentation, which belongs with the full-record catalog work.
-      The 3-scanline PseudoColor mode remains as a legacy curiosity.
+- [x] Frame-triplet color mode (3 successive frames → R/G/B with
+      registration) landed in Phase 14. The 3-scanline PseudoColor mode
+      remains available as a legacy mode.
 
 ### Phase 10 — Real playback clock & anchored live decode ✅
 
@@ -215,46 +214,45 @@ functions surfaced as CLI subcommands, runnable against the real assets.
       cached waveform markers instead of rescanning with the FFT tone
       detector)
 
-### Phase 14 — Gate 2 at scale (in progress)
+### Phase 14 — Full catalog decoding (Gate 2 passed)
 
 - [x] Image-boundary segmentation (`analysis/segment.rs`, CLI `segment`):
       sync-cadence-break detection splits the record into per-image
       sample ranges; tone-classified runs (lead-in tone) are rejected.
-      On `golden_record_stereo_48k.wav` it finds 80 left / 77 right
-      candidates against the published 78 + 78 frame catalog, and
-      `--decode-dir` decodes every candidate to PNG in one command
-      (calibration circle, pulsar map/galaxy, definition slides all
-      verified recognizable).
-- [x] Frame-triplet color (`catalog.rs`, `pipeline::composite_rgb`, CLI
-      `segment --color`): published 78-frame catalog with color roles and
+      On `golden_record_stereo_48k.wav`, merging false splits and
+      splitting fused runs against the median slot length recovers all
+      78 frames per channel. `--decode-dir` exports the frames to PNG.
+- [x] Frame-triplet color (`catalog.rs`, `pipeline::composite_triplet_levels`,
+      CLI `segment --color`): published 78-frame catalog with color roles and
       labels (cross-validated across three reference decoders),
-      row-offset plane registration via luminance-profile correlation,
       all 20 triplets composited with bounds normalized jointly across
-      the three planes. Triplet frame order is **blue, green, red** —
-      verified empirically (Sunset, Monument Valley, Fallen Leaves);
-      foodini's and MarcBaeuerle's red-first labels are wrong for this
-      rip, amazing-rando's README is right. Segmentation cleanup (merge
-      false splits, split fused runs against the median slot length)
-      brings both channels to exactly 78/78.
+      the three planes. Sunset, Monument Valley, and Fallen Leaves confirmed
+      the **blue, green, red** frame order for this rip.
 - [x] Predictive sync tracking (`track_line_syncs`): per-line lock with
       coasting fixes the frames that decoded as vertical shreds (dark
       photographs: Microscope, Sunset members) and removes composite
       ghosting (Human Anatomy).
 - [x] **Gate 2 acceptance:** all 156 frames reviewed against the
-      published catalog — every frame is sync-locked and recognizable as
-      its catalog subject; all 20 composites register cleanly. The two
-      composite gaps are fixed: joint bounds now come from the content
-      region only (central rows/columns — junk/leader pixels no longer
-      stretch the percentile population), and registration uses 2D
-      normalized cross-correlation of per-scan-line-demeaned content
-      blocks (flat junk bands demean to zero; the smallest lag within
-      0.002 of the peak wins, so featureless slides stay unshifted).
-      Plane offsets up to ~170 lines occur (Human Anatomy), so the lag
-      search spans min_height/3 capped at 256. Remaining cosmetic
-      limitations, accepted: Solar Spectrum registration is ill-posed
-      (the three planes legitimately differ — it is a spectrum),
-      composite saturation reads high-key next to published decodes,
+      published catalog. Every frame is sync-locked and recognizable as
+      its catalog subject. The CLI produced all 20 composites. Joint
+      percentile bounds use the central rows and columns to exclude the
+      leader and sync margins. Registration uses 2D normalized
+      cross-correlation after subtracting each scan line's mean. The
+      smallest lag within 0.002 of the peak wins, so featureless slides
+      stay unshifted.
+      Plane offsets up to ~170 lines occur (Human Anatomy), so each pair's
+      lag search spans a third of its shorter plane, capped at 256.
+      Solar Spectrum remains difficult to register because its planes
+      differ. Some composites look brighter than published decodes,
       and the analog tape smear under glyphs is a source artifact.
+- [x] Full-frame desktop preview uses detected image bounds during
+      playback and seeking, with optional sync-margin cropping. The
+      48 kHz excerpt smoke test covered frame changes during playback,
+      waveform seeks during playback and while paused, and resume from
+      the new position.
+
+## Remaining work
+
 - [ ] Big-file streaming/mmap and decimated waveform cache (the 1.5 GB
       stereo rip currently implies ~3 GB resident)
 - [ ] Playback-speed detection (sync-interval median ≈ 4.15 ms ⇒ 2×
