@@ -770,7 +770,7 @@ mod tests {
         assert_eq!(result.len(), 512 * 3);
 
         // All pixels should match the expected RGB triplet
-        for chunk in result.chunks_exact(3) {
+        for &chunk in result.as_chunks::<3>().0 {
             assert_eq!(chunk, [255, 0, 255]);
         }
     }

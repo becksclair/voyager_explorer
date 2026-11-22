@@ -54,7 +54,7 @@ impl WaveformPanel {
             painter.rect_stroke(
                 rect,
                 4.0,
-                egui::Stroke::new(1.0, theme::PANEL_BORDER),
+                egui::Stroke::new(1.0_f32, theme::PANEL_BORDER),
                 egui::StrokeKind::Inside,
             );
             painter.text(
@@ -128,7 +128,7 @@ impl WaveformPanel {
         painter.rect_stroke(
             *rect,
             4.0,
-            egui::Stroke::new(1.0, theme::PANEL_BORDER),
+            egui::Stroke::new(1.0_f32, theme::PANEL_BORDER),
             egui::StrokeKind::Inside,
         );
 
@@ -158,7 +158,7 @@ impl WaveformPanel {
                 egui::Pos2::new(wave_rect.min.x, center_y),
                 egui::Pos2::new(wave_rect.max.x, center_y),
             ],
-            egui::Stroke::new(1.0, theme::PANEL_BORDER),
+            egui::Stroke::new(1.0_f32, theme::PANEL_BORDER),
         );
 
         // Min/max envelope per pixel column, drawn in cyan. Rebuilt only when
@@ -198,7 +198,7 @@ impl WaveformPanel {
 
             painter.line_segment(
                 [egui::Pos2::new(x, min_y), egui::Pos2::new(x, max_y)],
-                egui::Stroke::new(1.0, trace_color),
+                egui::Stroke::new(1.0_f32, trace_color),
             );
         }
 
@@ -212,14 +212,14 @@ impl WaveformPanel {
                         egui::Pos2::new(x, wave_rect.min.y),
                         egui::Pos2::new(x, wave_rect.min.y + 10.0),
                     ],
-                    egui::Stroke::new(2.0, theme::AMBER),
+                    egui::Stroke::new(2.0_f32, theme::AMBER),
                 );
                 painter.line_segment(
                     [
                         egui::Pos2::new(x, wave_rect.min.y + 10.0),
                         egui::Pos2::new(x, wave_rect.max.y),
                     ],
-                    egui::Stroke::new(1.0, sync_color.gamma_multiply(0.35)),
+                    egui::Stroke::new(1.0_f32, sync_color.gamma_multiply(0.35)),
                 );
             }
         }
@@ -232,7 +232,7 @@ impl WaveformPanel {
                     egui::Pos2::new(position_x, wave_rect.min.y),
                     egui::Pos2::new(position_x, wave_rect.max.y),
                 ],
-                egui::Stroke::new(2.0, theme::ACCENT),
+                egui::Stroke::new(2.0_f32, theme::ACCENT),
             );
         }
 
@@ -244,7 +244,7 @@ impl WaveformPanel {
                     egui::Pos2::new(hover_pixel_x, wave_rect.min.y),
                     egui::Pos2::new(hover_pixel_x, wave_rect.max.y),
                 ],
-                egui::Stroke::new(1.0, theme::TEXT_MUTED),
+                egui::Stroke::new(1.0_f32, theme::TEXT_MUTED),
             );
         }
 

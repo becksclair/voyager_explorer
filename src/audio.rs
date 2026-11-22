@@ -146,9 +146,9 @@ impl WavReader {
                 let mut left = Vec::with_capacity(samples.len() / 2);
                 let mut right = Vec::with_capacity(samples.len() / 2);
 
-                for chunk in samples.chunks_exact(2) {
-                    left.push(chunk[0]);
-                    right.push(chunk[1]);
+                for &[left_sample, right_sample] in samples.as_chunks::<2>().0 {
+                    left.push(left_sample);
+                    right.push(right_sample);
                 }
 
                 (left.into(), right.into())

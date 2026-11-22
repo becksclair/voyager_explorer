@@ -38,7 +38,7 @@ pub fn apply_theme(ctx: &egui::Context) {
     *visuals = egui::Visuals::dark();
     visuals.panel_fill = BG;
     visuals.window_fill = PANEL;
-    visuals.window_stroke = Stroke::new(1.0, PANEL_BORDER);
+    visuals.window_stroke = Stroke::new(1.0_f32, PANEL_BORDER);
     visuals.window_corner_radius = CornerRadius::same(8);
     visuals.menu_corner_radius = CornerRadius::same(6);
     visuals.extreme_bg_color = WELL;
@@ -47,7 +47,7 @@ pub fn apply_theme(ctx: &egui::Context) {
     visuals.error_fg_color = ERROR;
     visuals.warn_fg_color = AMBER;
     visuals.selection.bg_fill = ACCENT.gamma_multiply(0.35);
-    visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
     visuals.slider_trailing_fill = true;
 
     let corner = CornerRadius::same(6);
@@ -56,32 +56,32 @@ pub fn apply_theme(ctx: &egui::Context) {
     widgets.noninteractive.corner_radius = corner;
     widgets.noninteractive.bg_fill = PANEL;
     widgets.noninteractive.weak_bg_fill = PANEL;
-    widgets.noninteractive.bg_stroke = Stroke::new(1.0, PANEL_BORDER);
-    widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_MUTED);
+    widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, PANEL_BORDER);
+    widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_MUTED);
 
     widgets.inactive.corner_radius = corner;
     widgets.inactive.bg_fill = Color32::from_rgb(0x1C, 0x23, 0x2C);
     widgets.inactive.weak_bg_fill = Color32::from_rgb(0x1C, 0x23, 0x2C);
-    widgets.inactive.bg_stroke = Stroke::new(1.0, PANEL_BORDER);
-    widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_BRIGHT);
+    widgets.inactive.bg_stroke = Stroke::new(1.0_f32, PANEL_BORDER);
+    widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_BRIGHT);
 
     widgets.hovered.corner_radius = corner;
     widgets.hovered.bg_fill = Color32::from_rgb(0x24, 0x2C, 0x37);
     widgets.hovered.weak_bg_fill = Color32::from_rgb(0x24, 0x2C, 0x37);
-    widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x3A, 0x44, 0x50));
-    widgets.hovered.fg_stroke = Stroke::new(1.5, TEXT_BRIGHT);
+    widgets.hovered.bg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(0x3A, 0x44, 0x50));
+    widgets.hovered.fg_stroke = Stroke::new(1.5_f32, TEXT_BRIGHT);
 
     widgets.active.corner_radius = corner;
     widgets.active.bg_fill = Color32::from_rgb(0x2A, 0x34, 0x40);
     widgets.active.weak_bg_fill = Color32::from_rgb(0x2A, 0x34, 0x40);
-    widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
-    widgets.active.fg_stroke = Stroke::new(1.5, TEXT_BRIGHT);
+    widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    widgets.active.fg_stroke = Stroke::new(1.5_f32, TEXT_BRIGHT);
 
     widgets.open.corner_radius = corner;
     widgets.open.bg_fill = Color32::from_rgb(0x1C, 0x23, 0x2C);
     widgets.open.weak_bg_fill = Color32::from_rgb(0x1C, 0x23, 0x2C);
-    widgets.open.bg_stroke = Stroke::new(1.0, PANEL_BORDER);
-    widgets.open.fg_stroke = Stroke::new(1.0, TEXT_BRIGHT);
+    widgets.open.bg_stroke = Stroke::new(1.0_f32, PANEL_BORDER);
+    widgets.open.fg_stroke = Stroke::new(1.0_f32, TEXT_BRIGHT);
 
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
     style.spacing.button_padding = egui::vec2(10.0, 5.0);
@@ -95,7 +95,7 @@ pub fn apply_theme(ctx: &egui::Context) {
 pub fn panel_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(PANEL)
-        .stroke(Stroke::new(1.0, PANEL_BORDER))
+        .stroke(Stroke::new(1.0_f32, PANEL_BORDER))
         .corner_radius(CornerRadius::same(6))
         .inner_margin(Margin::same(10))
 }
