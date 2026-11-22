@@ -388,7 +388,14 @@ impl SstvDecoder {
                     let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
                     let mut skipped = 0usize;
                     for w in positions.windows(2) {
-                        let interval = (w[1] - w[0]) as f64;
+                        // Sync positions are normally strictly increasing, but a
+                        // degenerate cadence could leave a non-increasing pair;
+                        // skip it rather than underflow the subtraction.
+                        let Some(interval) = w[1].checked_sub(w[0]) else {
+                            skipped += 1;
+                            continue;
+                        };
+                        let interval = interval as f64;
                         // Skip gaps that are not a single line (dropouts, the
                         // inter-image boundary, double-triggers).
                         if interval >= median * 0.7 && interval <= median * 1.3 {
