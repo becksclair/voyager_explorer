@@ -17,7 +17,7 @@ pub enum DecoderMode {
     PseudoColor,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DecoderParams {
     /// Nominal scan-line duration in ms. With `sync_lock` this seeds the sync
     /// search and serves as the fallback slicing period; the actual per-line

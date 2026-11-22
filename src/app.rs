@@ -38,6 +38,10 @@ pub struct VoyagerApp {
     image_texture: Option<TextureHandle>,
     params: DecoderParams,
     last_decoded: Option<PipelineResult>,
+    /// Display-only: hide the decoder's per-line sync/retrace and leader
+    /// margins in the image view. Toggling re-skins the cached decode
+    /// without re-running the decoder.
+    crop_sync_margins: bool,
     selected_channel: WaveformChannel,
     /// Sync-tone positions cached at file load / channel switch; rendered as
     /// amber markers in the waveform strip. Never recomputed per frame.
@@ -46,6 +50,20 @@ pub struct VoyagerApp {
     /// take seconds on real Golden Record audio, so it must not block the UI;
     /// replacing the receiver cancels delivery from a stale scan.
     sync_scan_rx: Option<std::sync::mpsc::Receiver<Vec<usize>>>,
+    /// Per-image sample ranges for the selected channel, found in the
+    /// background on load/channel-switch. The preview decodes one whole image
+    /// at a time from these, so a multi-image file shows a recognizable frame
+    /// instead of an arbitrary time window.
+    image_bounds: Vec<std::ops::Range<usize>>,
+    image_bounds_rx: Option<std::sync::mpsc::Receiver<Vec<std::ops::Range<usize>>>>,
+    /// Start sample of the image last sent to the decoder, so playback does
+    /// not re-decode the current image every interval.
+    last_decoded_image_start: Option<usize>,
+    /// Set when a live decode request was dropped because the worker queue was
+    /// full. The current image is then re-sent once the queue frees (a poll
+    /// drains a slot), rather than re-attempted every frame while the worker is
+    /// busy — which would spin `decode_at_position` for nothing.
+    pending_image_retry: bool,
 
     // Audio playback state
     audio_state: AudioPlaybackState,
@@ -120,9 +138,14 @@ impl Default for VoyagerApp {
             image_texture: None,
             params,
             last_decoded: None,
+            crop_sync_margins: true,
             selected_channel: WaveformChannel::Left,
             sync_positions: Vec::new(),
             sync_scan_rx: None,
+            image_bounds: Vec::new(),
+            image_bounds_rx: None,
+            last_decoded_image_start: None,
+            pending_image_retry: false,
             audio_state: AudioPlaybackState::Uninitialized,
             #[cfg(feature = "audio_playback")]
             audio_stream: None,
@@ -178,8 +201,9 @@ impl VoyagerApp {
                 // Clear any previous error and reset decode position
                 self.error_message = None;
                 self.last_decode_position = 0;
-                // Cache sync markers once per load (not per frame)
+                // Cache sync markers and per-image ranges once per load.
                 self.refresh_sync_positions();
+                self.refresh_image_bounds();
             }
             Err(e) => {
                 tracing::error!(path = %path.display(), error = %e, "Failed to load WAV file");
@@ -222,31 +246,61 @@ impl VoyagerApp {
         }
     }
 
+    /// Rebuild the displayed texture from the last decode result without
+    /// re-running the decoder — used when a display-only option (the
+    /// sync-margin crop) toggles.
+    fn refresh_texture_from_last(&mut self, ctx: &egui::Context) {
+        if let Some(result) = &self.last_decoded {
+            let img = result.to_egui_image(self.crop_sync_margins);
+            self.image_texture = Some(ctx.load_texture("decoded", img, Default::default()));
+        }
+    }
+
     fn handle_decode(&mut self, ctx: &egui::Context) {
-        if let Some(reader) = &self.wav_reader {
-            let samples = reader.get_samples(self.selected_channel);
-
-            // Clear any previous errors
-            self.error_message = None;
-
-            // Perform decode with error handling using unified pipeline
-            let pipeline = crate::pipeline::DecodingPipeline::new();
-            match pipeline.process(samples, &self.params, reader.sample_rate) {
-                Ok(result) => {
-                    tracing::info!(pixels = result.pixels.len(), "Decode completed successfully");
-                    let img = result.to_egui_image();
-                    self.image_texture = Some(ctx.load_texture("decoded", img, Default::default()));
-                    self.last_decoded = Some(result);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Decode failed");
-                    self.error_message = Some(format!("Decode failed: {}", e));
-                    self.image_texture = None;
-                    self.last_decoded = None;
-                }
-            }
-        } else {
+        // Decode the single image at the playhead when boundaries are known,
+        // so a multi-image file shows one recognizable frame. When bounds are
+        // not yet available (still scanning, or a tone-only file) decode a
+        // bounded window at the playhead — never the whole, possibly
+        // multi-minute, buffer, which would freeze the UI thread.
+        let range = self.image_range_at(self.current_position_samples);
+        let Some(reader) = &self.wav_reader else {
             self.error_message = Some("No audio file loaded".to_string());
+            return;
+        };
+        let all = reader.get_samples(self.selected_channel);
+        let (samples, image_start): (&[f32], Option<usize>) = match &range {
+            Some(r) if r.end <= all.len() => (&all[r.clone()], Some(r.start)),
+            _ => {
+                let pos = self.current_position_samples.min(all.len().saturating_sub(1));
+                let window = (reader.sample_rate as f64 * self.params.decode_window_secs) as usize;
+                let end = pos.saturating_add(window.max(1)).min(all.len());
+                (&all[pos..end], None)
+            }
+        };
+
+        // Clear any previous errors
+        self.error_message = None;
+
+        // Perform decode with error handling using unified pipeline
+        let pipeline = crate::pipeline::DecodingPipeline::new();
+        match pipeline.process(samples, &self.params, reader.sample_rate) {
+            Ok(result) => {
+                tracing::info!(pixels = result.pixels.len(), "Decode completed successfully");
+                let img = result.to_egui_image(self.crop_sync_margins);
+                self.image_texture = Some(ctx.load_texture("decoded", img, Default::default()));
+                self.last_decoded = Some(result);
+                // Only record the image as decoded when its slice was actually
+                // used; otherwise the per-image playback trigger would skip
+                // re-decoding it.
+                self.last_decoded_image_start = image_start;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Decode failed");
+                self.error_message = Some(format!("Decode failed: {}", e));
+                self.image_texture = None;
+                self.last_decoded = None;
+                self.last_decoded_image_start = None;
+            }
         }
     }
 
@@ -293,6 +347,60 @@ impl VoyagerApp {
         self.sync_scan_rx = Some(rx);
     }
 
+    /// Find per-image sample ranges for the selected channel on a background
+    /// thread (full-file segmentation is too slow to block the UI). The
+    /// preview decodes one of these whole ranges at a time.
+    fn refresh_image_bounds(&mut self) {
+        self.image_bounds.clear();
+        self.image_bounds_rx = None;
+        self.last_decoded_image_start = None;
+        self.pending_image_retry = false;
+
+        let Some(reader) = &self.wav_reader else {
+            return;
+        };
+        let samples: Arc<[f32]> = match self.selected_channel {
+            WaveformChannel::Left => Arc::clone(&reader.left_channel),
+            WaveformChannel::Right => Arc::clone(&reader.right_channel),
+        };
+        if samples.is_empty() {
+            return;
+        }
+        let sample_rate = reader.sample_rate;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let params = crate::analysis::SegmentImagesParams::default();
+            let ranges: Vec<std::ops::Range<usize>> = crate::analysis::find_image_bounds(&samples, sample_rate, &params)
+                .into_iter()
+                .map(|b| b.start_sample..b.end_sample)
+                .collect();
+            tracing::info!(
+                count = ranges.len(),
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "Background image-bounds scan completed"
+            );
+            let _ = tx.send(ranges);
+        });
+        self.image_bounds_rx = Some(rx);
+    }
+
+    /// The image range to preview for a playhead at `pos`: the image
+    /// containing it, else the next image starting after it, else the last.
+    /// `None` only while no image bounds are known (still scanning, or a file
+    /// with no detected images — e.g. pure tone).
+    fn image_range_at(&self, pos: usize) -> Option<std::ops::Range<usize>> {
+        if let Some(r) = self.image_bounds.iter().find(|r| r.contains(&pos)) {
+            return Some(r.clone());
+        }
+        self.image_bounds
+            .iter()
+            .find(|r| r.start >= pos)
+            .or_else(|| self.image_bounds.last())
+            .cloned()
+    }
+
     /// Export the last decoded image as a PNG via a save dialog.
     fn handle_export(&mut self) {
         let Some(result) = &self.last_decoded else {
@@ -310,6 +418,10 @@ impl VoyagerApp {
 
         match result.to_dynamic_image() {
             Ok(img) => {
+                // Same published orientation as the preview
+                // (`PipelineResult::to_egui_image`); the full frame is kept,
+                // the sync-margin crop is display-only.
+                let img = img.rotate90().fliph();
                 if let Err(e) = img.save(&path) {
                     tracing::error!(path = %path.display(), error = %e, "Failed to save PNG");
                     self.error_message = Some(format!("Export failed: {}", e));
@@ -485,6 +597,12 @@ impl VoyagerApp {
     /// - UI frame time: <16ms (previously spiked to 100-500ms during decode)
     /// - Responsiveness: Immediate (no blocking operations)
     fn decode_at_position(&mut self, _ctx: &egui::Context, position: usize) {
+        // Clear any armed retry up front: if this call bails out early (no
+        // reader, position past EOF, too few samples) there is nothing to
+        // retry, and if it reaches the worker the flag is re-armed below only
+        // when the request is dropped. Keeps "retry armed" ⟺ "last attempt hit
+        // the queue and was refused".
+        self.pending_image_retry = false;
         if let Some(reader) = &self.wav_reader {
             // Get shared reference to samples (Arc enables zero-copy sharing with worker)
             let samples: Arc<[f32]> = match self.selected_channel {
@@ -507,27 +625,63 @@ impl VoyagerApp {
                 return;
             }
 
-            // Ensure we have enough samples for a meaningful decode window
-            let min_window_samples = (reader.sample_rate as f64 * 0.1) as usize; // 100ms minimum
-            let remaining_samples = samples.len() - position;
-            if remaining_samples < min_window_samples {
+            let sample_rate = reader.sample_rate;
+            // Decode the whole image at the playhead when boundaries are known,
+            // so the live preview is a full frame rather than a 2 s slice.
+            let range = self.image_range_at(position);
+
+            // Ensure the decode spans enough samples to be meaningful. With a
+            // known image range the decode covers the whole image
+            // (`r.start..r.end`, always several seconds) even when the playhead
+            // sits near EOF; only the windowed fallback is bounded by what is
+            // left after the playhead. Gating unconditionally on
+            // `samples.len() - position` would drop a legitimate final image
+            // once the playhead entered its last 100 ms.
+            let min_window_samples = (sample_rate as f64 * 0.1) as usize; // 100ms minimum
+            let decode_span = match &range {
+                Some(r) => r.end.saturating_sub(r.start),
+                None => samples.len() - position,
+            };
+            if decode_span < min_window_samples {
                 tracing::debug!(
-                    remaining = remaining_samples,
+                    span = decode_span,
                     min_required = min_window_samples,
-                    "Insufficient samples remaining for decode window"
+                    "Insufficient samples for a decode window"
                 );
                 return;
             }
 
-            let sample_rate = reader.sample_rate;
-            self.decode_worker.request(
+            let (start_offset, params) = match &range {
+                Some(r) => {
+                    let secs = ((r.end - r.start) as f64 / sample_rate as f64).clamp(0.1, 60.0);
+                    (
+                        r.start,
+                        DecoderParams {
+                            decode_window_secs: secs,
+                            ..self.params
+                        },
+                    )
+                }
+                None => (position, self.params),
+            };
+            let accepted = self.decode_worker.request(
                 samples,
-                position,
-                self.params,
+                start_offset,
+                params,
                 sample_rate,
                 self.config.worker.max_queue_size,
                 self.decode_generation,
             );
+            // Record the image we're on regardless of acceptance, so the
+            // per-image playback trigger does not re-fire every frame. If the
+            // request was dropped on a full queue, arm a retry instead of
+            // leaving the image un-decoded: it is re-sent once a poll frees a
+            // queue slot (see `update`), so the playhead's image is still shown
+            // without spinning `decode_at_position` here on every repaint.
+            // A refusal with free slots means the worker is gone; retrying
+            // that would spin every frame until it is restarted.
+            self.last_decoded_image_start = range.map(|r| r.start);
+            self.pending_image_retry = !accepted && self.decode_worker.pending() >= self.config.worker.max_queue_size;
         }
     }
 
@@ -760,6 +914,24 @@ impl eframe::App for VoyagerApp {
             }
         }
 
+        // Collect the background image-bounds scan result, if one is in flight
+        if let Some(rx) = &self.image_bounds_rx {
+            match rx.try_recv() {
+                Ok(ranges) => {
+                    self.image_bounds = ranges;
+                    self.image_bounds_rx = None;
+                    ctx.request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    tracing::warn!("Image-bounds scan thread exited without a result");
+                    self.image_bounds_rx = None;
+                }
+            }
+        }
+
         // Poll for decode results from background worker (non-blocking)
         for decode_result in self.decode_worker.poll() {
             let DecodeResult {
@@ -810,10 +982,28 @@ impl eframe::App for VoyagerApp {
                 }
             } else if let Some(res) = pipeline_result {
                 self.last_decode_error = None;
-                let img = res.to_egui_image();
+                let img = res.to_egui_image(self.crop_sync_margins);
                 self.image_texture = Some(ctx.load_texture("decoded_realtime", img, Default::default()));
                 self.last_decoded = Some(res);
             }
+        }
+
+        // Re-send a live decode that was dropped on a full queue, but only now
+        // that `poll` above may have freed a slot — not every frame while the
+        // worker is busy. `decode_at_position` clears the retry flag on entry
+        // and re-arms it only if this attempt is dropped again, so this cannot
+        // spin: with a free slot the request is accepted and the flag clears.
+        if self.pending_image_retry && self.decode_worker.pending() < self.config.worker.max_queue_size {
+            self.decode_at_position(ctx, self.current_position_samples);
+        }
+
+        // Keep the frame loop alive while a decode is in flight so its result
+        // is polled within a frame. A paused, idle UI otherwise stops
+        // repainting, leaving a finished result uncollected — and the health
+        // check then mistakes that gap for an unresponsive worker and restarts
+        // it (discarding the result).
+        if self.decode_worker.pending() > 0 {
+            ctx.request_repaint_after(Duration::from_millis(33));
         }
 
         // Update playback position if playing. The position comes from the
@@ -840,13 +1030,19 @@ impl eframe::App for VoyagerApp {
                 } else {
                     self.current_position_samples = new_position;
 
-                    // Real-time decoding: decode from current position only if significant change
-                    // Decode at configurable interval to avoid flooding worker thread
-                    let decode_threshold_samples =
-                        (sample_rate as f32 * (self.config.worker.decode_interval_ms as f32 / 1000.0)) as usize;
-                    let position_change = new_position.abs_diff(self.last_decode_position);
-
-                    if position_change >= decode_threshold_samples {
+                    // Real-time decoding. With image boundaries known, decode
+                    // once per image (when the playhead crosses into a new
+                    // frame); otherwise fall back to a fixed time interval to
+                    // avoid flooding the worker.
+                    let trigger = match self.image_range_at(new_position) {
+                        Some(r) => Some(r.start) != self.last_decoded_image_start,
+                        None => {
+                            let threshold =
+                                (sample_rate as f32 * (self.config.worker.decode_interval_ms as f32 / 1000.0)) as usize;
+                            new_position.abs_diff(self.last_decode_position) >= threshold
+                        }
+                    };
+                    if trigger {
                         self.decode_at_position(ctx, new_position);
                         self.last_decode_position = new_position;
                     }
@@ -1090,6 +1286,7 @@ impl eframe::App for VoyagerApp {
                     ui.set_min_width(ui.available_width());
                     theme::section_label(ui, "Decode Controls");
                     ui.add_space(2.0);
+                    let params_before = self.params;
 
                     egui::Grid::new("decode_params_grid")
                         .num_columns(2)
@@ -1131,8 +1328,10 @@ impl eframe::App for VoyagerApp {
                                     ui.selectable_value(&mut self.selected_channel, WaveformChannel::Right, "Right");
                                 });
                             if self.selected_channel != previous_channel {
-                                // Sync markers are channel-specific; rescan once.
+                                // Sync markers and image ranges are
+                                // channel-specific; rescan once.
                                 self.refresh_sync_positions();
+                                self.refresh_image_bounds();
                                 // In-flight decode results are for the old channel
                                 self.decode_generation += 1;
                                 // The sink was built from the old channel's
@@ -1145,6 +1344,20 @@ impl eframe::App for VoyagerApp {
 
                     ui.checkbox(&mut self.params.invert, "Invert");
                     ui.checkbox(&mut self.params.sync_lock, "Sync lock");
+                    if self.params != params_before {
+                        // The live preview decodes once per image; forget the
+                        // current one so playback re-decodes it with the new
+                        // parameters instead of waiting for the next image.
+                        self.last_decoded_image_start = None;
+                    }
+                    if ui
+                        .checkbox(&mut self.crop_sync_margins, "Crop sync margins")
+                        .on_hover_text("Hide the decoder's per-line sync/retrace and leader borders")
+                        .changed()
+                    {
+                        // Display-only: re-skin the cached decode, no re-decode.
+                        self.refresh_texture_from_last(ctx);
+                    }
                 });
 
                 ui.add_space(8.0);
@@ -1193,18 +1406,19 @@ impl eframe::App for VoyagerApp {
                     });
                     ui.add_space(4.0);
 
-                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    // Fit the decoded image to the remaining panel rectangle,
+                    // preserving aspect ratio (scaling up or down). The size is
+                    // captured here, before any scroll area, because inside a
+                    // vertical scroll area `available_height` is unbounded.
+                    let avail = ui.available_size();
+                    ui.centered_and_justified(|ui| {
                         if let Some(texture) = &self.image_texture {
-                            ui.add(egui::Image::new(texture).max_width(ui.available_width()));
+                            ui.add(egui::Image::new(texture).fit_to_exact_size(avail).maintain_aspect_ratio(true));
                         } else {
-                            ui.centered_and_justified(|ui| {
-                                ui.label(
-                                    egui::RichText::new(
-                                        "No image decoded yet — load a WAV and press Decode, or play to decode live",
-                                    )
+                            ui.label(
+                                egui::RichText::new("No image decoded yet — load a WAV and press Decode, or play to decode live")
                                     .color(theme::TEXT_MUTED),
-                                );
-                            });
+                            );
                         }
                     });
                 });

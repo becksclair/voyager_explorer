@@ -68,37 +68,61 @@ impl PipelineResult {
         }
     }
 
-    pub fn to_egui_image(&self) -> ColorImage {
+    /// Build the egui texture image in the *published* (upright) orientation.
+    ///
+    /// The decoder emits scan lines as rows (line N → row N), but Voyager's
+    /// scan lines are vertical in the published images, so the recognizable
+    /// orientation is the raw buffer rotated 90° clockwise then mirrored
+    /// horizontally. That composition is a pure transpose: a source pixel at
+    /// (x, y) maps to (y, x), and the width/height swap. The CLI applies the
+    /// same `rotate90 + fliph` to its PNG output (see `cli.rs`); transposing
+    /// here keeps the live GUI view consistent with it.
+    ///
+    /// When `crop_sync` is set, the decoder's sync/leader margins are dropped
+    /// from the displayed texture via [`display_crop_cols`]/[`display_crop_rows`]
+    /// — a tight, picture-preserving trim, not the compositor's deliberately
+    /// conservative [`content_cols`]/[`content_rows`] window (which would eat
+    /// real image). This is display-only; the decode buffer and all
+    /// registration/compositing geometry are untouched.
+    pub fn to_egui_image(&self, crop_sync: bool) -> ColorImage {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let (cols, rows) = if crop_sync && w > 0 && h > 0 {
+            (display_crop_cols(w), display_crop_rows(h))
+        } else {
+            (0..w, 0..h)
+        };
+        let cw = cols.len();
+        let ch = rows.len();
+        // Transposed output: a cropped cw×ch source becomes a ch×cw image
+        // (ColorImage size is [width, height]).
+        let mut img = ColorImage::new([ch, cw], vec![egui::Color32::BLACK; cw * ch]);
         match self.mode {
             DecoderMode::Grayscale => {
-                let mut img = ColorImage::new(
-                    [self.width as usize, self.height as usize],
-                    vec![egui::Color32::BLACK; (self.width * self.height) as usize],
-                );
-                for (i, p) in self.pixels.iter().enumerate() {
-                    if i < img.pixels.len() {
-                        img.pixels[i] = egui::Color32::from_gray(*p);
+                for (oy, sy) in rows.clone().enumerate() {
+                    for (ox, sx) in cols.clone().enumerate() {
+                        let src = sy * w + sx;
+                        if src < self.pixels.len() {
+                            img.pixels[ox * ch + oy] = egui::Color32::from_gray(self.pixels[src]);
+                        }
                     }
                 }
-                img
             }
             DecoderMode::PseudoColor => {
-                let mut img = ColorImage::new(
-                    [self.width as usize, self.height as usize],
-                    vec![egui::Color32::BLACK; (self.width * self.height) as usize],
-                );
-                for i in 0..img.pixels.len() {
-                    let src_idx = i * 3;
-                    if src_idx + 3 <= self.pixels.len() {
-                        let r = self.pixels[src_idx];
-                        let g = self.pixels[src_idx + 1];
-                        let b = self.pixels[src_idx + 2];
-                        img.pixels[i] = egui::Color32::from_rgb(r, g, b);
+                for (oy, sy) in rows.clone().enumerate() {
+                    for (ox, sx) in cols.clone().enumerate() {
+                        let src = (sy * w + sx) * 3;
+                        if src + 3 <= self.pixels.len() {
+                            let r = self.pixels[src];
+                            let g = self.pixels[src + 1];
+                            let b = self.pixels[src + 2];
+                            img.pixels[ox * ch + oy] = egui::Color32::from_rgb(r, g, b);
+                        }
                     }
                 }
-                img
             }
         }
+        img
     }
 }
 
@@ -213,6 +237,47 @@ fn content_cols(width: usize) -> std::ops::Range<usize> {
     lo..hi
 }
 
+/// Central-row window (15–85%) for compositing: the first/last rows of a
+/// segmented frame are inter-image leader bands. Wider than [`content_cols`]'
+/// 20–90% column window because the leader bands are thinner than the
+/// per-line sync residue. Non-empty and within `0..rows` for every
+/// `rows >= 1`.
+///
+/// The clamp nests the `.min(rows)` *inside* the `.max` (unlike the sibling
+/// helpers' outer `.min`) to stay byte-for-byte identical to the original
+/// inline window in [`content_levels`]; don't "normalize" it to the outer
+/// form without re-checking that equivalence.
+fn content_rows(rows: usize) -> std::ops::Range<usize> {
+    let lo = rows * 3 / 20;
+    let hi = ((rows * 17) / 20).max((lo + 1).min(rows));
+    lo..hi
+}
+
+/// Within-line crop for the *display* preview — trims only the decoder's
+/// sync bands, far tighter than the compositor's [`content_cols`]. The
+/// compositor's window is deliberately conservative (it only needs to keep
+/// the junk *minority* out of a percentile population, so over-trimming is
+/// free); cropping the same 20%/10% off the shown image throws away real
+/// picture. Measured against the calibration circle: the line-start residue
+/// is ~6% and the bright line-end sync stripe ~11% of each scan line.
+/// Non-empty and within `0..width` for every `width >= 1`.
+fn display_crop_cols(width: usize) -> std::ops::Range<usize> {
+    let lo = width * 6 / 100;
+    let hi = ((width * 89) / 100).max(lo + 1).min(width);
+    lo..hi
+}
+
+/// Inter-image leader crop for the display preview — trims the leader band at
+/// each frame edge, tighter than the compositor's [`content_rows`]. Measured
+/// the same way as [`display_crop_cols`] (against the calibration circle): the
+/// inter-image leader band runs ~12% of the frame at each edge. Non-empty and
+/// within `0..rows` for every `rows >= 1`.
+fn display_crop_rows(rows: usize) -> std::ops::Range<usize> {
+    let lo = rows * 12 / 100;
+    let hi = ((rows * 88) / 100).max(lo + 1).min(rows);
+    lo..hi
+}
+
 /// Levels from a plane's content region: central columns (see
 /// [`content_cols`]) and central rows (inter-image leader bands sit at
 /// the frame edges; the 15–85% row window is looser than the 20–80%
@@ -223,13 +288,12 @@ fn content_cols(width: usize) -> std::ops::Range<usize> {
 /// the composite out.
 fn content_levels(levels: &[f32], width: usize) -> impl Iterator<Item = f32> + '_ {
     let rows = levels.len() / width;
-    let row_lo = rows * 3 / 20;
-    let row_hi = ((rows * 17) / 20).max((row_lo + 1).min(rows));
+    let row_window = content_rows(rows);
     let cols = content_cols(width);
     levels
         .chunks_exact(width)
-        .skip(row_lo)
-        .take(row_hi.saturating_sub(row_lo))
+        .skip(row_window.start)
+        .take(row_window.len())
         .flat_map(move |row| row[cols.clone()].iter().copied())
 }
 
@@ -534,5 +598,48 @@ mod tests {
         let mut b = gray_frame(4, 8, 0);
         b.mode = DecoderMode::PseudoColor;
         assert!(composite_rgb(&r, &g, &b).is_err());
+    }
+
+    #[test]
+    fn to_egui_image_transposes_and_crops() {
+        let (w, h) = (60u32, 60u32);
+
+        // Pixel value encodes its source column (x = i % w).
+        let by_col = PipelineResult {
+            pixels: (0..w * h).map(|i| (i % w) as u8).collect(),
+            width: w,
+            height: h,
+            mode: DecoderMode::Grayscale,
+        };
+        // Uncropped is a pure transpose: source column x becomes output row x,
+        // so every pixel in output row r has value r.
+        let full = by_col.to_egui_image(false);
+        assert_eq!(full.size, [60, 60]);
+        assert_eq!(full.pixels[5 * 60 + 7], egui::Color32::from_gray(5));
+
+        // Cropped to the display bounds; output rows map to the kept source columns.
+        let cols = display_crop_cols(w as usize);
+        let rows = display_crop_rows(h as usize);
+        let cropped = by_col.to_egui_image(true);
+        assert_eq!(cropped.size, [rows.len(), cols.len()]);
+        assert_eq!(cropped.pixels[0], egui::Color32::from_gray(cols.start as u8));
+        assert_eq!(
+            cropped.pixels[(cols.len() - 1) * rows.len()],
+            egui::Color32::from_gray((cols.end - 1) as u8)
+        );
+
+        // Pixel value encodes its source row (y = i / w): the first output
+        // column must map to the first kept source row, proving the crop
+        // applies the row offset, not just a size change.
+        let by_row = PipelineResult {
+            pixels: (0..w * h).map(|i| (i / w) as u8).collect(),
+            width: w,
+            height: h,
+            mode: DecoderMode::Grayscale,
+        };
+        assert_eq!(
+            by_row.to_egui_image(true).pixels[0],
+            egui::Color32::from_gray(rows.start as u8)
+        );
     }
 }
