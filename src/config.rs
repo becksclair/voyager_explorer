@@ -210,12 +210,23 @@ impl AppConfig {
         })
     }
 
-    /// Load configuration with fallback to defaults
+    /// Load configuration with fallback to defaults.
+    ///
+    /// A missing file is the normal first-run case, not an error, so it logs
+    /// at info; only a present-but-unreadable or malformed file warns.
     pub fn load_or_default<P: AsRef<Path>>(path: P) -> Self {
-        Self::load_from_file(path).unwrap_or_else(|e| {
-            tracing::warn!("Failed to load config, using defaults: {}", e);
-            Self::default()
-        })
+        let path = path.as_ref();
+        match Self::load_from_file(path) {
+            Ok(config) => config,
+            Err(ConfigError::LoadFailed { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!(path = %path.display(), "No config file found; using defaults");
+                Self::default()
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load config; using defaults");
+                Self::default()
+            }
+        }
     }
 
     /// Save configuration to TOML file
