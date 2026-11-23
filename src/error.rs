@@ -8,29 +8,33 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 /// Top-level error type for all Voyager Explorer operations.
+///
+/// Each variant is transparent: it displays as the error it wraps and adds
+/// no link of its own to the source chain. Printing the wrapped error here
+/// as well would repeat the cause wherever a whole chain is shown (`{:#}`).
 #[derive(Error, Debug)]
 pub enum VoyagerError {
     /// Audio file loading or processing errors
-    #[error("Audio error: {0}")]
+    #[error(transparent)]
     Audio(#[from] AudioError),
 
     /// SSTV decoding errors
-    #[error("Decoder error: {0}")]
+    #[error(transparent)]
     Decoder(#[from] DecoderError),
 
     /// Configuration errors
-    #[error("Configuration error: {0}")]
+    #[error(transparent)]
     Config(#[from] ConfigError),
 
     /// I/O errors
-    #[error("I/O error: {0}")]
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
 /// Audio-related errors
 #[derive(Error, Debug)]
 pub enum AudioError {
-    #[error("Failed to load WAV file '{path}': {source}")]
+    #[error("Failed to load WAV file '{path}'")]
     LoadFailed { path: PathBuf, source: hound::Error },
 
     #[error("Invalid sample rate: {rate} Hz (must be at least 8 kHz)")]
@@ -71,20 +75,37 @@ pub enum DecoderError {
 /// Configuration errors
 #[derive(Error, Debug)]
 pub enum ConfigError {
-    #[error("Failed to load config file '{path}': {source}")]
+    #[error("Failed to load config file '{path}'")]
     LoadFailed { path: Box<PathBuf>, source: std::io::Error },
 
-    #[error("Invalid config format in '{path}': {source}")]
+    #[error("Invalid config format in '{path}'")]
     InvalidFormat { path: Box<PathBuf>, source: toml::de::Error },
 
     #[error("Config validation failed: {reason}")]
     ValidationFailed { reason: String },
 
-    #[error("Failed to save config to '{path}': {source}")]
+    #[error("Failed to save config to '{path}'")]
     SaveFailed { path: Box<PathBuf>, source: std::io::Error },
 
-    #[error("Config serialization failed: {source}")]
+    #[error("Config serialization failed")]
     SerializationFailed { source: toml::ser::Error },
+}
+
+/// Render an error followed by its causes, outermost first, the way `{:#}`
+/// prints an `anyhow::Error`. For the error types here, which are logged
+/// and shown without being converted to one.
+///
+/// A message never repeats its own cause: variants with a `source` field
+/// leave it to the chain, so the cause is printed exactly once.
+pub fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut cause = err.source();
+    while let Some(err) = cause {
+        out.push_str(": ");
+        out.push_str(&err.to_string());
+        cause = err.source();
+    }
+    out
 }
 
 /// Result type alias for Voyager operations
@@ -161,6 +182,24 @@ mod tests {
         let msg = err.user_message();
         assert!(msg.contains("1000"));
         assert!(!msg.contains("Error")); // User-friendly, not technical
+    }
+
+    #[test]
+    fn cause_appears_once_in_a_printed_chain() {
+        let err = VoyagerError::from(DecoderError::InsufficientSamples { needed: 400, actual: 1 });
+        let chain = format!("{:#}", anyhow::Error::from(err).context("Decode failed"));
+        assert_eq!(chain, "Decode failed: Insufficient samples for decoding: needed 400, got 1");
+    }
+
+    #[test]
+    fn load_failure_names_its_cause_once() {
+        let err = VoyagerError::from(ConfigError::LoadFailed {
+            path: Box::new(PathBuf::from("settings.toml")),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+        });
+        let expected = "Failed to load config file 'settings.toml': permission denied";
+        assert_eq!(error_chain(&err), expected);
+        assert_eq!(format!("{:#}", anyhow::Error::from(err)), expected);
     }
 
     #[test]

@@ -75,7 +75,7 @@ impl BatchRunner {
 
                     let status = match result {
                         Ok(_) => BatchStatus::Done,
-                        Err(e) => BatchStatus::Error(e.to_string()),
+                        Err(e) => BatchStatus::Error(format!("{e:#}")),
                     };
                     let _ = tx.send(BatchProgressMsg::ItemStatus(index, status));
 

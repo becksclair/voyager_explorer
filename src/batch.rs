@@ -47,7 +47,7 @@ pub fn run_batch_processing(args: BatchArgs) -> Result<()> {
 
         match process_file(&path, &args.output_dir, &pipeline, &params) {
             Ok(_) => tracing::info!("Successfully processed {:?}", path),
-            Err(e) => tracing::error!("Failed to process {:?}: {}", path, e),
+            Err(e) => tracing::error!("Failed to process {:?}: {:#}", path, e),
         }
     }
 
@@ -56,8 +56,8 @@ pub fn run_batch_processing(args: BatchArgs) -> Result<()> {
 }
 
 fn process_file(input_path: &Path, output_dir: &Path, pipeline: &DecodingPipeline, params: &DecoderParams) -> Result<()> {
-    // Load WAV file
-    let reader = WavReader::from_file(input_path).context("Failed to load WAV file")?;
+    // No context here: the load error already names the operation and path.
+    let reader = WavReader::from_file(input_path)?;
 
     // Use left channel by default for batch processing
     let samples = reader.get_samples(crate::audio::WaveformChannel::Left);
