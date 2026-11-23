@@ -245,11 +245,15 @@ functions surfaced as CLI subcommands, runnable against the real assets.
       Solar Spectrum remains difficult to register because its planes
       differ. Some composites look brighter than published decodes,
       and the analog tape smear under glyphs is a source artifact.
-- [x] Full-frame desktop preview uses detected image bounds during
-      playback and seeking, with optional sync-margin cropping. The
-      48 kHz excerpt smoke test covered frame changes during playback,
-      waveform seeks during playback and while paused, and resume from
-      the new position.
+- [x] Full-frame desktop preview uses detected image bounds for manual
+      decoding, playback, and seeking. A window preview made during the
+      scan refreshes once when bounds arrive. Display cropping trims a
+      segmented image to its detected picture rows (leader lines and the
+      start burst vary per frame, so they are found, not assumed) and a
+      sync-locked decode to the columns between its sync bands. The
+      48 kHz excerpt smoke test covered frame changes during
+      playback, waveform seeks during playback and while paused, and
+      resume from the new position.
 
 ## Remaining work
 
@@ -257,6 +261,11 @@ functions surfaced as CLI subcommands, runnable against the real assets.
       stereo rip currently implies ~3 GB resident)
 - [ ] Playback-speed detection (sync-interval median ≈ 4.15 ms ⇒ 2×
       speed rip)
+- [ ] DC restoration: the recording is AC-coupled, so each line's level
+      drifts back toward mid-grey over roughly a fifth of the line. Black
+      diagram backgrounds decode grey, with a dark strip left at the line
+      start. Needs an inverse high-pass or per-line clamp, re-checked
+      against the Gate 2 composites.
 - [ ] Decoder presets and session save/load (single-image export from
       the main UI already landed in Phase 12)
 - [ ] TIFF/raw export; audio device disconnect recovery; accessibility;
