@@ -20,8 +20,9 @@ Prefer small, incremental changes that keep the app running.
   calibration circle through the "Home"/Earth color triplet, including the
   ill-posed Solar Spectrum triplet). Regenerate it with `just fixtures`
   from the source 48 kHz rip. Ignored integration tests in
-  `tests/excerpt_fixture_tests.rs` (segments-into-16, Earth-triplet
-  composites) run with `cargo test --test excerpt_fixture_tests -- --ignored`.
+  `tests/excerpt_fixture_tests.rs` (segments-into-16, per-frame picture
+  rows, burst-open frames not sheared, Earth-triplet composites) run with
+  `cargo test --test excerpt_fixture_tests -- --ignored`.
 
 ## Architecture
 
@@ -29,14 +30,19 @@ Prefer small, incremental changes that keep the app running.
   subcommands (flattened from `cli.rs`), and a `--load <wav>` GUI flag.
 - `cli.rs` — diagnostics harness: `decode` (time window → PNG with
   rotate/flip/invert/gamma), `spectrogram`, `syncs`, `classify`, `stats`,
-  `segment` (auto image-boundary catalog, optional per-image PNG decode),
+  `segment` (auto image-boundary catalog, optional per-image PNG decode
+  that also lists each frame's detected picture rows),
   `carve`. Thin shims over `analysis/` + `pipeline`; this is the
   agent-facing iteration loop against the real assets in `assets/`.
 - `app.rs` (`VoyagerApp`) — composition root: UI layout, playback state,
   and panel wiring. Orchestration lives in `services/`. The preview
   decodes one whole image at the playhead, from per-image ranges
-  (`find_image_bounds`) scanned in the background on load/channel switch;
-  until they arrive it decodes a `decode_window_secs` window instead.
+  (`find_image_bounds`) scanned in the background on load/channel switch.
+  With no bounds available, it decodes a `decode_window_secs` window.
+  A window decode made during a scan (Decode button or seek) refreshes
+  once at the current playhead if the scan finds an image and no later
+  decode supersedes it. A still-current decode dropped by a worker restart
+  is re-sent once (`RestartRetry`), playing or paused.
 - `audio.rs` (`WavReader`) — WAV loading/normalization: float32 and
   integer PCM at any rate ≥ 8 kHz (the masters are 384 kHz float32);
   `from_file_range` for windowed reads of huge files; samples live in
@@ -53,14 +59,22 @@ Prefer small, incremental changes that keep the app running.
 - `analysis/` — `spectrogram` (STFT → labeled PNG), `stats` (RMS/peak/
   ZCR/crest/dominant), `classify` (silence/tone/image-periodic/broadband
   segments), `sync` (spike+falling-edge line detector, predictive
-  tracker with per-line jitter smoothing, interval summary),
+  tracker seeded at the sync edge outside any start burst and walked in
+  both directions, with per-line jitter smoothing, split into separate
+  runs where a re-lock after coasting lands ≥1% of a line off the
+  prediction, interval summary),
   `segment` (per-image boundaries from sync-cadence breaks: split sync
   runs where an interval exceeds `gap_factor`× the median, drop short
-  runs and tone-classified runs), plus the one-shot `compute_spectrum`
-  (linear magnitude; UI converts to dB).
+  runs and tone-classified runs), `picture` (`find_picture_rows`: the
+  rows of one decoded frame that hold the picture, found from raw levels
+  by dropping leader lines, which are flat to the noise floor, and the
+  start burst), plus the one-shot `compute_spectrum` (linear magnitude;
+  UI converts to dB).
 - `pipeline.rs`, `batch.rs` — decode pipeline (`PipelineResult` →
   egui/PNG images; `to_egui_image(crop_sync)` transposes to the published
-  orientation and optionally crops the sync/leader margins, display-only),
+  orientation, with optional display-only cropping: a segmented,
+  sync-locked image to its detected `picture_rows`, and any sync-locked
+  decode to the columns between its sync bands),
   triplet compositing (`composite_triplet_levels`:
   joint percentile bounds over the content region only, plane
   registration via 2D normalized cross-correlation of per-scan-line-
@@ -87,7 +101,17 @@ Rip-specific decoding facts (verified): assets are float32 WAV; the
 48 kHz remaster needs no polarity inversion; decoded images need
 rotate90 + horizontal flip for correct orientation; lines are ~8.32 ms
 (≈400 samples at 48 kHz). Catalog slots are ~5.8 s apart with ~550–750
-sync-locked lines per image (not the nominal 512); inter-image gaps
+sync-locked lines per image (not the nominal 512). Inside a segmented
+range a complete picture is 519–534 lines (three ranges on the rip are
+cut short); the rest is leader (none to a fifth of the range), a 20-line
+start burst (a tone at 16 periods per line, not line-locked: its peaks
+also recur 410 samples apart at 48 kHz, close enough to a 400-sample line
+to capture a tracker seeded on it; the sync spike is present throughout)
+and up to 11 blank lines after it. The recording is AC-coupled: a line
+that starts at picture black drifts back toward mid-grey over roughly a
+fifth of the line, so black-background diagrams decode with a grey
+background and a dark strip at the line start. That strip is picture.
+Inter-image gaps
 show as 1.5–4× interval breaks in the sync cadence; the lead-in
 calibration tone sync-locks like an image and must be rejected by
 classification, not cadence. "Location of Our Solar System" is one

@@ -537,8 +537,9 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                 let mut member_levels: Vec<Option<Vec<f32>>> = vec![None; bounds.len()];
                 for (idx, b) in bounds.iter().enumerate() {
                     let window = &samples[b.start_sample..b.end_sample];
-                    let levels = match decoder.decode_levels(window, &decode_params, sample_rate) {
-                        Ok(levels) => levels,
+                    let (levels, sync_locked) = match decoder.decode_levels_with_sync_status(window, &decode_params, sample_rate)
+                    {
+                        Ok(decoded) => decoded,
                         Err(e) => {
                             tracing::warn!("image {idx} at {:.3}s failed to decode: {e:#}", start + b.start_secs);
                             continue;
@@ -551,6 +552,13 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                         width: plane_width as u32,
                         height: (levels.len() / plane_width) as u32,
                         mode: DecoderMode::Grayscale,
+                        segmented_image: true,
+                        sync_locked,
+                        // As in the GUI decode: picture rows are only
+                        // measurable on sync-aligned lines.
+                        picture_rows: sync_locked
+                            .then(|| crate::analysis::find_picture_rows(&levels, plane_width))
+                            .flatten(),
                     };
                     if triplets.iter().any(|t| t.contains(&idx)) {
                         member_levels[idx] = Some(levels);
@@ -562,7 +570,11 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                     };
                     let path = dir.join(name);
                     img.save(&path).with_context(|| format!("writing {}", path.display()))?;
-                    println!("  [{idx:03}] {} lines -> {}", frame.height, path.display());
+                    let picture = match &frame.picture_rows {
+                        Some(rows) => format!("picture {}..{} ({} lines)", rows.start, rows.end, rows.len()),
+                        None => "picture not found".to_string(),
+                    };
+                    println!("  [{idx:03}] {} lines, {picture} -> {}", frame.height, path.display());
                 }
 
                 if let Some(cat) = catalog {

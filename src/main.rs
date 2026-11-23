@@ -100,7 +100,7 @@ fn main() -> eframe::Result {
             };
 
             if let Err(e) = batch::run_batch_processing(args) {
-                tracing::error!("Batch processing failed: {}", e);
+                tracing::error!("Batch processing failed: {:#}", e);
                 std::process::exit(1);
             }
             return Ok(());

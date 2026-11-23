@@ -9,9 +9,10 @@
 //! cargo test --test excerpt_fixture_tests -- --ignored
 //! ```
 
-use voyager_explorer::analysis::{find_image_bounds, SegmentImagesParams};
+use voyager_explorer::analysis::sync::track_line_syncs;
+use voyager_explorer::analysis::{find_image_bounds, SegmentImagesParams, SyncParams};
 use voyager_explorer::audio::WavReader;
-use voyager_explorer::pipeline::composite_triplet_levels;
+use voyager_explorer::pipeline::{composite_triplet_levels, DecodingPipeline};
 use voyager_explorer::sstv::{DecoderMode, DecoderParams, SstvDecoder};
 
 const FIXTURE: &str = "assets/golden_record_excerpt_48k.wav";
@@ -46,6 +47,87 @@ fn excerpt_segments_into_sixteen_frames() {
     // still sits well above any inter-image fragment.
     for (i, b) in bounds.iter().enumerate() {
         assert!(b.line_count >= 400, "frame {i} has only {} scan lines", b.line_count);
+    }
+}
+
+/// Every frame's picture must be found inside its segmented range: the
+/// leader lines and start burst around it vary from frame to frame, the
+/// picture itself does not. This goes through the pipeline, as the GUI
+/// preview does.
+#[test]
+#[ignore = "requires assets/golden_record_excerpt_48k.wav (just fixtures)"]
+fn excerpt_frames_crop_to_their_pictures() {
+    let reader = WavReader::from_file(FIXTURE).expect("load fixture");
+    let samples = reader.left_channel.as_ref();
+    let bounds = find_image_bounds(samples, reader.sample_rate, &SegmentImagesParams::default());
+    let pipeline = DecodingPipeline::new();
+
+    let pictures: Vec<_> = bounds
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let result = pipeline
+                .process(
+                    &samples[b.start_sample..b.end_sample],
+                    &DecoderParams::default(),
+                    reader.sample_rate,
+                )
+                .unwrap_or_else(|e| panic!("frame {i} decodes: {e:#}"));
+            let rows = result.picture_rows.unwrap_or_else(|| panic!("frame {i}: no picture found"));
+            (result.height as usize, rows)
+        })
+        .collect();
+
+    // Pictures on this rip run 519-534 lines.
+    for (i, (_, rows)) in pictures.iter().enumerate() {
+        assert!(
+            (515..=540).contains(&rows.len()),
+            "frame {i}: picture is {} lines ({rows:?})",
+            rows.len()
+        );
+    }
+
+    // Frame 10 (a lunar photograph) is the hard case: uniform borders inside
+    // the picture, and about 120 lines of leader and burst before it. The
+    // borders stay, the leader goes.
+    let (height, rows) = &pictures[10];
+    assert!(rows.start >= 100, "frame 10 keeps leader before the picture: {rows:?}");
+    assert!(
+        height - rows.end >= 20,
+        "frame 10 keeps leader after the picture: {rows:?} of {height}"
+    );
+}
+
+/// Frames 0 and 5 open on the start burst. The line tracker must take its
+/// phase from the sync, not the burst tone: seeded on the tone it runs at
+/// the wrong period and shears the first 40 or so picture lines.
+#[test]
+#[ignore = "requires assets/golden_record_excerpt_48k.wav (just fixtures)"]
+fn excerpt_frames_opening_on_a_burst_are_not_sheared() {
+    let reader = WavReader::from_file(FIXTURE).expect("load fixture");
+    let samples = reader.left_channel.as_ref();
+    let bounds = find_image_bounds(samples, reader.sample_rate, &SegmentImagesParams::default());
+
+    for frame in [0, 5] {
+        let b = &bounds[frame];
+        let positions = track_line_syncs(
+            &samples[b.start_sample..b.end_sample],
+            reader.sample_rate,
+            &SyncParams::default(),
+        );
+        let intervals: Vec<f64> = positions.windows(2).map(|w| (w[1] - w[0]) as f64).collect();
+        let mut sorted = intervals.clone();
+        sorted.sort_by(f64::total_cmp);
+        let median = sorted[sorted.len() / 2];
+        let off_cadence = intervals
+            .iter()
+            .take(80)
+            .filter(|&&i| (i - median).abs() > median * 0.0075)
+            .count();
+        assert_eq!(
+            off_cadence, 0,
+            "frame {frame}: {off_cadence} of the first 80 lines are off the {median}-sample cadence"
+        );
     }
 }
 

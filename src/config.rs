@@ -223,7 +223,7 @@ impl AppConfig {
                 Self::default()
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to load config; using defaults");
+                tracing::warn!(error = %crate::error::error_chain(&e), "Failed to load config; using defaults");
                 Self::default()
             }
         }

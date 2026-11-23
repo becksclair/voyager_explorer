@@ -28,6 +28,88 @@ use crate::ui::theme;
 use crate::ui::waveform::WaveformPanel;
 use crate::utils::format_duration;
 
+/// Minimum spacing between restart-driven re-requests.
+const RESTART_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Re-request policy for a decode that a worker restart dropped.
+///
+/// A restart discards whatever the worker had queued. The preview would then
+/// stay stale whether playing or paused: the per-image playback trigger
+/// already counts that image as requested, and a paused seek has no trigger
+/// at all. The dropped decode is therefore re-sent at the playhead — once.
+/// If the re-sent request takes the worker down as well, the decode itself is
+/// failing, and sending it again would only restart the worker in a loop.
+/// Re-requests are also spaced by [`RESTART_RETRY_INTERVAL`]; one that falls
+/// inside the interval waits for it rather than being lost.
+#[derive(Debug, Default)]
+struct RestartRetry {
+    last_retry: Option<Instant>,
+    /// A dropped decode is waiting to be re-sent.
+    pending: bool,
+    /// The request now with the worker is itself a restart retry.
+    retried: bool,
+}
+
+impl RestartRetry {
+    /// Record a restart. `dropped` is whether it discarded a decode that is
+    /// still current.
+    fn on_restart(&mut self, dropped: bool) {
+        if !dropped {
+            return;
+        }
+        if self.retried {
+            tracing::warn!("Decode failed again after a worker restart; not retrying it");
+            self.retried = false;
+            self.pending = false;
+        } else {
+            self.pending = true;
+        }
+    }
+
+    /// A request from the user or from playback replaces whatever was dropped.
+    fn on_new_request(&mut self) {
+        self.pending = false;
+        self.retried = false;
+    }
+
+    /// The worker completed a decode, so its next failure is a new one.
+    fn on_result(&mut self) {
+        self.retried = false;
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Returns true when the dropped decode should be re-sent now. The caller
+    /// sends it and then calls [`Self::mark_retried`].
+    fn take_due(&mut self, now: Instant) -> bool {
+        let interval_elapsed = self
+            .last_retry
+            .is_none_or(|last| now.duration_since(last) >= RESTART_RETRY_INTERVAL);
+        if !self.pending || !interval_elapsed {
+            return false;
+        }
+        self.pending = false;
+        self.last_retry = Some(now);
+        true
+    }
+
+    fn mark_retried(&mut self) {
+        self.retried = true;
+    }
+}
+
+/// How a window preview shown during the image-bounds scan was produced, so
+/// it can be redone the same way as a full frame once the bounds arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowPreview {
+    /// The Decode button: decoded on the UI thread.
+    Manual,
+    /// A seek or live decode: decoded by the background worker.
+    Worker,
+}
+
 pub struct VoyagerApp {
     // Configuration
     config: AppConfig,
@@ -56,6 +138,9 @@ pub struct VoyagerApp {
     /// instead of an arbitrary time window.
     image_bounds: Vec<std::ops::Range<usize>>,
     image_bounds_rx: Option<std::sync::mpsc::Receiver<Vec<std::ops::Range<usize>>>>,
+    /// A window preview taken while the bounds scan was running, to be
+    /// replaced by the full frame once the bounds arrive.
+    pending_full_frame: Option<WindowPreview>,
     /// Start sample of the image last sent to the decoder, so playback does
     /// not re-decode the current image every interval.
     last_decoded_image_start: Option<usize>,
@@ -86,8 +171,9 @@ pub struct VoyagerApp {
 
     // Background decoding worker
     decode_worker: DecodeOrchestrator,
-    /// Input-state generation: bumped on file load and channel switch so
-    /// stale worker results can be recognized and dropped.
+    restart_retry: RestartRetry,
+    /// Bumped on file load, channel switch, and successful manual decode so
+    /// older worker results cannot replace the current preview.
     decode_generation: u64,
     /// Last decode error surfaced, to avoid re-raising the identical error
     /// every live-decode interval (which would defeat the dismiss button).
@@ -144,6 +230,7 @@ impl Default for VoyagerApp {
             sync_scan_rx: None,
             image_bounds: Vec::new(),
             image_bounds_rx: None,
+            pending_full_frame: None,
             last_decoded_image_start: None,
             pending_image_retry: false,
             audio_state: AudioPlaybackState::Uninitialized,
@@ -161,6 +248,7 @@ impl Default for VoyagerApp {
             #[cfg(not(feature = "audio_playback"))]
             playback_start_position: 0,
             decode_worker: DecodeOrchestrator::new(),
+            restart_retry: RestartRetry::default(),
             decode_generation: 0,
             last_decode_error: None,
             metrics: AppMetrics::new(),
@@ -206,7 +294,7 @@ impl VoyagerApp {
                 self.refresh_image_bounds();
             }
             Err(e) => {
-                tracing::error!(path = %path.display(), error = %e, "Failed to load WAV file");
+                tracing::error!(path = %path.display(), error = %crate::error::error_chain(&e), "Failed to load WAV file");
                 // Keep any previously loaded file fully usable — only the new
                 // load failed. Reset state only when nothing was loaded.
                 if self.wav_reader.is_none() {
@@ -218,7 +306,7 @@ impl VoyagerApp {
                 // Extract user-friendly error message
                 self.error_message = Some(match e {
                     VoyagerError::Audio(audio_err) => audio_err.user_message(),
-                    _ => format!("Failed to load audio file: {}", e),
+                    _ => format!("Failed to load audio file: {}", crate::error::error_chain(&e)),
                 });
             }
         }
@@ -256,7 +344,11 @@ impl VoyagerApp {
         }
     }
 
-    fn handle_decode(&mut self, ctx: &egui::Context) {
+    /// Decode the playhead's image (or window) on the UI thread. A `refresh`
+    /// replaces a manual window preview once image bounds arrive, and leaves
+    /// an unread error in place. A failed decode keeps the previous preview,
+    /// and with it any full-frame refresh that preview is still due.
+    fn handle_decode(&mut self, ctx: &egui::Context, refresh: bool) {
         // Decode the single image at the playhead when boundaries are known,
         // so a multi-image file shows one recognizable frame. When bounds are
         // not yet available (still scanning, or a tone-only file) decode a
@@ -278,13 +370,23 @@ impl VoyagerApp {
             }
         };
 
-        // Clear any previous errors
-        self.error_message = None;
+        // A decode the user asked for starts from a clean status line. A
+        // refresh is automatic, so it leaves an undismissed error alone.
+        if !refresh {
+            self.error_message = None;
+        }
 
         // Perform decode with error handling using unified pipeline
         let pipeline = crate::pipeline::DecodingPipeline::new();
         match pipeline.process(samples, &self.params, reader.sample_rate) {
-            Ok(result) => {
+            Ok(mut result) => {
+                result.segmented_image = image_start.is_some();
+                self.pending_full_frame = (range.is_none() && self.image_bounds_rx.is_some()).then_some(WindowPreview::Manual);
+                // An older live decode must not overwrite this manual preview,
+                // and neither should a re-request of one a restart dropped.
+                self.decode_generation += 1;
+                self.pending_image_retry = false;
+                self.restart_retry.on_new_request();
                 tracing::info!(pixels = result.pixels.len(), "Decode completed successfully");
                 let img = result.to_egui_image(self.crop_sync_margins);
                 self.image_texture = Some(ctx.load_texture("decoded", img, Default::default()));
@@ -295,10 +397,11 @@ impl VoyagerApp {
                 self.last_decoded_image_start = image_start;
             }
             Err(e) => {
-                tracing::error!(error = %e, "Decode failed");
-                self.error_message = Some(format!("Decode failed: {}", e));
-                self.image_texture = None;
-                self.last_decoded = None;
+                tracing::error!(error = %format!("{e:#}"), "Decode failed");
+                self.error_message = Some(format!("Decode failed: {e:#}"));
+                // The previous preview stays on screen under the error. It no
+                // longer counts as the playhead's image, so playback decodes
+                // that image again.
                 self.last_decoded_image_start = None;
             }
         }
@@ -306,8 +409,13 @@ impl VoyagerApp {
 
     /// Restart the decode worker after a crash or timeout, recording metrics.
     fn restart_worker(&mut self) {
+        // Anything still queued (or finished but not yet polled) is lost. Only
+        // work for the current generation is worth re-sending: a file load,
+        // channel switch, or manual decode already superseded anything older.
+        let dropped = self.decode_worker.newest_pending_generation() == Some(self.decode_generation);
         self.decode_worker.restart();
         self.metrics.record_worker_restart();
+        self.restart_retry.on_restart(dropped);
     }
 
     /// Kick off a background scan of the selected channel for sync tones,
@@ -353,8 +461,10 @@ impl VoyagerApp {
     fn refresh_image_bounds(&mut self) {
         self.image_bounds.clear();
         self.image_bounds_rx = None;
+        self.pending_full_frame = None;
         self.last_decoded_image_start = None;
         self.pending_image_retry = false;
+        self.restart_retry.on_new_request();
 
         let Some(reader) = &self.wav_reader else {
             return;
@@ -603,6 +713,7 @@ impl VoyagerApp {
         // when the request is dropped. Keeps "retry armed" ⟺ "last attempt hit
         // the queue and was refused".
         self.pending_image_retry = false;
+        self.restart_retry.on_new_request();
         if let Some(reader) = &self.wav_reader {
             // Get shared reference to samples (Arc enables zero-copy sharing with worker)
             let samples: Arc<[f32]> = match self.selected_channel {
@@ -651,27 +762,24 @@ impl VoyagerApp {
                 return;
             }
 
-            let (start_offset, params) = match &range {
-                Some(r) => {
-                    let secs = ((r.end - r.start) as f64 / sample_rate as f64).clamp(0.1, 60.0);
-                    (
-                        r.start,
-                        DecoderParams {
-                            decode_window_secs: secs,
-                            ..self.params
-                        },
-                    )
-                }
-                None => (position, self.params),
-            };
+            let image_start = range.as_ref().map(|r| r.start);
+            let windowed_during_scan = range.is_none() && self.image_bounds_rx.is_some();
             let accepted = self.decode_worker.request(
                 samples,
-                start_offset,
-                params,
+                position,
+                range,
+                self.params,
                 sample_rate,
                 self.config.worker.max_queue_size,
                 self.decode_generation,
             );
+            // Only a request the worker took supersedes an earlier window
+            // preview; an early return or refusal leaves that preview on
+            // screen, still due its full-frame refresh. A window decoded
+            // while the scan is running is itself due one.
+            if accepted {
+                self.pending_full_frame = windowed_during_scan.then_some(WindowPreview::Worker);
+            }
             // Record the image we're on regardless of acceptance, so the
             // per-image playback trigger does not re-fire every frame. If the
             // request was dropped on a full queue, arm a retry instead of
@@ -680,7 +788,7 @@ impl VoyagerApp {
             // without spinning `decode_at_position` here on every repaint.
             // A refusal with free slots means the worker is gone; retrying
             // that would spin every frame until it is restarted.
-            self.last_decoded_image_start = range.map(|r| r.start);
+            self.last_decoded_image_start = image_start;
             self.pending_image_retry = !accepted && self.decode_worker.pending() >= self.config.worker.max_queue_size;
         }
     }
@@ -888,13 +996,6 @@ impl eframe::App for VoyagerApp {
         }
         self.frame_start = Some(Instant::now());
 
-        // Check worker health and restart if needed
-        let max_unresponsive = Duration::from_millis(self.config.worker.max_unresponsive_ms);
-        if self.config.worker.auto_restart_on_panic && !self.decode_worker.is_healthy(max_unresponsive) {
-            self.error_message = Some("Worker thread crashed or timed out, restarting...".to_string());
-            self.restart_worker();
-        }
-
         // Collect the background sync scan result, if one is in flight
         if let Some(rx) = &self.sync_scan_rx {
             match rx.try_recv() {
@@ -915,11 +1016,13 @@ impl eframe::App for VoyagerApp {
         }
 
         // Collect the background image-bounds scan result, if one is in flight
+        let mut refresh_preview = None;
         if let Some(rx) = &self.image_bounds_rx {
             match rx.try_recv() {
                 Ok(ranges) => {
                     self.image_bounds = ranges;
                     self.image_bounds_rx = None;
+                    refresh_preview = self.pending_full_frame.take();
                     ctx.request_repaint();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -928,6 +1031,15 @@ impl eframe::App for VoyagerApp {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     tracing::warn!("Image-bounds scan thread exited without a result");
                     self.image_bounds_rx = None;
+                    self.pending_full_frame = None;
+                }
+            }
+        }
+        if let Some(preview) = refresh_preview {
+            if self.image_range_at(self.current_position_samples).is_some() {
+                match preview {
+                    WindowPreview::Manual => self.handle_decode(ctx, true),
+                    WindowPreview::Worker => self.decode_at_position(ctx, self.current_position_samples),
                 }
             }
         }
@@ -962,10 +1074,9 @@ impl eframe::App for VoyagerApp {
 
             // Record metrics (track both success and failure)
             self.metrics.record_decode(decode_duration, pixel_count, success);
+            self.restart_retry.on_result();
 
-            // Results from a previous file/channel generation are stale:
-            // displaying (or exporting) them would attribute old audio's
-            // pixels to the current input.
+            // A file load, channel switch, or manual decode superseded these results.
             if generation != self.decode_generation {
                 tracing::debug!(generation, current = self.decode_generation, "Dropping stale decode result");
                 continue;
@@ -973,7 +1084,8 @@ impl eframe::App for VoyagerApp {
 
             // Handle error or update texture. Identical consecutive errors are
             // not re-raised — live decode retries every interval and would
-            // otherwise make the dismiss button useless.
+            // otherwise make the dismiss button useless. The message carries
+            // the cause, so a different failure does raise a new banner.
             if let Some(err_msg) = error {
                 let msg = format!("Decode failed: {}", err_msg);
                 if self.last_decode_error.as_deref() != Some(msg.as_str()) {
@@ -988,6 +1100,26 @@ impl eframe::App for VoyagerApp {
             }
         }
 
+        // Check worker health and restart if needed. This runs after the
+        // poll above on purpose: the health check only sees results that
+        // have been collected, so checking first would restart a healthy
+        // worker whenever the UI thread stalled past the timeout with a
+        // decode in flight (a blocking file dialog, a hidden window).
+        let max_unresponsive = Duration::from_millis(self.config.worker.max_unresponsive_ms);
+        if self.config.worker.auto_restart_on_panic && !self.decode_worker.is_healthy(max_unresponsive) {
+            self.error_message = Some("Worker thread crashed or timed out, restarting...".to_string());
+            self.restart_worker();
+        }
+        // Re-send a decode the restart dropped, playing or paused. One that
+        // is waiting out the retry interval needs a repaint to come due,
+        // since a paused, idle UI stops repainting.
+        if self.restart_retry.take_due(Instant::now()) {
+            self.decode_at_position(ctx, self.current_position_samples);
+            self.restart_retry.mark_retried();
+        } else if self.restart_retry.is_pending() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
         // Re-send a live decode that was dropped on a full queue, but only now
         // that `poll` above may have freed a slot — not every frame while the
         // worker is busy. `decode_at_position` clears the retry flag on entry
@@ -999,9 +1131,8 @@ impl eframe::App for VoyagerApp {
 
         // Keep the frame loop alive while a decode is in flight so its result
         // is polled within a frame. A paused, idle UI otherwise stops
-        // repainting, leaving a finished result uncollected — and the health
-        // check then mistakes that gap for an unresponsive worker and restarts
-        // it (discarding the result).
+        // repainting, leaving a finished result uncollected and the preview
+        // stale until the next input event.
         if self.decode_worker.pending() > 0 {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
@@ -1263,6 +1394,12 @@ impl eframe::App for VoyagerApp {
                             self.sync_positions.len().to_string()
                         };
                         theme::key_value(ui, "Sync marks", &sync_marks);
+                        let images = if self.image_bounds_rx.is_some() {
+                            "scanning…".to_string()
+                        } else {
+                            self.image_bounds.len().to_string()
+                        };
+                        theme::key_value(ui, "Detected images", &images);
                         if let Some((freq, mag)) = peak {
                             theme::key_value(ui, "Dominant", &format!("{:.0} Hz ({:.1})", freq, mag));
                         }
@@ -1393,7 +1530,7 @@ impl eframe::App for VoyagerApp {
                         theme::section_label(ui, "Image Decode");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Decode").clicked() {
-                                self.handle_decode(ctx);
+                                self.handle_decode(ctx, false);
                             }
                             let lines = self.last_decoded.as_ref().map(|r| r.height).unwrap_or(0);
                             ui.label(
@@ -1423,5 +1560,75 @@ impl eframe::App for VoyagerApp {
                     });
                 });
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RestartRetry, RESTART_RETRY_INTERVAL};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn dropped_decode_is_retried_once() {
+        let mut retry = RestartRetry::default();
+        let now = Instant::now();
+
+        retry.on_restart(true);
+        assert!(retry.take_due(now));
+        assert!(!retry.take_due(now), "one restart yields one retry");
+        retry.mark_retried();
+
+        // The retry took the worker down too: give up rather than loop.
+        retry.on_restart(true);
+        assert!(!retry.is_pending());
+        assert!(!retry.take_due(now + RESTART_RETRY_INTERVAL));
+    }
+
+    #[test]
+    fn restart_that_dropped_nothing_is_not_retried() {
+        let mut retry = RestartRetry::default();
+        retry.on_restart(false);
+        assert!(!retry.is_pending());
+        assert!(!retry.take_due(Instant::now()));
+    }
+
+    #[test]
+    fn retry_inside_the_interval_waits_for_it() {
+        let mut retry = RestartRetry::default();
+        let first = Instant::now();
+        retry.on_restart(true);
+        assert!(retry.take_due(first));
+        retry.mark_retried();
+        retry.on_result();
+
+        // A later decode is dropped by a second restart inside the interval.
+        retry.on_new_request();
+        retry.on_restart(true);
+        let expiry = first + RESTART_RETRY_INTERVAL;
+        assert!(!retry.take_due(expiry - Duration::from_millis(1)));
+        assert!(retry.is_pending());
+        assert!(retry.take_due(expiry));
+        assert!(!retry.take_due(expiry + Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn completed_decode_makes_the_next_failure_retryable() {
+        let mut retry = RestartRetry::default();
+        let now = Instant::now();
+        retry.on_restart(true);
+        assert!(retry.take_due(now));
+        retry.mark_retried();
+
+        retry.on_result();
+        retry.on_restart(true);
+        assert!(retry.is_pending());
+    }
+
+    #[test]
+    fn new_request_supersedes_a_waiting_retry() {
+        let mut retry = RestartRetry::default();
+        retry.on_restart(true);
+        retry.on_new_request();
+        assert!(!retry.take_due(Instant::now()));
     }
 }

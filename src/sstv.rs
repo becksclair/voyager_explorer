@@ -1,7 +1,9 @@
 use std::f32::consts::PI;
+use std::ops::Range;
 
 use realfft::{RealFftPlanner, RealToComplex};
 
+use crate::analysis::picture::find_picture_rows;
 use crate::analysis::sync::{interval_summary, track_line_syncs, SyncParams};
 use crate::error::{DecoderError, Result, VoyagerError};
 
@@ -10,6 +12,16 @@ use crate::error::{DecoderError, Result, VoyagerError};
 const TARGET_FREQ_HZ: f32 = 1200.0;
 /// FFT chunk size for frequency analysis
 const CHUNK_SIZE: usize = 2048;
+
+/// Pixels from one decode, with what the display crop needs to know about it.
+pub(crate) struct DecodedFrame {
+    pub pixels: Vec<u8>,
+    /// Line segmentation used detected syncs, not the fixed-period fallback.
+    pub sync_locked: bool,
+    /// Rows holding the picture, when the detector could tell (see
+    /// [`find_picture_rows`]).
+    pub picture_rows: Option<Range<usize>>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecoderMode {
@@ -240,9 +252,25 @@ impl SstvDecoder {
     /// Returns [`DecoderError::InvalidParams`] if gamma is out of range 0.1-10.
     /// Returns [`DecoderError::InsufficientSamples`] if buffer is too short.
     pub fn decode(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Result<Vec<u8>> {
-        let levels = self.decode_levels(samples, params, sample_rate)?;
+        self.decode_frame(samples, params, sample_rate).map(|frame| frame.pixels)
+    }
+
+    /// Decode to pixels, keeping what the display crop needs to know about
+    /// the decode.
+    pub(crate) fn decode_frame(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Result<DecodedFrame> {
+        let (levels, sync_locked) = self.decode_levels_with_sync_status(samples, params, sample_rate)?;
         let width = params.effective_width();
         let lines_decoded = levels.len() / width;
+
+        // The detector measures the central part of each line, which only
+        // excludes the sync bands when lines are sync-aligned. PseudoColor
+        // folds three lines into one output row, so line rows are not image
+        // rows there.
+        let picture_rows = if sync_locked && params.mode == DecoderMode::Grayscale {
+            find_picture_rows(&levels, width)
+        } else {
+            None
+        };
 
         // --- Normalization ---
         // Percentile contrast stretch is robust to sync-spike outliers.
@@ -294,7 +322,11 @@ impl SstvDecoder {
 
         tracing::debug!(lines_decoded, pixels = image.len(), "Decode operation completed");
 
-        Ok(image)
+        Ok(DecodedFrame {
+            pixels: image,
+            sync_locked,
+            picture_rows,
+        })
     }
 
     /// Decode to raw per-pixel luminance levels (row-major, `width` per
@@ -303,6 +335,18 @@ impl SstvDecoder {
     /// where stretching each frame by its own bounds would skew the color
     /// balance.
     pub fn decode_levels(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Result<Vec<f32>> {
+        self.decode_levels_with_sync_status(samples, params, sample_rate)
+            .map(|(levels, _)| levels)
+    }
+
+    /// [`Self::decode_levels`], plus whether line segmentation used detected
+    /// syncs instead of the fixed-period fallback.
+    pub(crate) fn decode_levels_with_sync_status(
+        &self,
+        samples: &[f32],
+        params: &DecoderParams,
+        sample_rate: u32,
+    ) -> Result<(Vec<f32>, bool)> {
         // Validate parameters
         if !(1.0..=100.0).contains(&params.line_duration_ms) {
             return Err(VoyagerError::Decoder(DecoderError::InvalidLineDuration {
@@ -348,7 +392,7 @@ impl SstvDecoder {
         // Sync-locked when the detector finds a consistent line cadence;
         // otherwise fixed-period slicing at the nominal duration. Re-anchoring
         // at every detected sync keeps timing error from accumulating (slant).
-        let line_ranges = self.segment_lines(samples, params, sample_rate, samples_per_line, max_lines);
+        let (line_ranges, sync_locked) = self.segment_lines(samples, params, sample_rate, samples_per_line, max_lines);
 
         // --- Per-line level extraction ---
         // Resample each line to `width` luminance levels. Bin-averaging on
@@ -359,7 +403,7 @@ impl SstvDecoder {
             let slice = &samples[range.clone()];
             resample_line(slice, width, &mut levels);
         }
-        Ok(levels)
+        Ok((levels, sync_locked))
     }
 
     /// Segment samples into per-line ranges. Prefers sync-locked boundaries;
@@ -372,7 +416,7 @@ impl SstvDecoder {
         sample_rate: u32,
         samples_per_line: usize,
         max_lines: usize,
-    ) -> Vec<std::ops::Range<usize>> {
+    ) -> (Vec<std::ops::Range<usize>>, bool) {
         if params.sync_lock {
             let sync_params = SyncParams {
                 expected_line_ms: params.line_duration_ms,
@@ -422,7 +466,7 @@ impl SstvDecoder {
                             median_interval = median,
                             "Sync-locked line segmentation"
                         );
-                        return ranges;
+                        return (ranges, true);
                     }
                 }
             }
@@ -435,7 +479,7 @@ impl SstvDecoder {
             ranges.push(i..i + samples_per_line);
             i += samples_per_line;
         }
-        ranges
+        (ranges, false)
     }
 }
 
@@ -947,7 +991,9 @@ mod tests {
         let audio = crate::test_fixtures::encode_image_to_audio(&pixels, width, sample_rate, params.line_duration_ms);
         let samples_per_line = (params.line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
 
-        let ranges = decoder.segment_lines(&audio, &params, sample_rate, samples_per_line, 1000);
+        let (ranges, _) = decoder.segment_lines(&audio, &params, sample_rate, samples_per_line, 1000);
+        let frame = decoder.decode_frame(&audio, &params, sample_rate).unwrap();
+        assert!(frame.sync_locked);
 
         // The sync-locked path must engage (>= 4 detected line syncs) and yield a
         // line per detected interval, near the nominal cadence.
@@ -982,7 +1028,10 @@ mod tests {
         // the decoder falls back to evenly-spaced fixed-period slicing.
         let samples = vec![0.5f32; samples_per_line * 5];
 
-        let ranges = decoder.segment_lines(&samples, &params, sample_rate, samples_per_line, 1000);
+        let (ranges, _) = decoder.segment_lines(&samples, &params, sample_rate, samples_per_line, 1000);
+        let frame = decoder.decode_frame(&samples, &params, sample_rate).unwrap();
+        assert!(!frame.sync_locked);
+        assert_eq!(frame.picture_rows, None);
 
         assert_eq!(ranges.len(), 5);
         for (i, r) in ranges.iter().enumerate() {
@@ -1004,7 +1053,7 @@ mod tests {
         let samples_per_line = 400usize;
         let samples = vec![0.5f32; samples_per_line * 10];
 
-        let ranges = decoder.segment_lines(&samples, &params, sample_rate, samples_per_line, 3);
+        let (ranges, _) = decoder.segment_lines(&samples, &params, sample_rate, samples_per_line, 3);
         assert_eq!(ranges.len(), 3);
     }
 

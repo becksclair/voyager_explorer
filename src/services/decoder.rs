@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -15,6 +16,8 @@ pub struct DecodeOrchestrator {
     handle: Option<JoinHandle<()>>,
     next_id: u64,
     pending: usize,
+    /// Generation of the most recently accepted request.
+    newest_generation: u64,
     last_response: Instant,
 }
 
@@ -27,12 +30,20 @@ impl DecodeOrchestrator {
             handle: Some(handle),
             next_id: 0,
             pending: 0,
+            newest_generation: 0,
             last_response: Instant::now(),
         }
     }
 
     pub fn pending(&self) -> usize {
         self.pending
+    }
+
+    /// Generation of the newest request still outstanding, if any. The
+    /// worker serves requests in order, so while anything is pending the
+    /// newest request is part of it.
+    pub fn newest_pending_generation(&self) -> Option<u64> {
+        (self.pending > 0).then_some(self.newest_generation)
     }
 
     /// Enqueue a decode request (non-blocking). Returns false when the queue
@@ -42,6 +53,7 @@ impl DecodeOrchestrator {
         &mut self,
         samples: Arc<[f32]>,
         start_offset: usize,
+        image_range: Option<Range<usize>>,
         params: DecoderParams,
         sample_rate: u32,
         max_queue: usize,
@@ -59,6 +71,7 @@ impl DecodeOrchestrator {
             generation,
             samples,
             start_offset,
+            image_range,
             params,
             sample_rate,
         };
@@ -75,6 +88,7 @@ impl DecodeOrchestrator {
             self.pending = self.pending.saturating_sub(1);
             return false;
         }
+        self.newest_generation = generation;
         true
     }
 
@@ -93,6 +107,8 @@ impl DecodeOrchestrator {
     }
 
     /// Health check: thread alive, and responsive while work is pending.
+    /// Call it after [`Self::poll`]: a finished result still waiting in the
+    /// channel counts as unanswered work.
     pub fn is_healthy(&self, max_unresponsive: Duration) -> bool {
         let Some(handle) = &self.handle else {
             tracing::warn!("Worker handle is None, needs restart");
@@ -167,13 +183,14 @@ impl Drop for DecodeOrchestrator {
 pub struct DecodeRequest {
     /// Unique request ID for matching results to requests
     pub id: u64,
-    /// Input-state generation (bumped on file load / channel switch). Results
-    /// from an older generation are stale and must not be displayed.
+    /// Input-state generation. Results from an older generation are stale.
     pub generation: u64,
     /// Shared audio buffer (Arc enables zero-copy sharing with worker thread)
     pub samples: Arc<[f32]>,
-    /// Starting sample position for decode window
+    /// Starting sample position for the fallback decode window
     pub start_offset: usize,
+    /// Detected image range, if the bounds scan found one for this position
+    pub image_range: Option<Range<usize>>,
     /// Decoder parameters (line duration, threshold)
     pub params: DecoderParams,
     /// Sample rate in Hz (needed for samples-per-line calculation)
@@ -210,20 +227,21 @@ pub fn spawn_decode_worker() -> (Sender<DecodeRequest>, Receiver<DecodeResult>, 
             let start_time = Instant::now();
             tracing::debug!("Starting decode for request {}", request.id);
 
-            // Handle slicing here since DecodingPipeline expects a slice
-            // We need to calculate the slice based on start_offset and decode_window_secs
-            let window_duration_secs = request.params.decode_window_secs;
-            let window_samples = (window_duration_secs * request.sample_rate as f64) as usize;
-            let end_offset = request.start_offset.saturating_add(window_samples).min(request.samples.len());
-
-            let samples_slice = if request.start_offset < request.samples.len() {
-                &request.samples[request.start_offset..end_offset]
+            let (start_offset, end_offset) = if let Some(range) = &request.image_range {
+                // Keep the worker's 60-second limit on detected image ranges.
+                let max_image_samples = (request.sample_rate as usize).saturating_mul(60);
+                (range.start, range.end.min(range.start.saturating_add(max_image_samples)))
             } else {
-                &[]
+                let window_samples = (request.params.decode_window_secs * request.sample_rate as f64) as usize;
+                (request.start_offset, request.start_offset.saturating_add(window_samples))
             };
+            let end_offset = end_offset.min(request.samples.len());
+            let samples_slice = request.samples.get(start_offset..end_offset).unwrap_or(&[]);
+            let segmented_image = request.image_range.is_some_and(|range| range.end == end_offset);
 
             let result = match pipeline.process(samples_slice, &request.params, request.sample_rate) {
-                Ok(pipeline_result) => {
+                Ok(mut pipeline_result) => {
+                    pipeline_result.segmented_image = segmented_image;
                     tracing::debug!("Decode successful for request {}", request.id);
                     DecodeResult {
                         id: request.id,
@@ -234,13 +252,13 @@ pub fn spawn_decode_worker() -> (Sender<DecodeRequest>, Receiver<DecodeResult>, 
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Decode failed for request {}: {}", request.id, e);
+                    tracing::error!("Decode failed for request {}: {:#}", request.id, e);
                     DecodeResult {
                         id: request.id,
                         generation: request.generation,
                         result: None,
                         decode_duration: start_time.elapsed(),
-                        error: Some(e.to_string()),
+                        error: Some(format!("{e:#}")),
                     }
                 }
             };
@@ -255,4 +273,104 @@ pub fn spawn_decode_worker() -> (Sender<DecodeRequest>, Receiver<DecodeResult>, 
     });
 
     (request_tx, result_rx, handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_decodes_the_requested_image_range() {
+        let sample_rate = 48_000;
+        let params = DecoderParams::default();
+        let width = 64;
+        let pixels: Vec<u8> = (0..width * 40).map(|i| (i % 256) as u8).collect();
+        let image = crate::test_fixtures::encode_image_to_audio(&pixels, width, sample_rate, params.line_duration_ms);
+        // Silence on both sides: only the image range should be decoded.
+        let lead = sample_rate as usize;
+        let mut samples = vec![0.0f32; lead];
+        samples.extend_from_slice(&image);
+        samples.extend(std::iter::repeat_n(0.0, lead));
+        let samples: Arc<[f32]> = samples.into();
+        let image_range = lead..lead + image.len();
+
+        let (tx, rx, _handle) = spawn_decode_worker();
+        let request = |id, image_range: Option<Range<usize>>| DecodeRequest {
+            id,
+            generation: 0,
+            samples: Arc::clone(&samples),
+            start_offset: 0,
+            image_range,
+            params,
+            sample_rate,
+        };
+        tx.send(request(1, Some(image_range.clone()))).unwrap();
+        // A range running past the buffer is truncated, so it is not a whole image.
+        tx.send(request(2, Some(image_range.start..samples.len() + 1))).unwrap();
+
+        let whole = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        let whole = whole.result.expect("image range decodes");
+        assert!(whole.segmented_image);
+        let samples_per_line = (params.line_duration_ms / 1000.0 * sample_rate as f32).round() as usize;
+        assert!(whole.height as usize <= image.len() / samples_per_line + 1);
+
+        let truncated = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(!truncated.result.expect("truncated range decodes").segmented_image);
+    }
+
+    #[test]
+    fn newest_pending_generation_follows_outstanding_work() {
+        let mut worker = DecodeOrchestrator::new();
+        assert_eq!(worker.newest_pending_generation(), None);
+
+        let samples: Arc<[f32]> = vec![0.0f32; 16].into();
+        for generation in [3, 7] {
+            assert!(worker.request(Arc::clone(&samples), 0, None, DecoderParams::default(), 48_000, 4, generation));
+        }
+        assert_eq!(worker.newest_pending_generation(), Some(7));
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while worker.pending() > 0 && Instant::now() < deadline {
+            worker.poll();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(worker.newest_pending_generation(), None);
+    }
+
+    #[test]
+    fn failed_decode_reports_its_cause() {
+        let mut worker = DecodeOrchestrator::new();
+        // Far too short for one scan line.
+        let samples: Arc<[f32]> = vec![0.0f32; 16].into();
+        assert!(worker.request(samples, 0, None, DecoderParams::default(), 48_000, 4, 0));
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut results = Vec::new();
+        while results.is_empty() && Instant::now() < deadline {
+            results = worker.poll();
+            thread::sleep(Duration::from_millis(5));
+        }
+        let error = results[0].error.as_deref().expect("decode fails");
+        assert!(error.contains("Insufficient samples"), "{error}");
+        assert!(error.contains("got 16"), "{error}");
+    }
+
+    #[test]
+    fn uncollected_result_reads_as_unresponsive_until_polled() {
+        let mut worker = DecodeOrchestrator::new();
+        let samples: Arc<[f32]> = vec![0.0f32; 16].into();
+        assert!(worker.request(samples, 0, None, DecoderParams::default(), 48_000, 4, 0));
+
+        // The caller stalls past the timeout without polling.
+        let timeout = Duration::from_millis(50);
+        thread::sleep(timeout * 2);
+        assert!(!worker.is_healthy(timeout));
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while worker.pending() > 0 && Instant::now() < deadline {
+            worker.poll();
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(worker.is_healthy(timeout));
+    }
 }
