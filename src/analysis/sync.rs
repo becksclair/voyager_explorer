@@ -232,6 +232,10 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
     // on no sync at all (silence or noise ahead of the first line), and
     // keeping it would count against the lock fraction below.
     let mut backed_by_lock = 0;
+    // Backward lines that re-locked off the prediction after a coast, by
+    // their index in walk order.
+    let mut backward_relocks = Vec::new();
+    let mut was_coasting = false;
     loop {
         let predict = pos - period;
         // Stop where the search window would run off the buffer: a spike cut
@@ -242,6 +246,9 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
         let lock = lock_near(predict, pos, period).filter(|&(min_idx, _)| (min_idx as f64) < pos);
         let next = match lock {
             Some((min_idx, strong)) => {
+                if was_coasting && (min_idx as f64 - predict).abs() >= period * JITTER_RELOCK_FRAC {
+                    backward_relocks.push(positions.len());
+                }
                 locked += usize::from(strong);
                 min_idx as f64
             }
@@ -252,12 +259,20 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
             backed_by_lock = positions.len();
         }
         pos = next;
+        was_coasting = lock.is_none();
     }
     positions.truncate(backed_by_lock);
     positions.reverse();
+    // In time order the step lies just after a backward re-lock: the lines
+    // coasted over on the way to it were predicted from the later side, so
+    // the later run starts at the first of them.
+    let mut run_starts: Vec<usize> = backward_relocks
+        .iter()
+        .rev()
+        .map(|&walked| positions.len() - walked)
+        .collect();
     positions.push(seed);
 
-    let mut run_starts = Vec::new();
     let mut pos = seed as f64;
     let mut was_coasting = false;
     loop {
@@ -804,6 +819,37 @@ mod tests {
             "first whole line is missing"
         );
         assert!(positions.len() >= 58, "only {} lines tracked", positions.len());
+    }
+
+    #[test]
+    fn tracker_preserves_offset_at_a_relock_before_the_seed() {
+        // A long burst with a five-line dropout, after which every sync
+        // sits 18 samples later. The seed lands after the burst, so the
+        // step is met on the backward walk.
+        let (period, lines, burst_lines) = (400usize, 160usize, 100usize);
+        let (dropout, relock) = (75usize, 80usize);
+        let truth = |line: usize| 430 + line * period + if line >= relock { 18 } else { 0 };
+        let tone = |t: usize| 0.7 * (std::f32::consts::TAU * t as f32 / 25.6).sin();
+        let burst_end = truth(burst_lines) - 16;
+        let mut samples: Vec<f32> = (0..truth(lines)).map(|t| if t < burst_end { tone(t) } else { 0.2 }).collect();
+        samples[truth(dropout) - 16..truth(relock) - 16].fill(0.2);
+        for line in (0..dropout).chain(relock..lines) {
+            let dip = truth(line);
+            samples[dip - 16..dip].fill(1.0);
+            samples[dip..dip + 8].fill(-0.8);
+        }
+
+        let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
+        // Smoothing across the step would pull the lines on both sides of
+        // it toward each other by several samples.
+        for line in [dropout - 30..dropout, relock..relock + 30].into_iter().flatten() {
+            let nearest = tracked.iter().map(|p| p.abs_diff(truth(line))).min().unwrap();
+            assert!(
+                nearest <= 2,
+                "line {line}: nearest tracked start is {nearest} samples from {}",
+                truth(line)
+            );
+        }
     }
 
     #[test]
