@@ -106,15 +106,26 @@ const PERIOD_EMA_ALPHA: f64 = 0.05;
 /// per-line argmin noise (±several samples) yet narrow enough to follow the
 /// real slant/wow of the cadence.
 const JITTER_SMOOTH_HALF: usize = 10;
-/// An interval beyond this multiple of the period starts a new run for
-/// jitter smoothing — image boundaries and dropouts must not be averaged
-/// across (their gaps are real, not noise).
-const JITTER_RUN_GAP: f64 = 1.4;
+/// Split after coasting when the re-lock moves at least 1% of a line
+/// (~4 samples at 48 kHz). This clears the one-sample baseline p90 measured
+/// on the 48 kHz rip while keeping smoothing context for smaller corrections.
+const JITTER_RELOCK_FRAC: f64 = 0.01;
 /// A re-anchor needs a spike-to-dip swing above this fraction of the
 /// detector threshold; a full-threshold swing also counts as a strong lock.
 const SWING_ANCHOR_FACTOR: f32 = 0.6;
 /// Accepted re-anchor intervals must lie within this fraction of the period.
 const TRACK_INTERVAL_TOL: f64 = 0.06;
+/// Lines folded together to find the sync edge at the seed. Enough to
+/// average picture content away, few enough that an error in the period
+/// estimate cannot smear the spike.
+const SEED_FOLD_LINES: usize = 8;
+/// Tone periods of the start burst in one line. The burst precedes every
+/// picture on the record and runs about 20 lines.
+const BURST_PERIODS_PER_LINE: f64 = 16.0;
+/// A line is burst tone when its autocorrelation at half the tone period is
+/// below this. Burst lines measure -0.36 to -0.67 on the 48 kHz rip, and
+/// leader and picture lines stay above zero.
+const BURST_TONE_CORR: f64 = -0.25;
 
 /// Track scan-line sync positions with a predictive lock.
 ///
@@ -124,8 +135,17 @@ const TRACK_INTERVAL_TOL: f64 = 0.06;
 /// predict each next sync at `previous + period` and search only a narrow
 /// window around the prediction, coasting on the prediction when no
 /// credible peak appears. This does that: it seeds from the global
-/// detector's first coherent position, then walks the buffer line by line,
-/// slowly adapting the period estimate (slant) from accepted peaks.
+/// detector's first coherent position outside a start burst, then walks the
+/// buffer line by line in both directions, slowly adapting the period
+/// estimate (slant) from accepted peaks on the way forward. The jitter
+/// smoother treats a large re-lock offset as a run boundary.
+///
+/// The seed must not sit on the start burst: the tone repeats every 1/16 of
+/// a line, so its peaks also recur one line apart, close enough to pass for
+/// a line cadence. A track seeded there follows the tone at the wrong phase
+/// and period, and shears the first picture lines until it drifts onto the
+/// real sync. The sync spike itself is present all through the burst, so a
+/// track that reaches the burst already in phase stays locked.
 pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) -> Vec<usize> {
     let detected = detect_line_syncs(samples, sample_rate, params);
     let Some(summary) = interval_summary(&detected, sample_rate) else {
@@ -152,21 +172,25 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
     let search = ((period * TRACK_SEARCH_FRAC) as usize).max(2);
     let edge_search = ((period * TRACK_EDGE_FRAC) as usize).max(4);
 
-    // Seed at the first detected sync that starts a coherent pair.
-    let seed = detected
-        .windows(2)
-        .find(|w| ((w[1] - w[0]) as f64 - period).abs() / period < 0.1)
-        .map(|w| w[0])
-        .unwrap_or(detected[0]);
+    // Seed near the first detected sync that starts a coherent pair outside a
+    // start burst (failing that, the first coherent pair anywhere), then
+    // find the sync edge there properly. A detection only says roughly where
+    // a line starts: it can sit a tenth of a line late where the picture
+    // goes dark right after the sync, or a few percent off around a burst,
+    // and a track seeded further off than its search window never locks.
+    let coherent = |i: usize| ((detected[i + 1] - detected[i]) as f64 - period).abs() / period < 0.1;
+    let outside_burst = |i: usize| !is_burst_tone(samples, detected[i], period);
+    let pairs = 0..detected.len() - 1;
+    let rough_seed = pairs
+        .clone()
+        .find(|&i| coherent(i) && outside_burst(i) && outside_burst(i + 1))
+        .or_else(|| pairs.clone().find(|&i| coherent(i)))
+        .map_or(detected[0], |i| detected[i]);
+    let seed = sync_edge_near(samples, rough_seed, period, edge_search);
 
-    let mut positions = vec![seed];
-    let mut pos = seed as f64;
-    let mut locked = 0usize;
-    loop {
-        let predict = pos + period;
-        if predict + period > samples.len() as f64 {
-            break;
-        }
+    // The sync-like event nearest `predict`, if there is one: its line start
+    // and whether the spike-to-dip swing clears the full threshold.
+    let lock_near = |predict: f64, from: f64, period: f64| -> Option<(usize, bool)> {
         let center = predict.round() as usize;
         let lo = center.saturating_sub(search);
         let hi = (center + search).min(samples.len() - 1);
@@ -178,14 +202,12 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
         // and the accumulated period error shears the image.
         // Ties (flat plateaus) break toward the prediction so featureless
         // stretches don't walk the anchor to the window edge.
-        let peak = (lo..=hi)
-            .max_by(|&a, &b| {
-                samples[a]
-                    .partial_cmp(&samples[b])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| b.abs_diff(center).cmp(&a.abs_diff(center)))
-            })
-            .expect("window is non-empty");
+        let peak = (lo..=hi).max_by(|&a, &b| {
+            samples[a]
+                .partial_cmp(&samples[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.abs_diff(center).cmp(&a.abs_diff(center)))
+        })?;
 
         // Falling edge after the peak marks the true line start.
         let min_idx = falling_edge_min(samples, peak, edge_search);
@@ -195,12 +217,61 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
         // randomizes line starts in dark regions; coasting there is what
         // keeps the image coherent.
         let swing = samples[peak] - samples[min_idx];
-        let interval = min_idx as f64 - pos;
-        let next = if swing > threshold * SWING_ANCHOR_FACTOR && (interval - period).abs() / period < TRACK_INTERVAL_TOL {
-            period = period * (1.0 - PERIOD_EMA_ALPHA) + interval * PERIOD_EMA_ALPHA;
-            if swing > threshold {
-                locked += 1;
+        let interval = (min_idx as f64 - from).abs();
+        let sync_like = swing > threshold * SWING_ANCHOR_FACTOR && (interval - period).abs() / period < TRACK_INTERVAL_TOL;
+        sync_like.then_some((min_idx, swing > threshold))
+    };
+
+    let mut locked = 0usize;
+
+    // Lines before the seed, walked backward at the seed's period. Without
+    // them a range that opens on a burst would lose the burst lines.
+    let mut positions = Vec::new();
+    let mut pos = seed as f64;
+    // Backward lines up to the earliest lock. Anything coasted past it rests
+    // on no sync at all (silence or noise ahead of the first line), and
+    // keeping it would count against the lock fraction below.
+    let mut backed_by_lock = 0;
+    loop {
+        let predict = pos - period;
+        // Stop where the search window would run off the buffer: a spike cut
+        // by the buffer start cannot be told from a missing one.
+        if predict < search as f64 {
+            break;
+        }
+        let lock = lock_near(predict, pos, period).filter(|&(min_idx, _)| (min_idx as f64) < pos);
+        let next = match lock {
+            Some((min_idx, strong)) => {
+                locked += usize::from(strong);
+                min_idx as f64
             }
+            None => predict,
+        };
+        positions.push(next.round() as usize);
+        if lock.is_some() {
+            backed_by_lock = positions.len();
+        }
+        pos = next;
+    }
+    positions.truncate(backed_by_lock);
+    positions.reverse();
+    positions.push(seed);
+
+    let mut run_starts = Vec::new();
+    let mut pos = seed as f64;
+    let mut was_coasting = false;
+    loop {
+        let predict = pos + period;
+        if predict + period > samples.len() as f64 {
+            break;
+        }
+        let lock = lock_near(predict, pos, period);
+        let next = if let Some((min_idx, strong)) = lock {
+            if was_coasting && (min_idx as f64 - predict).abs() >= period * JITTER_RELOCK_FRAC {
+                run_starts.push(positions.len());
+            }
+            period = period * (1.0 - PERIOD_EMA_ALPHA) + (min_idx as f64 - pos) * PERIOD_EMA_ALPHA;
+            locked += usize::from(strong);
             min_idx as f64
         } else {
             // No credible sync (dark line, dropout, boundary junk): coast.
@@ -208,6 +279,7 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
         };
         positions.push(next.round() as usize);
         pos = next;
+        was_coasting = lock.is_none();
     }
 
     // A track that mostly coasted never found real line structure (music,
@@ -216,38 +288,89 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
     if locked < positions.len() / 4 {
         return detected;
     }
-    smooth_line_jitter(&positions, period)
+    smooth_line_jitter(&positions, &run_starts)
+}
+
+/// The line start nearest `rough`, in the tracker's sense: the bottom of the
+/// sync spike's falling edge.
+///
+/// The sync spike is the one feature that recurs at the same place in every
+/// line, so the spike-to-dip swing of each sample is summed over a few
+/// lines folded at the period and the phase with the largest sum is the
+/// spike. Picture edges swing less, and anything that is not line-locked
+/// (picture detail, burst tone) lands at a different phase in every line.
+/// `rough` is returned unchanged when there is too little signal to fold.
+fn sync_edge_near(samples: &[f32], rough: usize, period: f64, edge_search: usize) -> usize {
+    let line = period.round() as usize;
+    let base = rough.saturating_sub(line / 2);
+    let lines = ((samples.len().saturating_sub(base + edge_search)) / line.max(1)).min(SEED_FOLD_LINES);
+    if line == 0 || lines < 2 {
+        return rough;
+    }
+    let swing_at = |peak: usize| samples[peak] - samples[falling_edge_min(samples, peak, edge_search)];
+    let folded = |phase: usize| -> f32 {
+        (0..lines)
+            .map(|k| swing_at(base + phase + (k as f64 * period).round() as usize))
+            .sum()
+    };
+    let spike = (0..line)
+        .map(|phase| (phase, folded(phase)))
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    match spike {
+        Some((phase, _)) => falling_edge_min(samples, base + phase, edge_search),
+        None => rough,
+    }
+}
+
+/// Whether the line starting at `start` is start-burst tone rather than
+/// leader or picture: a tone is strongly anti-correlated with itself half a
+/// period later, wherever the line happens to start.
+fn is_burst_tone(samples: &[f32], start: usize, period: f64) -> bool {
+    let end = (start + period.round() as usize).min(samples.len());
+    let line = &samples[start.min(end)..end];
+    let half_period = period / (2.0 * BURST_PERIODS_PER_LINE);
+    let lags = [half_period.floor() as usize, half_period.ceil() as usize];
+    if lags[0] == 0 || line.len() <= lags[1] * 2 {
+        return false;
+    }
+    let mean = line.iter().map(|&v| f64::from(v)).sum::<f64>() / line.len() as f64;
+    let centered = |i: usize| f64::from(line[i]) - mean;
+    let energy: f64 = (0..line.len()).map(|i| centered(i) * centered(i)).sum();
+    if energy <= 0.0 {
+        return false;
+    }
+    lags.into_iter().any(|lag| {
+        let lagged: f64 = (lag..line.len()).map(|i| centered(i) * centered(i - lag)).sum();
+        lagged / energy < BURST_TONE_CORR
+    })
 }
 
 /// Low-pass the per-line detection jitter out of tracked sync positions while
-/// preserving the slow cadence (period, slant, tape wow) and any real gaps.
+/// preserving the slow cadence (period, slant, tape wow) and large re-lock steps.
 ///
 /// The falling-edge argmin jitters ±several samples per line; the tracker's
 /// tight window keeps that from drifting the lock, but it still snaps each
 /// accepted line start onto the noisy argmin. Used directly as line
 /// boundaries those positions render the noise as feathered edges and
-/// vertical streaks. Within each gap-free run, fit a line to
-/// position-vs-index and replace each residual with its moving average:
-/// only structure slower than the window (the true cadence) survives, and
-/// the linear-phase average introduces no drift or ringing.
-fn smooth_line_jitter(positions: &[usize], period: f64) -> Vec<usize> {
-    if positions.len() < 3 || period <= 0.0 {
-        return positions.to_vec();
-    }
-    let gap = period * JITTER_RUN_GAP;
+/// vertical streaks. Each index in `run_starts` marks a substantial re-anchor
+/// after coasting. Detrend and average the residual within each run so the
+/// coast and the recovered cadence do not pull each other's line starts.
+fn smooth_line_jitter(positions: &[usize], run_starts: &[usize]) -> Vec<usize> {
     let mut out = positions.to_vec();
-    let mut run_start = 0usize;
-    for i in 1..=positions.len() {
-        let is_break = i == positions.len() || (positions[i] - positions[i - 1]) as f64 > gap;
-        if is_break {
-            smooth_run(&positions[run_start..i], &mut out[run_start..i]);
-            run_start = i;
-        }
+    let mut start = 0;
+    for end in run_starts.iter().copied().chain(std::iter::once(positions.len())) {
+        smooth_run(&positions[start..end], &mut out[start..end], start > 0, end < positions.len());
+        start = end;
+    }
+    // Downstream slicing requires strictly increasing line boundaries,
+    // including where independently smoothed runs meet.
+    for i in 1..out.len() {
+        out[i] = out[i].max(out[i - 1] + 1);
     }
     out
 }
 
-/// Detrend-smooth-retrend one gap-free run of positions in place. Runs of
+/// Detrend-smooth-retrend one run of positions into `out`. Runs of
 /// fewer than three lines (too few to fit a trend) are left as-is.
 ///
 /// On a run long enough to support it the trend is a *quadratic* in line index:
@@ -261,12 +384,10 @@ fn smooth_line_jitter(positions: &[usize], period: f64) -> Vec<usize> {
 ///
 /// The residual is averaged over a centered window of half-width
 /// `min(JITTER_SMOOTH_HALF, (n-1)/2)`, so a short run (e.g. between dropouts)
-/// is still smoothed as much as its length allows rather than skipped, and the
-/// window never overruns the run. Out-of-range window indices are mirrored
-/// back into the run (reflection padding), so the first and last lines average
-/// a full-width window and get the same noise reduction as the interior — a
-/// truncated edge window would smooth the run ends less.
-fn smooth_run(run: &[usize], out: &mut [usize]) {
+/// is still smoothed as much as its length allows. At the outer edges of the
+/// image, reflect out-of-range indices to keep the window width. At a re-lock
+/// boundary, fit a local line inside the run to preserve the residual slope.
+fn smooth_run(run: &[usize], out: &mut [usize], starts_at_relock: bool, ends_at_relock: bool) {
     let n = run.len();
     if n < 3 {
         return;
@@ -316,19 +437,6 @@ fn smooth_run(run: &[usize], out: &mut [usize]) {
     };
     let resid: Vec<f64> = run.iter().enumerate().map(|(k, &p)| p as f64 - trend(k)).collect();
 
-    // Centered moving average of the residual; trend + smoothed residual keeps
-    // the slow cadence (slant, wow) and drops the per-line argmin noise. The
-    // half-width is capped at (n-1)/2 so the window fits the run, and indices
-    // that fall off either end are reflected back inside (mirror about the
-    // endpoint) so every position averages a full-width `2*half + 1` window.
-    // Because `half <= (n-1)/2`, an out-of-range index is at most `half` past
-    // an edge, so a single reflection always lands within `0..n`.
-    //
-    // Force strictly increasing output: these become line boundaries
-    // (`positions[i]..positions[i+1]`) downstream, and a non-increasing pair
-    // would underflow the interval subtraction. At the real line cadence the
-    // trend's per-step rise (~period) dwarfs the residual wiggle so the clamp
-    // never fires; it only guards the degenerate small-period case.
     let half = JITTER_SMOOTH_HALF.min((n - 1) / 2);
     let window = (2 * half + 1) as f64;
     let reflect = |idx: isize| -> usize {
@@ -340,21 +448,38 @@ fn smooth_run(run: &[usize], out: &mut [usize]) {
             idx as usize
         }
     };
-    let mut prev: Option<usize> = None;
     for (k, slot) in out.iter_mut().enumerate() {
-        let mut sum = 0.0;
-        for j in 0..=2 * half {
-            let idx = k as isize + j as isize - half as isize;
-            sum += resid[reflect(idx)];
-        }
-        let rs = sum / window;
-        let mut value = (trend(k) + rs).round().max(0.0) as usize;
-        if let Some(p) = prev {
-            value = value.max(p + 1);
-        }
-        *slot = value;
-        prev = Some(value);
+        let near_start = starts_at_relock && k < half;
+        let near_end = ends_at_relock && k + half >= n;
+        let rs = if near_start || near_end {
+            // Shift the window inside the run. Reflecting a residual with a
+            // local slope would fold it back on itself and bias its average.
+            let width = (2 * JITTER_SMOOTH_HALF + 1).min(n);
+            let start = if near_start { 0 } else { n - width };
+            fit_residual_at(&resid[start..start + width], k - start)
+        } else {
+            let mut sum = 0.0;
+            for j in 0..=2 * half {
+                let idx = k as isize + j as isize - half as isize;
+                sum += resid[reflect(idx)];
+            }
+            sum / window
+        };
+        *slot = (trend(k) + rs).round().max(0.0) as usize;
     }
+}
+
+/// Evaluate a least-squares line at an index within its sample window.
+fn fit_residual_at(residuals: &[f64], index: usize) -> f64 {
+    let center = (residuals.len() - 1) as f64 / 2.0;
+    let (mut sum, mut weighted, mut squares) = (0.0, 0.0, 0.0);
+    for (k, residual) in residuals.iter().enumerate() {
+        let t = k as f64 - center;
+        sum += residual;
+        weighted += t * residual;
+        squares += t * t;
+    }
+    sum / residuals.len() as f64 + weighted / squares * (index as f64 - center)
 }
 
 /// Summary of intervals between consecutive sync positions.
@@ -529,12 +654,194 @@ mod tests {
     }
 
     #[test]
+    fn tracker_ignores_a_silent_lead_in() {
+        // Four parts silence, then one part weak-sync lines. The backward
+        // walk finds no sync in the silence: lines extrapolated there would
+        // outnumber the locks and send the whole track back to the raw
+        // detections, which mistime this fixture.
+        let period = 400usize;
+        let n_lines = 60;
+        let lead_in = 4 * n_lines * period;
+        let mut samples = vec![0.0f32; lead_in];
+        samples.extend(weak_sync_lines(n_lines, period));
+
+        let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
+        assert!(
+            (tracked.len() as i64 - n_lines as i64).abs() <= 3,
+            "expected ~{n_lines} lines, got {}",
+            tracked.len()
+        );
+        for &p in &tracked {
+            assert!(p >= lead_in, "line start {p} is inside the silence");
+            let offset = (p - lead_in) % period;
+            assert!((4..=11).contains(&offset), "tracked start at offset {offset} is off-cadence");
+        }
+    }
+
+    #[test]
     fn tracker_matches_detector_on_clean_signal() {
         let samples = synthetic_lines(50, 400);
         let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
         let summary = interval_summary(&tracked, 48_000).unwrap();
         assert!((summary.median_samples - 400.0).abs() < 2.0);
         assert!(summary.std_samples < 3.0, "jitter {}", summary.std_samples);
+    }
+
+    #[test]
+    fn tracker_preserves_offset_after_relocking() {
+        let period = 400;
+        let lines = 160;
+        let relock = 80;
+        let coast_start = relock - 5;
+        let truth = |line: usize| 30 + line * period + if line >= relock { 18 } else { 0 };
+        let mut samples = vec![0.2; lines * period];
+        for line in (0..coast_start).chain(relock..lines) {
+            let jitter = [0, -3, 3, -4, 4][line % 5];
+            let dip = truth(line).checked_add_signed(jitter).unwrap();
+            samples[dip - 4] = 1.0;
+            samples[dip] = -0.8;
+        }
+
+        let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
+        // The fixture omits five spikes before an 18-sample offset. Around
+        // the recovery the boundaries should stay within the ordinary jitter
+        // on their own side, while the jitter within both runs is reduced.
+        for line in [coast_start - 40..coast_start, relock..relock + 40].into_iter().flatten() {
+            assert!(
+                tracked[line].abs_diff(truth(line)) <= 2,
+                "line {line}: expected {}, got {}",
+                truth(line),
+                tracked[line]
+            );
+        }
+    }
+
+    #[test]
+    fn tracker_preserves_cadence_at_relock_with_slope() {
+        let lines = 200;
+        let relock = 80;
+        let coast_start = relock - 3;
+        let truth = |line: usize| 30 + 400 * line + 5 * line.saturating_sub(60).min(41);
+        let mut samples = vec![0.2; truth(lines - 1) + 400];
+        for line in (0..coast_start).chain(relock..lines) {
+            let dip = truth(line);
+            samples[dip - 4] = 1.0;
+            samples[dip] = -0.8;
+        }
+
+        let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
+        // The cadence changes before the dropout and continues through the
+        // re-lock. Smoothing should preserve the accurate locks on both sides.
+        for line in (relock..relock + 10).chain(coast_start - 10..coast_start) {
+            assert!(
+                tracked[line].abs_diff(truth(line)) <= 2,
+                "line {line}: expected {}, got {}",
+                truth(line),
+                tracked[line]
+            );
+        }
+    }
+
+    /// A range that opens partway through a line of start-burst tone, as
+    /// eight frames of the 48 kHz rip do. The tone is not line-locked: 16
+    /// periods take 409.6 samples against a 400-sample line. Each line
+    /// starts with a sync spike (16 samples) and its dip (8 samples).
+    fn lines_opening_on_a_burst(burst_lines: usize, n_lines: usize) -> (Vec<f32>, usize) {
+        const PERIOD: usize = 400;
+        // One line of tone before the first sync. Its first trough falls
+        // about a line ahead of that sync, so the pair looks coherent.
+        let lead_in = 400;
+        // The tone fades a little over the lead-in, so its first peak is its
+        // tallest and the detector keeps that one, as it does on the record.
+        let tone = |t: usize| {
+            let level = 0.75 - 0.05 * (t.min(lead_in) as f32 / lead_in as f32);
+            level * (std::f32::consts::TAU * t as f32 / 25.6).sin()
+        };
+        let mut out: Vec<f32> = (0..lead_in).map(tone).collect();
+        for line in 0..n_lines {
+            for i in 0..PERIOD {
+                out.push(match i {
+                    0..=15 => 1.0,
+                    16..=23 => -0.8,
+                    _ if line < burst_lines => tone(out.len()),
+                    _ => 0.2 + 0.2 * ((line * 7 + i) % 13) as f32 / 13.0,
+                });
+            }
+        }
+        (out, lead_in)
+    }
+
+    #[test]
+    fn tracker_keeps_line_phase_when_the_range_opens_on_a_burst() {
+        let (samples, lead_in) = lines_opening_on_a_burst(18, 60);
+        // The first detection is a tone trough about one line before the
+        // first sync: a coherent-looking pair, yet further off the line
+        // phase than the tracker's search window reaches. Seeding there
+        // follows the tone and shears every line until the track drifts
+        // onto the sync.
+        let detected = detect_line_syncs(&samples, 48_000, &SyncParams::default());
+        let first_gap = (detected[1] - detected[0]) as f64;
+        assert!(
+            (first_gap - 400.0).abs() / 400.0 < 0.1,
+            "setup: first pair {first_gap} is not coherent"
+        );
+        assert!(
+            (first_gap - 400.0).abs() > 400.0 * TRACK_SEARCH_FRAC,
+            "setup: first pair {first_gap} is in phase"
+        );
+
+        let positions = track_line_syncs(&samples, 48_000, &SyncParams::default());
+        for &p in positions.iter().filter(|&&p| p >= lead_in) {
+            let offset = (p - lead_in) % 400;
+            assert!(
+                (16..24).contains(&offset),
+                "line start {p} is at offset {offset}, not in the sync dip"
+            );
+        }
+        // The burst lines before the seed are kept, not dropped.
+        assert!(
+            positions.iter().any(|p| (lead_in..lead_in + 400).contains(p)),
+            "first whole line is missing"
+        );
+        assert!(positions.len() >= 58, "only {} lines tracked", positions.len());
+    }
+
+    #[test]
+    fn tracker_starts_lines_at_the_sync_edge_not_a_dark_picture_edge() {
+        // After the sync dip the line sits at a shallow porch level, then
+        // drops to picture black. The detector's wide falling-edge search
+        // reports the black edge, 36 samples late; the seed must not.
+        let mut samples = Vec::new();
+        for line in 0..40usize {
+            for i in 0..400usize {
+                samples.push(match i {
+                    0..=15 => 1.0,
+                    16..=51 => -0.1,
+                    52..=119 => -0.6,
+                    _ => -0.4 + 0.3 * ((line * 5 + i) % 11) as f32 / 11.0,
+                });
+            }
+        }
+        let detected = detect_line_syncs(&samples, 48_000, &SyncParams::default());
+        assert_eq!(detected[0] % 400, 52, "the detector is expected to report the black edge");
+
+        let positions = track_line_syncs(&samples, 48_000, &SyncParams::default());
+        for &p in &positions {
+            assert!((16..24).contains(&(p % 400)), "line start {p} is at offset {}", p % 400);
+        }
+    }
+
+    #[test]
+    fn burst_tone_is_told_from_picture_and_leader() {
+        let (samples, lead_in) = lines_opening_on_a_burst(18, 30);
+        // Wherever the window starts inside the burst, it reads as tone.
+        for start in [0, 7, 13, lead_in + 24, lead_in + 400 * 5 + 100] {
+            assert!(is_burst_tone(&samples, start, 400.0), "burst line at {start}");
+        }
+        for line in 19..28 {
+            assert!(!is_burst_tone(&samples, lead_in + 400 * line, 400.0), "picture line {line}");
+        }
+        assert!(!is_burst_tone(&[0.25f32; 400], 0, 400.0), "flat leader line");
     }
 
     #[test]
@@ -554,7 +861,7 @@ mod tests {
         let jitter = |k: usize| ((k.wrapping_mul(2_654_435_761) >> 8) % 9) as f64 - 4.0;
         let noisy: Vec<usize> = (0..n).map(|k| (truth(k) + jitter(k)).round() as usize).collect();
 
-        let smoothed = smooth_line_jitter(&noisy, period);
+        let smoothed = smooth_line_jitter(&noisy, &[]);
 
         assert_eq!(smoothed.len(), noisy.len());
         assert!(
@@ -578,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn smooth_run_output_is_strictly_increasing_at_small_period() {
+    fn smoothing_output_is_strictly_increasing_at_small_period() {
         // Degenerate cadence: ~1 sample/line with ±4 jitter. The trend's
         // per-step rise is tiny, so without the monotonic clamp the residual
         // moving average can produce equal/decreasing boundaries — which would
@@ -586,8 +893,7 @@ mod tests {
         let n = 60usize;
         let jitter = |k: usize| ((k.wrapping_mul(2_654_435_761) >> 8) % 9) as f64 - 4.0;
         let run: Vec<usize> = (0..n).map(|k| (1000.0 + k as f64 + jitter(k)).round() as usize).collect();
-        let mut out = run.clone();
-        smooth_run(&run, &mut out);
+        let out = smooth_line_jitter(&run, &[]);
         assert!(
             out.windows(2).all(|w| w[1] > w[0]),
             "smoothed positions must be strictly increasing: {out:?}"
@@ -603,36 +909,28 @@ mod tests {
     }
 
     #[test]
-    fn smoothing_splits_on_gaps_and_smooths_each_run() {
-        // Two gap-free runs separated by a real image-boundary gap (well over
-        // JITTER_RUN_GAP × period). Exercises the run-splitting loop in
-        // `smooth_line_jitter`: each run must be smoothed independently, the
-        // boundary gap must survive (not be averaged across), and the whole
-        // sequence must stay strictly increasing.
+    fn smoothing_splits_on_relock_and_smooths_each_run() {
+        // Two noisy runs separated by a marked, sub-line re-lock step. The
+        // smoother must preserve the offset and de-jitter each run.
         let period = 399.0;
         let n = 80usize;
         let jitter = |k: usize| ((k.wrapping_mul(2_654_435_761) >> 8) % 9) as f64 - 4.0;
         let run_truth = |base: f64, k: usize| base + period * k as f64;
 
         let mut noisy: Vec<usize> = (0..n).map(|k| (run_truth(1000.0, k) + jitter(k)).round() as usize).collect();
-        // Boundary gap = 5× period, far above the 1.4× run-break threshold.
-        let gap_base = *noisy.last().unwrap() as f64 + 5.0 * period;
-        noisy.extend((0..n).map(|k| (run_truth(gap_base, k) + jitter(k)).round() as usize));
+        let offset = 18.0;
+        let relock_base = run_truth(1000.0, n) + offset;
+        noisy.extend((0..n).map(|k| (run_truth(relock_base, k) + jitter(k)).round() as usize));
 
-        let smoothed = smooth_line_jitter(&noisy, period);
+        let smoothed = smooth_line_jitter(&noisy, &[n]);
 
         assert_eq!(smoothed.len(), noisy.len());
         assert!(
             smoothed.windows(2).all(|w| w[1] > w[0]),
             "boundaries across both runs must stay increasing"
         );
-        // The boundary gap is preserved: the step at the run break stays large,
-        // proving the runs were not smoothed across.
-        let break_step = smoothed[n] - smoothed[n - 1];
-        assert!(
-            break_step as f64 > 3.0 * period,
-            "image-boundary gap was averaged away: step {break_step} at the break"
-        );
+        let break_step = (smoothed[n] - smoothed[n - 1]) as f64 - period;
+        assert!((break_step - offset).abs() <= 3.0, "smoothed re-lock step {break_step}");
         // Each run is independently de-jittered (residual rms well under the
         // ±4-sample raw jitter).
         let run_rms = |off: usize, base: f64| -> f64 {
@@ -642,7 +940,7 @@ mod tests {
                 / n as f64
         };
         assert!(run_rms(0, 1000.0).sqrt() < 2.0, "first run not smoothed");
-        assert!(run_rms(n, gap_base).sqrt() < 2.0, "second run not smoothed");
+        assert!(run_rms(n, relock_base).sqrt() < 2.0, "second run not smoothed");
     }
 
     #[test]
@@ -662,7 +960,7 @@ mod tests {
 
         for n in [4usize, 6, 10] {
             let noisy: Vec<usize> = (0..n).map(|k| (truth(k) + jitter(k)).round() as usize).collect();
-            let smoothed = smooth_line_jitter(&noisy, period);
+            let smoothed = smooth_line_jitter(&noisy, &[]);
 
             assert_eq!(smoothed.len(), n);
             assert!(
@@ -678,8 +976,35 @@ mod tests {
 
         // The longer short run is smoothed substantially, not just nudged.
         let noisy: Vec<usize> = (0..10).map(|k| (truth(k) + jitter(k)).round() as usize).collect();
-        let after = rms(&smooth_line_jitter(&noisy, period));
+        let after = rms(&smooth_line_jitter(&noisy, &[]));
         assert!(after < rms(&noisy) * 0.6, "n=10 weakly smoothed: {after:.2}");
+    }
+
+    #[test]
+    fn smoothing_handles_short_runs_between_relocks() {
+        let start = 21;
+        let period = 400;
+        let truth = |k: usize| 1000 + k * period + 18;
+        let jitter = [3, -4, 2, -2, 4, -3];
+        for n in [1, 2, 3, 4, 6, 10, 20] {
+            let end = start + n;
+            let mut positions: Vec<usize> = (0..start).map(|k| 1000 + k * period).collect();
+            positions.extend((start..end).map(|k| truth(k).checked_add_signed(jitter[(k - start) % jitter.len()]).unwrap()));
+            positions.extend((end..end + 21).map(|k| 1000 + k * period + 36));
+
+            let smoothed = smooth_line_jitter(&positions, &[start, end]);
+            assert!(smoothed.windows(2).all(|w| w[0] < w[1]));
+            if n < 3 {
+                assert_eq!(smoothed[start..end], positions[start..end]);
+            } else {
+                let squared_error =
+                    |v: &[usize]| -> usize { v.iter().enumerate().map(|(k, &p)| p.abs_diff(truth(start + k)).pow(2)).sum() };
+                assert!(
+                    squared_error(&smoothed[start..end]) < squared_error(&positions[start..end]),
+                    "n={n}: jitter was not reduced"
+                );
+            }
+        }
     }
 
     #[test]
@@ -699,7 +1024,7 @@ mod tests {
 
         for &n in &[201usize, 601] {
             let noisy: Vec<usize> = (0..n).map(|k| (truth(k) + jitter(k)).round() as usize).collect();
-            let smoothed = smooth_line_jitter(&noisy, period);
+            let smoothed = smooth_line_jitter(&noisy, &[]);
 
             assert_eq!(smoothed.len(), n);
             assert!(
