@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use egui::ColorImage;
 use image::{DynamicImage, GrayImage, Luma, Rgba, RgbaImage};
 use thiserror::Error;
@@ -17,6 +17,15 @@ pub struct PipelineResult {
     pub width: u32,
     pub height: u32,
     pub mode: DecoderMode,
+    /// The decode used the full sample range of a segmented image.
+    pub segmented_image: bool,
+    /// The decoder aligned scan lines to detected syncs.
+    pub sync_locked: bool,
+    /// Rows holding the picture itself, clear of leader lines and the start
+    /// burst, when the detector could tell (see
+    /// [`crate::analysis::find_picture_rows`]). Trustworthy only together
+    /// with `segmented_image`: the detector needs a whole image.
+    pub picture_rows: Option<std::ops::Range<usize>>,
 }
 
 impl PipelineResult {
@@ -78,19 +87,21 @@ impl PipelineResult {
     /// same `rotate90 + fliph` to its PNG output (see `cli.rs`); transposing
     /// here keeps the live GUI view consistent with it.
     ///
-    /// When `crop_sync` is set, the decoder's sync/leader margins are dropped
-    /// from the displayed texture via [`display_crop_cols`]/[`display_crop_rows`]
-    /// — a tight, picture-preserving trim, not the compositor's deliberately
-    /// conservative [`content_cols`]/[`content_rows`] window (which would eat
-    /// real image). This is display-only; the decode buffer and all
-    /// registration/compositing geometry are untouched.
+    /// When `crop_sync` is set, trim a segmented image to its detected
+    /// picture rows and a sync-locked decode to the columns between its sync
+    /// bands. With no detected picture the rows are left alone. Cropping
+    /// affects only the displayed texture.
     pub fn to_egui_image(&self, crop_sync: bool) -> ColorImage {
         let w = self.width as usize;
         let h = self.height as usize;
-        let (cols, rows) = if crop_sync && w > 0 && h > 0 {
-            (display_crop_cols(w), display_crop_rows(h))
+        let cols = if crop_sync && self.sync_locked && w > 0 && h > 0 {
+            display_crop_cols(w)
         } else {
-            (0..w, 0..h)
+            0..w
+        };
+        let rows = match &self.picture_rows {
+            Some(rows) if crop_sync && self.segmented_image && !rows.is_empty() && rows.end <= h => rows.clone(),
+            _ => 0..h,
         };
         let cw = cols.len();
         let ch = rows.len();
@@ -223,6 +234,9 @@ pub fn composite_triplet_levels(planes: [&[f32]; 3], width: usize, invert: bool,
             width: width as u32,
             height: (levels.len() / width) as u32,
             mode: DecoderMode::Grayscale,
+            segmented_image: false,
+            sync_locked: false,
+            picture_rows: None,
         })
         .collect();
     stack_registered(&frames[0], &frames[1], &frames[2], lag_g, lag_b)
@@ -258,23 +272,22 @@ fn content_rows(rows: usize) -> std::ops::Range<usize> {
 /// compositor's window is deliberately conservative (it only needs to keep
 /// the junk *minority* out of a percentile population, so over-trimming is
 /// free); cropping the same 20%/10% off the shown image throws away real
-/// picture. Measured against the calibration circle: the line-start residue
-/// is ~6% and the bright line-end sync stripe ~11% of each scan line.
+/// picture. Measured on left-channel frames of the 48 kHz rip: the
+/// line-start band ends 7-9% into each scan line and the bright line-end
+/// sync stripe starts at 88-90%. Fixed fractions work here because sync
+/// lock pins every line to the same phase.
+///
+/// The dark strip that diagram frames show just inside the left bound is
+/// picture, not margin, and must stay. Those frames have a black
+/// background; the recording is AC-coupled, so each line starts at true
+/// black and drifts back toward mid-grey over roughly a fifth of the line.
+/// The level falls to black in one step at the 9% bound and then recovers
+/// smoothly with no second edge, and photographs carry ordinary picture
+/// content in the same columns.
 /// Non-empty and within `0..width` for every `width >= 1`.
 fn display_crop_cols(width: usize) -> std::ops::Range<usize> {
-    let lo = width * 6 / 100;
+    let lo = width * 9 / 100;
     let hi = ((width * 89) / 100).max(lo + 1).min(width);
-    lo..hi
-}
-
-/// Inter-image leader crop for the display preview — trims the leader band at
-/// each frame edge, tighter than the compositor's [`content_rows`]. Measured
-/// the same way as [`display_crop_cols`] (against the calibration circle): the
-/// inter-image leader band runs ~12% of the frame at each edge. Non-empty and
-/// within `0..rows` for every `rows >= 1`.
-fn display_crop_rows(rows: usize) -> std::ops::Range<usize> {
-    let lo = rows * 12 / 100;
-    let hi = ((rows * 88) / 100).max(lo + 1).min(rows);
     lo..hi
 }
 
@@ -423,10 +436,13 @@ impl DecodingPipeline {
     }
 
     pub fn process(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Result<PipelineResult> {
-        let pixels = self
-            .decoder
-            .decode(samples, params, sample_rate)
-            .context("Failed to decode audio")?;
+        // No context here: every caller names the operation itself, and the
+        // decoder's error already says what went wrong.
+        let crate::sstv::DecodedFrame {
+            pixels,
+            sync_locked,
+            picture_rows,
+        } = self.decoder.decode_frame(samples, params, sample_rate)?;
 
         // Detect empty pixel data immediately, fail before computing dimensions
         if pixels.is_empty() {
@@ -455,6 +471,9 @@ impl DecodingPipeline {
             width: width as u32,
             height,
             mode: params.mode,
+            segmented_image: false,
+            sync_locked,
+            picture_rows,
         })
     }
 }
@@ -475,6 +494,9 @@ mod tests {
             width,
             height,
             mode: DecoderMode::Grayscale,
+            segmented_image: false,
+            sync_locked: false,
+            picture_rows: None,
         }
     }
 
@@ -503,6 +525,9 @@ mod tests {
             width,
             height,
             mode: DecoderMode::Grayscale,
+            segmented_image: false,
+            sync_locked: false,
+            picture_rows: None,
         }
     }
 
@@ -603,6 +628,7 @@ mod tests {
     #[test]
     fn to_egui_image_transposes_and_crops() {
         let (w, h) = (60u32, 60u32);
+        let picture = 8..50usize;
 
         // Pixel value encodes its source column (x = i % w).
         let by_col = PipelineResult {
@@ -610,6 +636,9 @@ mod tests {
             width: w,
             height: h,
             mode: DecoderMode::Grayscale,
+            segmented_image: true,
+            sync_locked: true,
+            picture_rows: Some(picture.clone()),
         };
         // Uncropped is a pure transpose: source column x becomes output row x,
         // so every pixel in output row r has value r.
@@ -619,27 +648,55 @@ mod tests {
 
         // Cropped to the display bounds; output rows map to the kept source columns.
         let cols = display_crop_cols(w as usize);
-        let rows = display_crop_rows(h as usize);
         let cropped = by_col.to_egui_image(true);
-        assert_eq!(cropped.size, [rows.len(), cols.len()]);
+        assert_eq!(cropped.size, [picture.len(), cols.len()]);
         assert_eq!(cropped.pixels[0], egui::Color32::from_gray(cols.start as u8));
         assert_eq!(
-            cropped.pixels[(cols.len() - 1) * rows.len()],
+            cropped.pixels[(cols.len() - 1) * picture.len()],
             egui::Color32::from_gray((cols.end - 1) as u8)
         );
 
         // Pixel value encodes its source row (y = i / w): the first output
-        // column must map to the first kept source row, proving the crop
-        // applies the row offset, not just a size change.
+        // column must map to the first picture row, proving the crop applies
+        // the row offset, not just a size change.
         let by_row = PipelineResult {
             pixels: (0..w * h).map(|i| (i / w) as u8).collect(),
-            width: w,
-            height: h,
-            mode: DecoderMode::Grayscale,
+            ..by_col.clone()
         };
         assert_eq!(
             by_row.to_egui_image(true).pixels[0],
-            egui::Color32::from_gray(rows.start as u8)
+            egui::Color32::from_gray(picture.start as u8)
         );
+
+        // A window is not a whole image, so its picture rows are not trusted.
+        let windowed = PipelineResult {
+            segmented_image: false,
+            ..by_row.clone()
+        }
+        .to_egui_image(true);
+        assert_eq!(windowed.size, [h as usize, cols.len()]);
+        assert_eq!(windowed.pixels[0], egui::Color32::from_gray(0));
+
+        // No picture found, or one that does not fit the frame: rows stay.
+        for rows in [None, Some(0..0), Some(10..h as usize + 1)] {
+            let kept = PipelineResult {
+                picture_rows: rows,
+                ..by_row.clone()
+            }
+            .to_egui_image(true);
+            assert_eq!(kept.size, [h as usize, cols.len()]);
+        }
+
+        // Nothing known about the decode (a windowed, unlocked one): cropping
+        // enabled must leave the image exactly as it is with cropping disabled.
+        let plain = PipelineResult {
+            segmented_image: false,
+            sync_locked: false,
+            picture_rows: None,
+            ..by_col
+        };
+        let uncropped = plain.to_egui_image(true);
+        assert_eq!(uncropped.size, full.size);
+        assert_eq!(uncropped.pixels, full.pixels);
     }
 }

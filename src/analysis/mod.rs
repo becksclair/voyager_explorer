@@ -1,17 +1,20 @@
 //! Signal analysis and diagnostics: one-shot spectra, spectrograms, rolling
-//! statistics, segment classification, and scan-line sync detection.
+//! statistics, segment classification, scan-line sync detection, and
+//! picture-row detection inside a decoded frame.
 //!
 //! Everything here is pure library code; the CLI subcommands and the GUI
 //! diagnostics panel are thin shims over these functions.
 
 pub mod classify;
 mod font;
+pub mod picture;
 pub mod segment;
 pub mod spectrogram;
 pub mod stats;
 pub mod sync;
 
 pub use classify::{classify_segments, ClassifyParams, Segment, SegmentLabel};
+pub use picture::find_picture_rows;
 pub use segment::{find_image_bounds, ImageBounds, SegmentImagesParams};
 pub use spectrogram::{compute_spectrogram, render_spectrogram, Spectrogram, SpectrogramParams};
 pub use stats::{compute_stats, rolling_stats, SignalStats};
