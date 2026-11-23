@@ -31,8 +31,14 @@ pub const CYAN: Color32 = Color32::from_rgb(0x4F, 0xC3, 0xE8);
 pub const ERROR: Color32 = Color32::from_rgb(0xF8, 0x51, 0x49);
 
 /// Apply the mission-console style to the egui context. Call once at startup.
+///
+/// The console has one look, so the context is pinned to egui's dark theme
+/// rather than left to follow the system. egui keeps a separate style per
+/// theme; styling only the active one leaves the stock light style to take
+/// over when the system is, or later switches to, a light appearance.
 pub fn apply_theme(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
+    ctx.set_theme(egui::Theme::Dark);
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
 
     let visuals = &mut style.visuals;
     *visuals = egui::Visuals::dark();
@@ -88,7 +94,7 @@ pub fn apply_theme(ctx: &egui::Context) {
     style.spacing.interact_size.y = 26.0;
     style.spacing.slider_width = 120.0;
 
-    ctx.set_style(style);
+    ctx.set_style_of(egui::Theme::Dark, style);
 }
 
 /// Standard bordered panel frame used by every console section.
@@ -118,4 +124,27 @@ pub fn key_value(ui: &mut egui::Ui, key: &str, value: &str) {
             ui.label(egui::RichText::new(value).size(12.0).color(TEXT_BRIGHT).monospace());
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn console_style_survives_a_light_system_appearance() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx);
+
+        let input = egui::RawInput {
+            system_theme: Some(egui::Theme::Light),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |_| {});
+
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        let visuals = &ctx.style().visuals;
+        assert!(visuals.dark_mode);
+        assert_eq!(visuals.panel_fill, BG);
+        assert_eq!(visuals.widgets.inactive.fg_stroke.color, TEXT_BRIGHT);
+    }
 }
