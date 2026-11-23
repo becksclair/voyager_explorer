@@ -132,15 +132,9 @@ mod tests {
         assert_eq!(img.size, [512, 2]);
         assert_eq!(img.pixels.len(), 1024);
 
-        // Check first line
-        for i in 0..512 {
-            assert_eq!(img.pixels[i], egui::Color32::from_gray(100));
-        }
-
-        // Check second line
-        for i in 512..1024 {
-            assert_eq!(img.pixels[i], egui::Color32::from_gray(200));
-        }
+        let (first_line, second_line) = img.pixels.split_at(512);
+        assert!(first_line.iter().all(|&px| px == egui::Color32::from_gray(100)));
+        assert!(second_line.iter().all(|&px| px == egui::Color32::from_gray(200)));
     }
 
     #[test]
