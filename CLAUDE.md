@@ -85,11 +85,15 @@ Prefer small, incremental changes that keep the app running.
   orientation, with optional display-only cropping: a segmented,
   sync-locked image to its detected `picture_rows`, and any sync-locked
   decode to the columns between its sync bands),
-  triplet compositing (`composite_triplet_levels`:
-  joint percentile bounds over the content region only, plane
-  registration via 2D normalized cross-correlation of per-scan-line-
-  demeaned content blocks computed on raw levels before normalization
-  clipping, smallest lag within 0.002 of the peak wins), and batch file
+  triplet compositing (`composite_triplet_levels`,
+  `composite_triplet_levels_with_picture_rows`: joint percentile bounds
+  over the content region only, plane registration via 2D normalized
+  cross-correlation of per-scan-line-demeaned content blocks computed on
+  raw levels before normalization clipping, smallest lag within 0.002 of
+  the peak wins; when unclipped `picture_rows` edges are supplied, NCC
+  refines locally within ±8 lines of the picture-boundary prior and keeps
+  the prior when no interior peak rises above the search boundary, fixing
+  spectrally distinct triplets like Solar Spectrum), and batch file
   processing; cancellation via `Arc<AtomicBool>` with Release/Acquire
   ordering.
 - `services/` — `decoder.rs` (`DecodeOrchestrator`: background decode
