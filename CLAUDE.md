@@ -51,18 +51,28 @@ Prefer small, incremental changes that keep the app running.
   Use `audio_state.is_playing()`, never bare booleans.
 - `sstv.rs` (`SstvDecoder`, `DecoderParams`) — baseband slow-scan decoder:
   sync-locked line segmentation (time-domain detector from
-  `analysis/sync.rs`, fixed-period fallback), anti-aliased per-line
-  resampling, percentile normalization with `invert`/`gamma`. The 1200 Hz
-  FFT tone detector remains for navigation only (tone regions, not
-  per-line syncs). PseudoColor (3 scanlines as RGB) is a legacy mode;
+  `analysis/sync.rs`, fixed-period fallback), stabilized 2nd-order
+  Butterworth inverse high-pass DC restoration (`restore_dc` /
+  `restore_dc_with_preroll`, default on, `--no-dc-restore` in CLI
+  `decode`/`segment`/`batch`, "DC restore" in GUI; GUI batch inherits
+  the active preview `DecoderParams` with the batch panel's mode;
+  windowed decodes warm the filter on `DC_RESTORE_PREROLL_SECS` of
+  preceding audio; standalone slices, and windows with under 30 ms of
+  audio before them, warm on their first two contiguous scan lines; sync
+  tracking and picture-row detection still measure the raw signal),
+  anti-aliased per-line resampling, percentile normalization with
+  `invert`/`gamma`.
+  The 1200 Hz FFT tone detector remains for navigation only (tone regions,
+  not per-line syncs). PseudoColor (3 scanlines as RGB) is a legacy mode;
   real Voyager color (frame triplets) is Phase 14.
 - `analysis/` — `spectrogram` (STFT → labeled PNG), `stats` (RMS/peak/
   ZCR/crest/dominant), `classify` (silence/tone/image-periodic/broadband
   segments), `sync` (spike+falling-edge line detector, predictive
   tracker seeded at the sync edge outside any start burst and walked in
-  both directions, with per-line jitter smoothing, split into separate
-  runs where a re-lock after coasting lands ≥1% of a line off the
-  prediction, interval summary),
+  both directions, re-acquiring phase across inter-image boundaries when
+  a coasting walk meets a phase-shifted coherent run, with per-line jitter
+  smoothing split into separate runs at re-locks ≥1% of a line off
+  prediction and at phase re-acquisitions, interval summary),
   `segment` (per-image boundaries from sync-cadence breaks: split sync
   runs where an interval exceeds `gap_factor`× the median, drop short
   runs and tone-classified runs), `picture` (`find_picture_rows`: the
@@ -109,8 +119,9 @@ also recur 410 samples apart at 48 kHz, close enough to a 400-sample line
 to capture a tracker seeded on it; the sync spike is present throughout)
 and up to 11 blank lines after it. The recording is AC-coupled: a line
 that starts at picture black drifts back toward mid-grey over roughly a
-fifth of the line, so black-background diagrams decode with a grey
-background and a dark strip at the line start. That strip is picture.
+fifth of the line, so with DC restore off black-background diagrams
+decode with a grey background and a dark strip at the line start. That
+strip is picture; DC restore (default on) flattens the background.
 Inter-image gaps
 show as 1.5–4× interval breaks in the sync cadence; the lead-in
 calibration tone sync-locks like an image and must be rejected by
