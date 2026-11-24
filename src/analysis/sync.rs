@@ -126,12 +126,15 @@ const BURST_PERIODS_PER_LINE: f64 = 16.0;
 /// below this. Burst lines measure -0.36 to -0.67 on the 48 kHz rip, and
 /// leader and picture lines stay above zero.
 const BURST_TONE_CORR: f64 = -0.25;
+/// Consecutive coherent, non-burst detections required to re-acquire phase
+/// across an inter-image boundary. Requiring 8 lines (and waiting until the
+/// coasting walk has passed all 8 with no lock at the old phase) keeps brief
+/// dark-region weak-sync patches with bright mid-line picture features from
+/// hijacking the phase while still catching every real inter-image boundary.
+const REACQUIRE_RUN_SYNCS: usize = 8;
 /// Consecutive coasted lines before checking `detected` for a phase-shifted
 /// coherent run (an inter-image boundary in a multi-frame window).
-const REACQUIRE_COAST_LINES: usize = 3;
-/// Consecutive coherent, non-burst detections required to re-acquire phase
-/// across an inter-image boundary.
-const REACQUIRE_RUN_SYNCS: usize = 4;
+const REACQUIRE_COAST_LINES: usize = REACQUIRE_RUN_SYNCS;
 
 /// Track scan-line sync positions with a predictive lock.
 ///
@@ -324,6 +327,12 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
                 pos = min_idx as f64;
                 last_locked_pos = pos;
                 last_locked_idx = positions.len() - 1;
+                if was_coasting {
+                    // Anchor/period changed after a coast: reset the scan
+                    // cursor so any future coast evaluates candidates against
+                    // the updated anchor.
+                    detect_cursor = detected.partition_point(|&d| (d as f64) <= last_locked_pos + period * 1.1);
+                }
                 coast_len = 0;
                 was_coasting = false;
             }
@@ -335,28 +344,31 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
                 was_coasting = true;
 
                 // Across an inter-image boundary, the next image's leader syncs
-                // arrive at a new phase outside our ±6% tracking window. If a
-                // coherent non-burst run has started at a different phase, drop
-                // the shifted coasted lines and re-anchor on the new run.
+                // arrive at a new phase outside our ±6% tracking window. Wait
+                // until the coasting walk has passed an entire coherent
+                // non-burst run at a different phase with zero locks at the old
+                // phase, then drop only the shifted coasted lines and re-anchor.
                 if coast_len >= REACQUIRE_COAST_LINES {
-                    while detect_cursor < detected.len() && (detected[detect_cursor] as f64) <= last_locked_pos + period * 1.1 {
-                        detect_cursor += 1;
-                    }
                     let mut reacquired = None;
-                    let mut j = detect_cursor;
-                    while j + REACQUIRE_RUN_SYNCS <= detected.len() && (detected[j] as f64) <= predict + period {
+                    while detect_cursor + REACQUIRE_RUN_SYNCS <= detected.len()
+                        && (detected[detect_cursor + REACQUIRE_RUN_SYNCS - 1] as f64) <= predict
+                    {
+                        let j = detect_cursor;
+                        detect_cursor += 1;
+                        if (detected[j] as f64) <= last_locked_pos + period * 1.1 {
+                            continue;
+                        }
                         if is_coherent_run(j, period) {
                             let candidate = sync_edge_near(samples, detected[j], period, edge_search);
                             if (candidate as f64) > last_locked_pos + period * 1.1
                                 && is_phase_jump(last_locked_pos, candidate, period)
                             {
-                                reacquired = Some((j, candidate));
+                                reacquired = Some(candidate);
                                 break;
                             }
                         }
-                        j += 1;
                     }
-                    if let Some((found_idx, new_seed)) = reacquired {
+                    if let Some(new_seed) = reacquired {
                         // Walk backward from `new_seed` to pick up any opening
                         // lines of the new image that `detected` skipped.
                         let mut lead = Vec::new();
@@ -403,7 +415,7 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
                         last_locked_idx = positions.len() - 1;
                         coast_len = 0;
                         was_coasting = false;
-                        detect_cursor = found_idx + 1;
+                        detect_cursor = detected.partition_point(|&d| (d as f64) <= last_locked_pos + period * 1.1);
                     }
                 }
             }
@@ -1296,6 +1308,49 @@ mod tests {
         // Both sides stay on their own syncs.
         for line in (dropout - 20..dropout).chain(resume..resume + 20) {
             assert!(nearest(truth(line)) <= 2, "line {line} is off its sync");
+        }
+    }
+
+    #[test]
+    fn tracker_keeps_phase_past_weak_syncs_with_a_bright_mid_line_bar() {
+        // A dark region with a five-line weak-sync fade and a bright vertical
+        // picture feature at a fixed mid-line offset. The global detector picks
+        // the bright feature during the fade, creating a short coherent run at
+        // a shifted phase; the tracker must coast across the fade and stay on
+        // the real sync phase instead of jumping onto the picture feature.
+        let period = 400usize;
+        let lines = 180usize;
+        let (fade_start, fade_end) = (80usize, 85usize);
+        let mut samples = vec![-0.1f32; lines * period];
+        for line in 0..lines {
+            let base = line * period;
+            if !(fade_start..fade_end).contains(&line) {
+                samples[base + 26..=base + 29].fill(1.0);
+                samples[base + 30..=base + 33].fill(-0.8);
+            } else {
+                // Weak sync below the anchor threshold.
+                samples[base + 26..=base + 29].fill(0.15);
+                samples[base + 30..=base + 33].fill(-0.15);
+            }
+            // Bright vertical feature mid-line throughout the central region.
+            if (50..140).contains(&line) {
+                samples[base + 216..=base + 220].fill(0.75);
+                samples[base + 221..=base + 225].fill(-0.5);
+            }
+        }
+
+        let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
+        assert!(
+            (tracked.len() as i64 - lines as i64).abs() <= 3,
+            "expected ~{lines} lines, got {}",
+            tracked.len()
+        );
+        for &p in &tracked {
+            let offset = p % period;
+            assert!(
+                (26..=35).contains(&offset),
+                "line start {p} drifted onto picture feature (offset {offset})"
+            );
         }
     }
 
