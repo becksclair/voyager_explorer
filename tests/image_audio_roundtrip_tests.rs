@@ -66,12 +66,22 @@ fn offset_correlation(source: &[u8], decoded: &[u8], width: usize, offset: usize
     image_correlation(&source[offset * width..], decoded, width)
 }
 
+/// Direct-coupled decoder parameters for synthetic `encode_image_to_audio`
+/// tests (the forward encoder emits DC-coupled levels unless explicitly
+/// high-pass filtered).
+fn dc_coupled_params() -> DecoderParams {
+    DecoderParams {
+        dc_restore: false,
+        ..DecoderParams::default()
+    }
+}
+
 #[test]
 fn roundtrip_clean_signal() {
     let width = 512;
     let n_lines = 64;
     let sample_rate = 48_000;
-    let params = DecoderParams::default();
+    let params = dc_coupled_params();
     let pixels = test_image(width, n_lines);
 
     let audio = encode_image_to_audio(&pixels, width, sample_rate, params.line_duration_ms);
@@ -107,9 +117,7 @@ fn roundtrip_with_slant_requires_sync_lock() {
     let audio = encode_image_to_audio_with(&pixels, width, sample_rate, 8.32, &opts);
     let decoder = SstvDecoder::new();
 
-    let locked = decoder
-        .decode(&audio, &DecoderParams::default(), sample_rate)
-        .expect("decode");
+    let locked = decoder.decode(&audio, &dc_coupled_params(), sample_rate).expect("decode");
     let corr_locked = image_correlation(&pixels, &locked, width);
     assert!(corr_locked > 0.85, "sync-locked decode under slant too low: {corr_locked:.3}");
 
@@ -118,7 +126,7 @@ fn roundtrip_with_slant_requires_sync_lock() {
             &audio,
             &DecoderParams {
                 sync_lock: false,
-                ..Default::default()
+                ..dc_coupled_params()
             },
             sample_rate,
         )
@@ -135,7 +143,7 @@ fn roundtrip_with_noise() {
     let width = 512;
     let n_lines = 64;
     let sample_rate = 48_000;
-    let params = DecoderParams::default();
+    let params = dc_coupled_params();
     let pixels = test_image(width, n_lines);
 
     let opts = EncodeOptions {
@@ -147,6 +155,55 @@ fn roundtrip_with_noise() {
 
     let corr = image_correlation(&pixels, &decoded, width);
     assert!(corr > 0.7, "noisy roundtrip correlation too low: {corr:.3}");
+}
+
+#[test]
+fn roundtrip_ac_coupled_requires_dc_restore() {
+    // Pass a synthetic encoded image through a 2nd-order 100 Hz Butterworth
+    // high-pass filter (matching the real record's AC coupling) and verify
+    // `dc_restore: true` recovers high correlation and beats `dc_restore: false`.
+    let width = 512;
+    let n_lines = 64;
+    let sample_rate = 48_000;
+    let pixels = test_image(width, n_lines);
+    let raw = encode_image_to_audio(&pixels, width, sample_rate, 8.32);
+
+    let q = std::f64::consts::FRAC_1_SQRT_2;
+    let k = 2.0 * sample_rate as f64;
+    let w0 = std::f64::consts::TAU * 100.0;
+    let a0 = k * k + k * w0 / q + w0 * w0;
+    let (b0, b1, b2) = (k * k / a0, -2.0 * k * k / a0, k * k / a0);
+    let (a1, a2) = ((2.0 * w0 * w0 - 2.0 * k * k) / a0, (k * k - k * w0 / q + w0 * w0) / a0);
+    let mut ac_audio = Vec::with_capacity(raw.len());
+    let (mut x1, mut x2, mut y1, mut y2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for &s in &raw {
+        let x0 = f64::from(s);
+        let y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        ac_audio.push(y0 as f32);
+        x2 = x1;
+        x1 = x0;
+        y2 = y1;
+        y1 = y0;
+    }
+
+    let decoder = SstvDecoder::new();
+    let restored = decoder
+        .decode(&ac_audio, &DecoderParams::default(), sample_rate)
+        .expect("decode with dc_restore");
+    let unrestored = decoder
+        .decode(&ac_audio, &dc_coupled_params(), sample_rate)
+        .expect("decode without dc_restore");
+
+    let corr_restored = image_correlation(&pixels, &restored, width);
+    let corr_unrestored = image_correlation(&pixels, &unrestored, width);
+    assert!(
+        corr_restored > 0.72,
+        "DC-restored AC-coupled roundtrip too low: {corr_restored:.3} (unrestored={corr_unrestored:.3})"
+    );
+    assert!(
+        corr_restored > corr_unrestored + 0.2,
+        "DC restore should clearly beat raw on AC-coupled signal: restored={corr_restored:.3} raw={corr_unrestored:.3}"
+    );
 }
 
 /// Gate 1 regression: decode the real record excerpt and assert the output is

@@ -10,9 +10,11 @@ slides — decoded from the real signal.
 
 - **Decodes the record's baseband slow-scan video**: per-line sync
   alignment (time-domain spike/falling-edge detection with slant
-  correction), anti-aliased resampling to 512 px lines, percentile
-  contrast stretch with polarity and gamma controls. Validated against
-  the record's calibration circle and published reference decodes.
+  correction and phase re-acquisition across image boundaries), inverse
+  high-pass DC restoration for AC-coupled recordings, anti-aliased
+  resampling to 512 px lines, percentile contrast stretch with polarity
+  and gamma controls. Validated against the record's calibration circle
+  and published reference decodes.
 - **Plays the audio** (rodio, optional `audio_playback` feature, on by
   default) with play/pause/stop, click-to-seek on an interactive
   waveform with sync markers, and skip-to-next-sync navigation. The

@@ -6,6 +6,7 @@ fn test_pseudocolor_decoding_logic() {
     let params = DecoderParams {
         line_duration_ms: 10.0,
         sync_lock: false, // plain level lines, no sync structure
+        dc_restore: false,
         mode: DecoderMode::PseudoColor,
         ..Default::default()
     };
@@ -42,6 +43,7 @@ fn test_pseudocolor_partial_lines() {
     let params = DecoderParams {
         line_duration_ms: 10.0,
         sync_lock: false,
+        dc_restore: false,
         mode: DecoderMode::PseudoColor,
         ..Default::default()
     };
@@ -63,6 +65,7 @@ fn test_pseudocolor_preserves_gray_levels() {
     let params = DecoderParams {
         line_duration_ms: 10.0,
         sync_lock: false,
+        dc_restore: false,
         mode: DecoderMode::PseudoColor,
         ..Default::default()
     };

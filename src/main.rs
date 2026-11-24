@@ -56,6 +56,10 @@ enum Commands {
         /// Decoder mode (Grayscale or PseudoColor)
         #[arg(short, long, value_enum, default_value_t = ModeArg::Grayscale)]
         mode: ModeArg,
+
+        /// Disable AC-coupling DC restoration (inverse high-pass filter)
+        #[arg(long, default_value_t = false)]
+        no_dc_restore: bool,
     },
 
     /// Diagnostics: decode windows, spectrograms, sync detection, stats
@@ -92,11 +96,17 @@ fn main() -> eframe::Result {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Batch { input, output, mode }) => {
+        Some(Commands::Batch {
+            input,
+            output,
+            mode,
+            no_dc_restore,
+        }) => {
             let args = batch::BatchArgs {
                 input_pattern: input,
                 output_dir: output,
                 mode: mode.into(),
+                dc_restore: !no_dc_restore,
             };
 
             if let Err(e) = batch::run_batch_processing(args) {

@@ -261,11 +261,14 @@ functions surfaced as CLI subcommands, runnable against the real assets.
       stereo rip currently implies ~3 GB resident)
 - [ ] Playback-speed detection (sync-interval median ≈ 4.15 ms ⇒ 2×
       speed rip)
-- [ ] DC restoration: the recording is AC-coupled, so each line's level
-      drifts back toward mid-grey over roughly a fifth of the line. Black
-      diagram backgrounds decode grey, with a dark strip left at the line
-      start. Needs an inverse high-pass or per-line clamp, re-checked
-      against the Gate 2 composites.
+- [x] DC restoration (`sstv::restore_dc`, `DecoderParams::dc_restore`,
+      default on, GUI toggle and `--no-dc-restore` CLI flag): stabilized
+      2nd-order Butterworth inverse high-pass filter (`f₀ = 100 Hz`,
+      `fₗ = 20 Hz`, `Q = 1/√2`, mean-centered in `f64`) compensates the
+      recording's AC-coupling droop, flattening black diagram backgrounds
+      and removing trailing droop smears on photographs while preserving
+      color balance and registration across all Gate 2 triplets. Sync
+      tracking and picture-row detection stay on the raw signal.
 - [ ] Decoder presets and session save/load (single-image export from
       the main UI already landed in Phase 12)
 - [ ] TIFF/raw export; audio device disconnect recovery; accessibility;

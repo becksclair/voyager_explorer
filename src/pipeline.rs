@@ -277,13 +277,13 @@ fn content_rows(rows: usize) -> std::ops::Range<usize> {
 /// sync stripe starts at 88-90%. Fixed fractions work here because sync
 /// lock pins every line to the same phase.
 ///
-/// The dark strip that diagram frames show just inside the left bound is
-/// picture, not margin, and must stay. Those frames have a black
-/// background; the recording is AC-coupled, so each line starts at true
-/// black and drifts back toward mid-grey over roughly a fifth of the line.
-/// The level falls to black in one step at the 9% bound and then recovers
-/// smoothly with no second edge, and photographs carry ordinary picture
-/// content in the same columns.
+/// The dark strip that diagram frames show just inside the left bound when DC
+/// restoration is off is picture, not margin, and must stay. Those frames have
+/// a black background; the recording is AC-coupled, so without DC restoration
+/// each line starts at true black and drifts back toward mid-grey over roughly
+/// a fifth of the line. The level falls to black in one step at the 9% bound
+/// and then recovers smoothly with no second edge, and photographs carry
+/// ordinary picture content in the same columns.
 /// Non-empty and within `0..width` for every `width >= 1`.
 fn display_crop_cols(width: usize) -> std::ops::Range<usize> {
     let lo = width * 9 / 100;
@@ -436,13 +436,28 @@ impl DecodingPipeline {
     }
 
     pub fn process(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Result<PipelineResult> {
+        self.process_with_preroll(&[], samples, params, sample_rate)
+    }
+
+    /// [`Self::process`] with preceding audio samples used to warm up the
+    /// DC-restoration filter before `samples[0]` so mid-picture windows open
+    /// without a start-up transient.
+    pub fn process_with_preroll(
+        &self,
+        preroll: &[f32],
+        samples: &[f32],
+        params: &DecoderParams,
+        sample_rate: u32,
+    ) -> Result<PipelineResult> {
         // No context here: every caller names the operation itself, and the
         // decoder's error already says what went wrong.
         let crate::sstv::DecodedFrame {
             pixels,
             sync_locked,
             picture_rows,
-        } = self.decoder.decode_frame(samples, params, sample_rate)?;
+        } = self
+            .decoder
+            .decode_frame_with_preroll(preroll, samples, params, sample_rate)?;
 
         // Detect empty pixel data immediately, fail before computing dimensions
         if pixels.is_empty() {

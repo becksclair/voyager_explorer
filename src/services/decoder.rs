@@ -237,9 +237,12 @@ pub fn spawn_decode_worker() -> (Sender<DecodeRequest>, Receiver<DecodeResult>, 
             };
             let end_offset = end_offset.min(request.samples.len());
             let samples_slice = request.samples.get(start_offset..end_offset).unwrap_or(&[]);
+            let preroll_len = (request.sample_rate as f64 * crate::sstv::DC_RESTORE_PREROLL_SECS) as usize;
+            let preroll_start = start_offset.saturating_sub(preroll_len);
+            let preroll = request.samples.get(preroll_start..start_offset).unwrap_or(&[]);
             let segmented_image = request.image_range.is_some_and(|range| range.end == end_offset);
 
-            let result = match pipeline.process(samples_slice, &request.params, request.sample_rate) {
+            let result = match pipeline.process_with_preroll(preroll, samples_slice, &request.params, request.sample_rate) {
                 Ok(mut pipeline_result) => {
                     pipeline_result.segmented_image = segmented_image;
                     tracing::debug!("Decode successful for request {}", request.id);

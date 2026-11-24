@@ -22,10 +22,6 @@ egui_extras = { version = "0.33", features = [
   "all_loaders",
 ] }
 
-env_logger = { version = "0.11", default-features = false, features = [
-  "auto-color",
-  "humantime",
-] }
 hound = "3.5.1"
 
 image = { version = "0.25", default-features = false, features = [
