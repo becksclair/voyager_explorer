@@ -329,11 +329,13 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
         }
         let resume_end = resume_end?;
 
-        // Advance the candidate phase to the same time position as `streak_start`.
+        // Advance the candidate phase to the candidate line that contains
+        // `streak_start` (`new_probe <= streak_start < new_probe + period`) so
+        // both scores cover the same candidate-line cycles.
         let mut new_probe = candidate as f64;
         let max_steps = REACQUIRE_OLD_PHASE_LOOKAHEAD + REACQUIRE_RUN_SYNCS + 4;
         for _ in 0..max_steps {
-            if new_probe + period * 0.5 >= streak_start {
+            if new_probe + period > streak_start {
                 break;
             }
             let p = new_probe + period;
@@ -1495,7 +1497,11 @@ mod tests {
         let first_lines = 60usize;
         let second_lines = 60usize;
         let gap = period * 2 + 160;
-        for &(bar_peak, bar_dip) in &[(0.75f32, -0.50f32), (1.0f32, -0.80f32)] {
+        for &(bar_peak, bar_dip, gain_drop_line) in &[
+            (0.75f32, -0.50f32, None),
+            (1.0f32, -0.80f32, None),
+            (1.0f32, -0.80f32, Some(28usize)),
+        ] {
             let mut samples = synthetic_lines(first_lines, period);
             samples.extend(std::iter::repeat_n(0.0f32, gap));
             let second_start = samples.len();
@@ -1505,19 +1511,25 @@ mod tests {
                 samples[base + 241..=base + 244].fill(bar_peak);
                 samples[base + 245..=base + 248].fill(bar_dip);
             }
+            if let Some(drop_line) = gain_drop_line {
+                let drop_start = second_start + drop_line * period;
+                for s in &mut samples[drop_start..] {
+                    *s *= 0.5;
+                }
+            }
 
             let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
             let second_half: Vec<usize> = tracked.iter().copied().filter(|&p| p >= second_start).collect();
             assert!(
                 second_half.len() >= second_lines - 3,
-                "bar=({bar_peak},{bar_dip}): second image got {} lines",
+                "bar=({bar_peak},{bar_dip}) drop={gain_drop_line:?}: second image got {} lines",
                 second_half.len()
             );
             for &p in &second_half {
                 let offset = (p - second_start) % period;
                 assert!(
                     (4..=10).contains(&offset),
-                    "bar=({bar_peak},{bar_dip}): second image start {p} vetoed onto old phase (offset {offset})"
+                    "bar=({bar_peak},{bar_dip}) drop={gain_drop_line:?}: second image start {p} vetoed onto old phase (offset {offset})"
                 );
             }
         }
