@@ -143,6 +143,9 @@ const REACQUIRE_OLD_PHASE_LOOKAHEAD: usize = 32;
 /// Consecutive strong, non-burst locks at the original phase within the
 /// lookahead window needed to confirm the old phase has not ended.
 const REACQUIRE_OLD_PHASE_RESUME_LOCKS: usize = 3;
+/// Lines over which to compare summed non-burst sync swing between the old
+/// phase and a phase-shifted candidate once the old phase appears to resume.
+const REACQUIRE_COMPARE_LINES: usize = 16;
 
 /// Track scan-line sync positions with a predictive lock.
 ///
@@ -205,9 +208,9 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
         .map_or(detected[0], |i| detected[i]);
     let seed = sync_edge_near(samples, rough_seed, period, edge_search);
 
-    // The sync-like event nearest `predict`, if there is one: its line start
-    // and whether the spike-to-dip swing clears the full threshold.
-    let lock_near = |predict: f64, from: f64, period: f64| -> Option<(usize, bool)> {
+    // The sync-like event nearest `predict`, if there is one: its line start,
+    // whether the spike-to-dip swing clears the full threshold, and the swing.
+    let lock_near_swing = |predict: f64, from: f64, period: f64| -> Option<(usize, bool, f32)> {
         let center = predict.round() as usize;
         let lo = center.saturating_sub(search);
         let hi = (center + search).min(samples.len() - 1);
@@ -236,7 +239,10 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
         let swing = samples[peak] - samples[min_idx];
         let interval = (min_idx as f64 - from).abs();
         let sync_like = swing > threshold * SWING_ANCHOR_FACTOR && (interval - period).abs() / period < TRACK_INTERVAL_TOL;
-        sync_like.then_some((min_idx, swing > threshold))
+        sync_like.then_some((min_idx, swing > threshold, swing))
+    };
+    let lock_near = |predict: f64, from: f64, period: f64| -> Option<(usize, bool)> {
+        lock_near_swing(predict, from, period).map(|(min_idx, strong, _)| (min_idx, strong))
     };
 
     // Whether `candidate` lies past a full line from `anchor` and outside the
@@ -261,13 +267,42 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
             && (start_idx..start_idx + REACQUIRE_RUN_SYNCS).all(|k| !is_burst_tone(samples, detected[k], period))
     };
 
-    // Probe ahead along the currently tracked phase to see if it resumes with
-    // consecutive strong, non-burst locks. A temporary weak-sync dark patch
-    // inside one image resumes at the old phase once the patch ends, whereas
-    // an inter-image boundary moves permanently to the new image's phase.
-    let old_phase_resumes_at = |from_pos: f64, period: f64| -> Option<f64> {
+    // Sum the non-burst locked spike-to-dip swings along one phase track over
+    // `n_lines` starting at `start_pos`.
+    let phase_swing_score = |start_pos: f64, period: f64, n_lines: usize| -> f64 {
+        let mut probe = start_pos - period;
+        let mut total = 0.0f64;
+        for _ in 0..n_lines {
+            let p = probe + period;
+            if p + period > samples.len() as f64 {
+                break;
+            }
+            if let Some((min_idx, _, swing)) = lock_near_swing(p, probe, period) {
+                if !is_burst_tone(samples, min_idx, period) {
+                    total += swing.max(0.0) as f64;
+                }
+                probe = min_idx as f64;
+            } else {
+                probe = p;
+            }
+        }
+        total
+    };
+
+    // Check whether the currently tracked phase resumes ahead AND beats the
+    // phase-shifted candidate over the same post-resume window.
+    // - Inside one image with a weak-sync dark patch + bright mid-line bar,
+    //   the real syncs resume at the old phase with strictly larger swing than
+    //   the picture bar, so re-acquisition is suppressed.
+    // - Across a real inter-image boundary, even if the second image happens
+    //   to put a bright vertical picture feature at the first image's old
+    //   phase, the second image's true syncs at `candidate` are at least as
+    //   strong over that window, so re-acquisition still fires.
+    let old_phase_beats_candidate = |from_pos: f64, candidate: usize, period: f64| -> Option<f64> {
         let mut probe = from_pos;
         let mut streak = 0usize;
+        let mut streak_start = 0.0f64;
+        let mut resume_end = None;
         for _ in 0..REACQUIRE_OLD_PHASE_LOOKAHEAD {
             let p = probe + period;
             if p + period > samples.len() as f64 {
@@ -276,9 +311,13 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
             if let Some((min_idx, strong)) = lock_near(p, probe, period) {
                 probe = min_idx as f64;
                 if strong && !is_burst_tone(samples, min_idx, period) {
+                    if streak == 0 {
+                        streak_start = probe;
+                    }
                     streak += 1;
                     if streak >= REACQUIRE_OLD_PHASE_RESUME_LOCKS {
-                        return Some(probe);
+                        resume_end = Some(probe);
+                        break;
                     }
                 } else {
                     streak = 0;
@@ -288,7 +327,30 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
                 streak = 0;
             }
         }
-        None
+        let resume_end = resume_end?;
+
+        // Advance the candidate phase to the same time position as `streak_start`.
+        let mut new_probe = candidate as f64;
+        let max_steps = REACQUIRE_OLD_PHASE_LOOKAHEAD + REACQUIRE_RUN_SYNCS + 4;
+        for _ in 0..max_steps {
+            if new_probe + period * 0.5 >= streak_start {
+                break;
+            }
+            let p = new_probe + period;
+            if p + period > samples.len() as f64 {
+                break;
+            }
+            new_probe = lock_near(p, new_probe, period).map_or(p, |(m, _)| m as f64);
+        }
+
+        let max_start = streak_start.max(new_probe);
+        let avail = (((samples.len() as f64 - max_start) / period).floor().max(0.0) as usize).min(REACQUIRE_COMPARE_LINES);
+        if avail == 0 {
+            return None;
+        }
+        let old_score = phase_swing_score(streak_start, period, avail);
+        let new_score = phase_swing_score(new_probe, period, avail);
+        (old_score > new_score).then_some(resume_end)
     };
 
     let mut locked = 0usize;
@@ -404,7 +466,7 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
                             if (candidate as f64) > last_locked_pos + period * 1.1
                                 && is_phase_jump(last_locked_pos, candidate, period)
                             {
-                                if let Some(resume_pos) = old_phase_resumes_at(pos, period) {
+                                if let Some(resume_pos) = old_phase_beats_candidate(pos, candidate, period) {
                                     old_phase_resumes_before = resume_pos;
                                 } else {
                                     reacquired = Some(candidate);
@@ -1416,6 +1478,48 @@ mod tests {
                 (26..=35).contains(&offset),
                 "line start {p} drifted onto picture feature (offset {offset})"
             );
+        }
+    }
+
+    #[test]
+    fn tracker_reacquires_across_boundary_despite_bright_feature_at_old_phase() {
+        // Two 60-line images separated by a 2.4-line gap (160-sample phase
+        // shift), with a bright vertical picture feature in the second image
+        // starting at line 12 that happens to land at the first image's old
+        // phase (offset 245, since 400 - 160 + 5 = 245). Even though the old
+        // phase finds strong locks on that future picture feature, the second
+        // image's true syncs at offset 5 carry equal or greater swing over the
+        // same window, so the tracker must re-acquire onto offset 5 instead of
+        // letting future picture content veto the phase change.
+        let period = 400usize;
+        let first_lines = 60usize;
+        let second_lines = 60usize;
+        let gap = period * 2 + 160;
+        for &(bar_peak, bar_dip) in &[(0.75f32, -0.50f32), (1.0f32, -0.80f32)] {
+            let mut samples = synthetic_lines(first_lines, period);
+            samples.extend(std::iter::repeat_n(0.0f32, gap));
+            let second_start = samples.len();
+            samples.extend(synthetic_lines(second_lines, period));
+            for line in 12..second_lines {
+                let base = second_start + line * period;
+                samples[base + 241..=base + 244].fill(bar_peak);
+                samples[base + 245..=base + 248].fill(bar_dip);
+            }
+
+            let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
+            let second_half: Vec<usize> = tracked.iter().copied().filter(|&p| p >= second_start).collect();
+            assert!(
+                second_half.len() >= second_lines - 3,
+                "bar=({bar_peak},{bar_dip}): second image got {} lines",
+                second_half.len()
+            );
+            for &p in &second_half {
+                let offset = (p - second_start) % period;
+                assert!(
+                    (4..=10).contains(&offset),
+                    "bar=({bar_peak},{bar_dip}): second image start {p} vetoed onto old phase (offset {offset})"
+                );
+            }
         }
     }
 
