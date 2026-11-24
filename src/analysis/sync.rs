@@ -126,6 +126,12 @@ const BURST_PERIODS_PER_LINE: f64 = 16.0;
 /// below this. Burst lines measure -0.36 to -0.67 on the 48 kHz rip, and
 /// leader and picture lines stay above zero.
 const BURST_TONE_CORR: f64 = -0.25;
+/// Consecutive coasted lines before checking `detected` for a phase-shifted
+/// coherent run (an inter-image boundary in a multi-frame window).
+const REACQUIRE_COAST_LINES: usize = 3;
+/// Consecutive coherent, non-burst detections required to re-acquire phase
+/// across an inter-image boundary.
+const REACQUIRE_RUN_SYNCS: usize = 4;
 
 /// Track scan-line sync positions with a predictive lock.
 ///
@@ -222,6 +228,28 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
         sync_like.then_some((min_idx, swing > threshold))
     };
 
+    // Whether `candidate` lies past a full line from `anchor` and outside the
+    // narrow tracking window modulo `period` — i.e. a genuine phase jump such
+    // as an inter-image boundary, not a dark-region dropout within one frame
+    // (where syncs resume at the same phase).
+    let is_phase_jump = |anchor: f64, candidate: usize, period: f64| -> bool {
+        let dist = (candidate as f64 - anchor).abs();
+        if dist < period * 1.1 {
+            return false;
+        }
+        let rem = dist % period;
+        let phase_err = rem.min(period - rem);
+        phase_err > period * TRACK_SEARCH_FRAC
+    };
+    let is_coherent_run = |start_idx: usize, period: f64| -> bool {
+        if start_idx + REACQUIRE_RUN_SYNCS > detected.len() {
+            return false;
+        }
+        (start_idx..start_idx + REACQUIRE_RUN_SYNCS - 1)
+            .all(|k| ((detected[k + 1] - detected[k]) as f64 - period).abs() / period < 0.1)
+            && (start_idx..start_idx + REACQUIRE_RUN_SYNCS).all(|k| !is_burst_tone(samples, detected[k], period))
+    };
+
     let mut locked = 0usize;
 
     // Lines before the seed, walked backward at the seed's period. Without
@@ -274,27 +302,112 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
     positions.push(seed);
 
     let mut pos = seed as f64;
+    let mut last_locked_pos = seed as f64;
+    let mut last_locked_idx = positions.len() - 1;
+    let mut coast_len = 0usize;
     let mut was_coasting = false;
+    let mut detect_cursor = detected.partition_point(|&d| (d as f64) <= seed as f64 + period * 1.1);
     loop {
         let predict = pos + period;
         if predict + period > samples.len() as f64 {
             break;
         }
         let lock = lock_near(predict, pos, period);
-        let next = if let Some((min_idx, strong)) = lock {
-            if was_coasting && (min_idx as f64 - predict).abs() >= period * JITTER_RELOCK_FRAC {
-                run_starts.push(positions.len());
+        match lock {
+            Some((min_idx, strong)) => {
+                if was_coasting && (min_idx as f64 - predict).abs() >= period * JITTER_RELOCK_FRAC {
+                    run_starts.push(positions.len());
+                }
+                period = period * (1.0 - PERIOD_EMA_ALPHA) + (min_idx as f64 - pos) * PERIOD_EMA_ALPHA;
+                locked += usize::from(strong);
+                positions.push(min_idx);
+                pos = min_idx as f64;
+                last_locked_pos = pos;
+                last_locked_idx = positions.len() - 1;
+                coast_len = 0;
+                was_coasting = false;
             }
-            period = period * (1.0 - PERIOD_EMA_ALPHA) + (min_idx as f64 - pos) * PERIOD_EMA_ALPHA;
-            locked += usize::from(strong);
-            min_idx as f64
-        } else {
-            // No credible sync (dark line, dropout, boundary junk): coast.
-            predict
-        };
-        positions.push(next.round() as usize);
-        pos = next;
-        was_coasting = lock.is_none();
+            None => {
+                // No credible sync (dark line, dropout, boundary junk): coast.
+                coast_len += 1;
+                positions.push(predict.round() as usize);
+                pos = predict;
+                was_coasting = true;
+
+                // Across an inter-image boundary, the next image's leader syncs
+                // arrive at a new phase outside our ±6% tracking window. If a
+                // coherent non-burst run has started at a different phase, drop
+                // the shifted coasted lines and re-anchor on the new run.
+                if coast_len >= REACQUIRE_COAST_LINES {
+                    while detect_cursor < detected.len() && (detected[detect_cursor] as f64) <= last_locked_pos + period * 1.1 {
+                        detect_cursor += 1;
+                    }
+                    let mut reacquired = None;
+                    let mut j = detect_cursor;
+                    while j + REACQUIRE_RUN_SYNCS <= detected.len() && (detected[j] as f64) <= predict + period {
+                        if is_coherent_run(j, period) {
+                            let candidate = sync_edge_near(samples, detected[j], period, edge_search);
+                            if (candidate as f64) > last_locked_pos + period * 1.1
+                                && is_phase_jump(last_locked_pos, candidate, period)
+                            {
+                                reacquired = Some((j, candidate));
+                                break;
+                            }
+                        }
+                        j += 1;
+                    }
+                    if let Some((found_idx, new_seed)) = reacquired {
+                        // Walk backward from `new_seed` to pick up any opening
+                        // lines of the new image that `detected` skipped.
+                        let mut lead = Vec::new();
+                        let mut back = new_seed as f64;
+                        loop {
+                            let bp = back - period;
+                            if bp < search as f64 || bp <= last_locked_pos + period * 0.7 {
+                                break;
+                            }
+                            let Some((min_idx, strong)) = lock_near(bp, back, period)
+                                .filter(|&(m, _)| (m as f64) < back && (m as f64) > last_locked_pos + period * 0.7)
+                            else {
+                                break;
+                            };
+                            locked += usize::from(strong);
+                            lead.push(min_idx);
+                            back = min_idx as f64;
+                        }
+                        lead.reverse();
+                        // Only the coasted lines that run into the new image
+                        // are at the wrong phase. Those that end before its
+                        // first line are the previous image's own closing
+                        // lines (weak syncs, a dropout) and the gap: keep
+                        // them, or the previous image loses those rows.
+                        let first_new = lead.first().copied().unwrap_or(new_seed) as f64;
+                        let kept = positions[last_locked_idx + 1..]
+                            .iter()
+                            .take_while(|&&p| p as f64 + period * 0.7 <= first_new)
+                            .count();
+                        positions.truncate(last_locked_idx + 1 + kept);
+                        run_starts.retain(|&idx| idx <= last_locked_idx);
+                        // The kept lines are extrapolated, not measured, so
+                        // they smooth as a run of their own and leave the
+                        // locked lines before them as they were.
+                        if kept > 0 {
+                            run_starts.push(last_locked_idx + 1);
+                        }
+                        run_starts.push(positions.len());
+                        positions.extend(lead);
+                        positions.push(new_seed);
+                        locked += 1;
+                        pos = new_seed as f64;
+                        last_locked_pos = pos;
+                        last_locked_idx = positions.len() - 1;
+                        coast_len = 0;
+                        was_coasting = false;
+                        detect_cursor = found_idx + 1;
+                    }
+                }
+            }
+        }
     }
 
     // A track that mostly coasted never found real line structure (music,
@@ -1083,6 +1196,106 @@ mod tests {
             // ...and the slant is preserved (a flattened trend would blow this
             // up to tens of samples over the run).
             assert!(after < 1.5, "n={n}: slant not tracked, residual rms {after:.2}");
+        }
+    }
+
+    #[test]
+    fn tracker_reacquires_phase_across_an_inter_image_boundary() {
+        // Two 60-line images separated by a 2.4-line gap (160-sample phase
+        // shift, well outside the ±6% tracking window). Without phase
+        // re-acquisition the tracker coasts through the second image at the
+        // first image's phase and shifts its leader sideways.
+        let period = 400usize;
+        let first_lines = 60usize;
+        let second_lines = 60usize;
+        let gap = period * 2 + 160;
+        let mut samples = synthetic_lines(first_lines, period);
+        samples.extend(std::iter::repeat_n(0.0f32, gap));
+        let second_start = samples.len();
+        samples.extend(synthetic_lines(second_lines, period));
+
+        let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
+        let first_half: Vec<usize> = tracked.iter().copied().filter(|&p| p < first_lines * period).collect();
+        let second_half: Vec<usize> = tracked.iter().copied().filter(|&p| p >= second_start).collect();
+
+        assert!(first_half.len() >= first_lines - 3, "first image: {} lines", first_half.len());
+        assert!(
+            second_half.len() >= second_lines - 3,
+            "second image: {} lines",
+            second_half.len()
+        );
+        for &p in &first_half {
+            assert!((4..=10).contains(&(p % period)), "first image start {p} off-phase");
+        }
+        for &p in &second_half {
+            let offset = (p - second_start) % period;
+            assert!(
+                (4..=10).contains(&offset),
+                "second image start {p} shifted sideways (offset {offset})"
+            );
+        }
+    }
+
+    #[test]
+    fn tracker_reacquires_phase_across_multiple_image_boundaries() {
+        // Three images separated by two different non-integer gaps (170-sample
+        // and 210-sample phase shifts). Every image's lines must lock to its
+        // own sync dip without carrying the earlier phase forward.
+        let period = 400usize;
+        let n_lines = 50usize;
+        let mut samples = synthetic_lines(n_lines, period);
+        samples.extend(std::iter::repeat_n(0.0f32, period * 2 + 170));
+        let second_start = samples.len();
+        samples.extend(synthetic_lines(n_lines, period));
+        samples.extend(std::iter::repeat_n(0.0f32, period * 3 + 210));
+        let third_start = samples.len();
+        samples.extend(synthetic_lines(n_lines, period));
+
+        let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
+        for (label, base) in [("first", 0), ("second", second_start), ("third", third_start)] {
+            let end = base + n_lines * period;
+            let group: Vec<usize> = tracked.iter().copied().filter(|&p| p >= base && p < end).collect();
+            assert!(group.len() >= n_lines - 3, "{label} image: {} lines", group.len());
+            for &p in &group {
+                let offset = (p - base) % period;
+                assert!(
+                    (4..=10).contains(&offset),
+                    "{label} image start {p} off-phase (offset {offset})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reacquiring_keeps_the_lines_coasted_before_the_new_run() {
+        // A five-line dropout, after which every sync sits 60 samples (15%
+        // of a line) later: outside the tracking window, so the tracker
+        // re-acquires. The lines it coasted across the dropout end before
+        // the new run starts. They are lines of the first image and must
+        // stay in the track, or that image loses five rows.
+        let period = 400usize;
+        let (lines, dropout, resume) = (120usize, 60usize, 65usize);
+        let truth = |line: usize| 30 + line * period + if line >= resume { 60 } else { 0 };
+        let mut samples = vec![0.2f32; truth(lines)];
+        for line in (0..dropout).chain(resume..lines) {
+            let dip = truth(line);
+            samples[dip - 4] = 1.0;
+            samples[dip] = -0.8;
+        }
+
+        let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
+        let nearest = |target: usize| tracked.iter().map(|p| p.abs_diff(target)).min().unwrap();
+        // The dropout lines stay, at the cadence of the syncs before them.
+        for line in dropout..resume {
+            let coasted = 30 + line * period;
+            assert!(nearest(coasted) <= 2, "dropout line {line} is missing from the track");
+        }
+        // The line coasted into the new run at the old phase is dropped.
+        let stale = 30 + resume * period;
+        assert!(nearest(stale) > 20, "a line at the old phase survives inside the new run");
+        // Both sides stay on their own syncs.
+        for line in (dropout - 20..dropout).chain(resume..resume + 20) {
+            assert!(nearest(truth(line)) <= 2, "line {line} is off its sync");
         }
     }
 
