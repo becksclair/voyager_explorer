@@ -181,3 +181,167 @@ fn excerpt_earth_triplet_composites() {
         "composite is uniform gray — registration/compositing produced no color"
     );
 }
+
+/// Window decodes spanning an inter-image boundary must re-acquire the next
+/// image's sync phase on its leader instead of coasting at the previous
+/// image's phase until the start burst.
+#[test]
+#[ignore = "requires assets/golden_record_excerpt_48k.wav (just fixtures)"]
+fn excerpt_window_across_image_boundary_reacquires_leader_phase() {
+    let reader = WavReader::from_file(FIXTURE).expect("load fixture");
+    let samples = reader.left_channel.as_ref();
+    let sr = reader.sample_rate as usize;
+
+    // Boundaries 0->1 (9.65s..9.70s) and 3->4 (27.60s..28.37s) both jump phase
+    // by >80 samples across the splice, well outside the ±6% tracking window.
+    for (start_s, dur_s) in [(9.0, 2.0), (27.0, 2.5)] {
+        let s0 = (start_s * sr as f64) as usize;
+        let s1 = (s0 + (dur_s * sr as f64) as usize).min(samples.len());
+        let window = &samples[s0..s1];
+
+        let tracked = track_line_syncs(window, reader.sample_rate, &SyncParams::default());
+        // The next image's leader sits in the middle third of each window;
+        // every tracked line start there must sit near a real positive sync
+        // spike (within the preceding 25 samples), not in the flat mid-line.
+        let max_abs = window.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let mid_lines: Vec<usize> = tracked
+            .iter()
+            .copied()
+            .filter(|&p| p > window.len() / 3 && p < window.len() * 2 / 3)
+            .collect();
+        assert!(mid_lines.len() >= 40, "expected >=40 leader lines, got {}", mid_lines.len());
+        let locked_near_spike = mid_lines
+            .iter()
+            .filter(|&&p| {
+                let lo = p.saturating_sub(25);
+                let spike = window[lo..=p].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                spike > max_abs * 0.35
+            })
+            .count();
+        assert!(
+            locked_near_spike * 10 >= mid_lines.len() * 8,
+            "window at {start_s}s: only {locked_near_spike}/{} leader lines locked to a sync spike",
+            mid_lines.len()
+        );
+    }
+}
+
+/// DC restoration must flatten the AC-coupling droop on black-background
+/// diagrams (Frame 0: Calibration Circle) relative to an un-restored decode.
+#[test]
+#[ignore = "requires assets/golden_record_excerpt_48k.wav (just fixtures)"]
+fn excerpt_dc_restore_flattens_black_diagram_background() {
+    let reader = WavReader::from_file(FIXTURE).expect("load fixture");
+    let samples = reader.left_channel.as_ref();
+    let bounds = find_image_bounds(samples, reader.sample_rate, &SegmentImagesParams::default());
+    let f0 = &bounds[0];
+    let slice = &samples[f0.start_sample..f0.end_sample];
+    let decoder = SstvDecoder::new();
+
+    let restored = decoder
+        .decode_levels(slice, &DecoderParams::default(), reader.sample_rate)
+        .expect("restored decode");
+    let raw = decoder
+        .decode_levels(
+            slice,
+            &DecoderParams {
+                dc_restore: false,
+                ..DecoderParams::default()
+            },
+            reader.sample_rate,
+        )
+        .expect("raw decode");
+
+    // Average pure-black border rows 50..80 (after start burst, before circle).
+    let width = 512usize;
+    let col_std = |levels: &[f32]| -> f64 {
+        let mut avg = vec![0.0f64; width];
+        for row in 50..80 {
+            for (x, slot) in avg.iter_mut().enumerate() {
+                *slot += f64::from(levels[row * width + x]) / 30.0;
+            }
+        }
+        // Content region inside sync bands (12%..86% of line width).
+        let sub = &avg[width * 12 / 100..width * 86 / 100];
+        let mean = sub.iter().sum::<f64>() / sub.len() as f64;
+        (sub.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / sub.len() as f64).sqrt()
+    };
+
+    let raw_std = col_std(&raw);
+    let restored_std = col_std(&restored);
+    assert!(
+        restored_std < raw_std * 0.4,
+        "DC restoration did not flatten Frame 0 black background: raw_std={raw_std:.5} restored_std={restored_std:.5}"
+    );
+}
+
+/// A window opening mid-picture (70% into Frame 6) must match the full-frame
+/// DC-restored decode from line 0 onward when given real pre-roll, and stay
+/// close via 2-line periodic warm-up when decoded standalone without pre-roll.
+#[test]
+#[ignore = "requires assets/golden_record_excerpt_48k.wav (just fixtures)"]
+fn excerpt_mid_picture_window_has_no_dc_restore_startup_transient() {
+    let reader = WavReader::from_file(FIXTURE).expect("load fixture");
+    let samples = reader.left_channel.as_ref();
+    let bounds = find_image_bounds(samples, reader.sample_rate, &SegmentImagesParams::default());
+    let f6 = &bounds[6];
+    let params = DecoderParams::default();
+    let decoder = SstvDecoder::new();
+    let width = params.effective_width();
+
+    // Full-frame DC-restored reference (settled well before 70% into the frame).
+    let full_levels = decoder
+        .decode_levels(&samples[f6.start_sample..f6.end_sample], &params, reader.sample_rate)
+        .expect("full frame decode");
+    let full_rows = full_levels.len() / width;
+
+    // 2 s window starting 70% into Frame 6.
+    let win_start = f6.start_sample + (f6.end_sample - f6.start_sample) * 70 / 100;
+    let win_end = (win_start + 2 * reader.sample_rate as usize).min(samples.len());
+    let preroll_len = (reader.sample_rate as f64 * voyager_explorer::sstv::DC_RESTORE_PREROLL_SECS) as usize;
+    let preroll = &samples[win_start.saturating_sub(preroll_len)..win_start];
+    let window = &samples[win_start..win_end];
+
+    let with_preroll = decoder
+        .decode_levels_with_preroll(preroll, window, &params, reader.sample_rate)
+        .expect("preroll window decode");
+    let standalone = decoder
+        .decode_levels(window, &params, reader.sample_rate)
+        .expect("standalone window decode");
+
+    // Align window's line 0 to the matching row in `full_levels` using row 10
+    // (well past any possible transient).
+    let c0 = width * 12 / 100;
+    let c1 = width * 86 / 100;
+    let row_err = |a: &[f32], ra: usize, b: &[f32], rb: usize| -> f64 {
+        (c0..c1)
+            .map(|x| f64::from((a[ra * width + x] - b[rb * width + x]).abs()))
+            .sum::<f64>()
+            / (c1 - c0) as f64
+    };
+    let approx_row = (full_rows * 70 / 100).saturating_sub(10);
+    let search_end = (approx_row + 40).min(full_rows - 15);
+    let best_offset = (approx_row..search_end)
+        .min_by(|&r1, &r2| {
+            row_err(&with_preroll, 10, &full_levels, r1 + 10).total_cmp(&row_err(&with_preroll, 10, &full_levels, r2 + 10))
+        })
+        .expect("matching row offset");
+
+    let ref_slice = &full_levels[best_offset * width..(best_offset + 10) * width];
+    let min_v = ref_slice.iter().copied().fold(f32::INFINITY, f32::min);
+    let max_v = ref_slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let span = f64::from((max_v - min_v).max(1e-6));
+
+    let preroll_err0 = row_err(&with_preroll, 0, &full_levels, best_offset) / span;
+    let standalone_err0 = row_err(&standalone, 0, &full_levels, best_offset) / span;
+    assert!(
+        preroll_err0 < 0.02,
+        "pre-roll window line 0 error too high: {:.2}%",
+        preroll_err0 * 100.0
+    );
+    assert!(
+        standalone_err0 < 0.05,
+        "standalone 2-line warmup line 0 error too high: {:.2}%",
+        standalone_err0 * 100.0
+    );
+}

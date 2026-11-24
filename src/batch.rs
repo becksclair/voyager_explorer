@@ -12,6 +12,7 @@ pub struct BatchArgs {
     pub input_pattern: String,
     pub output_dir: PathBuf,
     pub mode: DecoderMode,
+    pub dc_restore: bool,
 }
 
 pub fn run_batch_processing(args: BatchArgs) -> Result<()> {
@@ -19,6 +20,7 @@ pub fn run_batch_processing(args: BatchArgs) -> Result<()> {
     tracing::info!("Input pattern: {}", args.input_pattern);
     tracing::info!("Output directory: {:?}", args.output_dir);
     tracing::info!("Mode: {:?}", args.mode);
+    tracing::info!("DC restore: {}", args.dc_restore);
 
     // Create output directory if it doesn't exist
     fs::create_dir_all(&args.output_dir).context("Failed to create output directory")?;
@@ -39,6 +41,7 @@ pub fn run_batch_processing(args: BatchArgs) -> Result<()> {
     let pipeline = DecodingPipeline::new();
     let params = DecoderParams {
         mode: args.mode,
+        dc_restore: args.dc_restore,
         ..DecoderParams::default()
     };
 
@@ -130,5 +133,48 @@ mod tests {
         fs::write(&second, b"x").unwrap();
         let third = unique_output_path(dir.path(), stem);
         assert_eq!(third, dir.path().join("frame_2.png"));
+    }
+
+    #[test]
+    fn test_run_batch_processing_honors_dc_restore_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav_path = dir.path().join("sample.wav");
+        // Periodic sync+step waveform whose output differs visibly with vs without DC restore.
+        let sr = 48_000u32;
+        let period = 400usize;
+        let mut samples = Vec::with_capacity(period * 12);
+        for _ in 0..12 {
+            for i in 0..period {
+                samples.push(match i {
+                    0..=12 => 0.9f32,
+                    13..=20 => -0.7f32,
+                    21..=200 => -0.2f32,
+                    _ => 0.1f32,
+                });
+            }
+        }
+        let tmp = crate::test_fixtures::create_test_wav_file(&samples, sr, 1);
+        fs::copy(tmp.path(), &wav_path).unwrap();
+
+        let out_on = dir.path().join("on");
+        let out_off = dir.path().join("off");
+        run_batch_processing(BatchArgs {
+            input_pattern: wav_path.to_string_lossy().into_owned(),
+            output_dir: out_on.clone(),
+            mode: DecoderMode::Grayscale,
+            dc_restore: true,
+        })
+        .unwrap();
+        run_batch_processing(BatchArgs {
+            input_pattern: wav_path.to_string_lossy().into_owned(),
+            output_dir: out_off.clone(),
+            mode: DecoderMode::Grayscale,
+            dc_restore: false,
+        })
+        .unwrap();
+
+        let bytes_on = fs::read(out_on.join("sample.png")).unwrap();
+        let bytes_off = fs::read(out_off.join("sample.png")).unwrap();
+        assert_ne!(bytes_on, bytes_off, "dc_restore flag had no effect on batch output");
     }
 }

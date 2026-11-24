@@ -12,6 +12,27 @@ use crate::error::{DecoderError, Result, VoyagerError};
 const TARGET_FREQ_HZ: f32 = 1200.0;
 /// FFT chunk size for frequency analysis
 const CHUNK_SIZE: usize = 2048;
+/// Measured AC-coupling high-pass corner of the Golden Record audio chain (Hz).
+/// Matches the exponential droop and zero-crossing overshoot measured on pure-
+/// black diagram lines across both the 48 kHz remaster and 384 kHz masters.
+const DC_RESTORE_CUTOFF_HZ: f64 = 100.0;
+/// Low-frequency leak corner (Hz) bounding the inverse filter's DC gain to
+/// `(cutoff / leak)^2 = 25x` so transients settle within about four scan lines
+/// (each line roughly halves them) and sub-frame turntable rumble is not
+/// amplified. Windowed callers pass [`DC_RESTORE_PREROLL_SECS`] of preceding
+/// audio so the filter opens in steady state; standalone slices warm up on
+/// their first two contiguous scan lines.
+const DC_RESTORE_LEAK_HZ: f64 = 20.0;
+/// Pre-roll duration (seconds) fed into [`restore_dc_with_preroll`] before a
+/// windowed slice so the 20 Hz leak pole settles to `< 0.02%` before line 0.
+pub const DC_RESTORE_PREROLL_SECS: f64 = 0.1;
+/// Shortest pre-roll (seconds) the decoder warms the filter on: about three
+/// time constants of the leak pole. A window that opens closer than this to
+/// the start of its buffer has less, and the filter would start almost from
+/// rest (with 1-40 samples, line 0 of a mid-picture window is 10-24% of the
+/// level range off on the 48 kHz excerpt, against under 5% for the two-line
+/// warm-up), so it warms up as a standalone slice does.
+const DC_RESTORE_MIN_PREROLL_SECS: f64 = 0.03;
 
 /// Pixels from one decode, with what the display crop needs to know about it.
 pub(crate) struct DecodedFrame {
@@ -20,6 +41,13 @@ pub(crate) struct DecodedFrame {
     pub sync_locked: bool,
     /// Rows holding the picture, when the detector could tell (see
     /// [`find_picture_rows`]).
+    pub picture_rows: Option<Range<usize>>,
+}
+
+/// Raw decoded luminance levels plus sync and picture-row metadata.
+pub(crate) struct DecodedLevels {
+    pub levels: Vec<f32>,
+    pub sync_locked: bool,
     pub picture_rows: Option<Range<usize>>,
 }
 
@@ -42,6 +70,10 @@ pub struct DecoderParams {
     pub gamma: f32,
     /// Align lines to detected sync edges instead of fixed-period slicing.
     pub sync_lock: bool,
+    /// Compensate the recording chain's AC-coupling droop with a stabilized
+    /// inverse high-pass filter so uniform dark/light regions hold their level
+    /// across each scan line.
+    pub dc_restore: bool,
     /// Live-decode window length in seconds (used by the decode worker to
     /// slice around the playback position, not by `decode` itself).
     pub decode_window_secs: f64,
@@ -67,6 +99,7 @@ impl Default for DecoderParams {
             invert: false,
             gamma: 1.0,
             sync_lock: true,
+            dc_restore: true,
             decode_window_secs: 2.0,
             mode: DecoderMode::Grayscale,
             width: 512,
@@ -258,19 +291,26 @@ impl SstvDecoder {
     /// Decode to pixels, keeping what the display crop needs to know about
     /// the decode.
     pub(crate) fn decode_frame(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Result<DecodedFrame> {
-        let (levels, sync_locked) = self.decode_levels_with_sync_status(samples, params, sample_rate)?;
+        self.decode_frame_with_preroll(&[], samples, params, sample_rate)
+    }
+
+    /// [`Self::decode_frame`] with preceding audio samples used to warm up the
+    /// DC-restoration filter before `samples[0]` so mid-picture windows open
+    /// without a start-up transient.
+    pub(crate) fn decode_frame_with_preroll(
+        &self,
+        preroll: &[f32],
+        samples: &[f32],
+        params: &DecoderParams,
+        sample_rate: u32,
+    ) -> Result<DecodedFrame> {
+        let DecodedLevels {
+            levels,
+            sync_locked,
+            picture_rows,
+        } = self.decode_levels_with_metadata(preroll, samples, params, sample_rate)?;
         let width = params.effective_width();
         let lines_decoded = levels.len() / width;
-
-        // The detector measures the central part of each line, which only
-        // excludes the sync bands when lines are sync-aligned. PseudoColor
-        // folds three lines into one output row, so line rows are not image
-        // rows there.
-        let picture_rows = if sync_locked && params.mode == DecoderMode::Grayscale {
-            find_picture_rows(&levels, width)
-        } else {
-            None
-        };
 
         // --- Normalization ---
         // Percentile contrast stretch is robust to sync-spike outliers.
@@ -335,18 +375,44 @@ impl SstvDecoder {
     /// where stretching each frame by its own bounds would skew the color
     /// balance.
     pub fn decode_levels(&self, samples: &[f32], params: &DecoderParams, sample_rate: u32) -> Result<Vec<f32>> {
-        self.decode_levels_with_sync_status(samples, params, sample_rate)
-            .map(|(levels, _)| levels)
+        self.decode_levels_inner(&[], samples, params, sample_rate, false)
+            .map(|decoded| decoded.levels)
     }
 
-    /// [`Self::decode_levels`], plus whether line segmentation used detected
-    /// syncs instead of the fixed-period fallback.
-    pub(crate) fn decode_levels_with_sync_status(
+    /// [`Self::decode_levels`], plus preceding audio samples to warm up DC
+    /// restoration before `samples[0]`.
+    pub fn decode_levels_with_preroll(
         &self,
+        preroll: &[f32],
         samples: &[f32],
         params: &DecoderParams,
         sample_rate: u32,
-    ) -> Result<(Vec<f32>, bool)> {
+    ) -> Result<Vec<f32>> {
+        self.decode_levels_inner(preroll, samples, params, sample_rate, false)
+            .map(|decoded| decoded.levels)
+    }
+
+    /// [`Self::decode_levels`], plus sync-lock status and detected picture rows
+    /// (measured on the un-restored signal so DC restoration cannot shift the
+    /// leader noise-floor calibration).
+    pub(crate) fn decode_levels_with_metadata(
+        &self,
+        preroll: &[f32],
+        samples: &[f32],
+        params: &DecoderParams,
+        sample_rate: u32,
+    ) -> Result<DecodedLevels> {
+        self.decode_levels_inner(preroll, samples, params, sample_rate, true)
+    }
+
+    fn decode_levels_inner(
+        &self,
+        preroll: &[f32],
+        samples: &[f32],
+        params: &DecoderParams,
+        sample_rate: u32,
+        detect_picture_rows: bool,
+    ) -> Result<DecodedLevels> {
         // Validate parameters
         if !(1.0..=100.0).contains(&params.line_duration_ms) {
             return Err(VoyagerError::Decoder(DecoderError::InvalidLineDuration {
@@ -392,18 +458,72 @@ impl SstvDecoder {
         // Sync-locked when the detector finds a consistent line cadence;
         // otherwise fixed-period slicing at the nominal duration. Re-anchoring
         // at every detected sync keeps timing error from accumulating (slant).
+        // Sync detection always runs on the raw signal so DC restoration cannot
+        // perturb spike/dip thresholds.
         let (line_ranges, sync_locked) = self.segment_lines(samples, params, sample_rate, samples_per_line, max_lines);
 
-        // --- Per-line level extraction ---
-        // Resample each line to `width` luminance levels. Bin-averaging on
-        // downsample doubles as the anti-alias filter; linear interpolation
-        // covers the upsample case (e.g. 400 samples/line at 48 kHz -> 512 px).
-        let mut levels: Vec<f32> = Vec::with_capacity(width * line_ranges.len());
-        for range in &line_ranges {
-            let slice = &samples[range.clone()];
-            resample_line(slice, width, &mut levels);
-        }
-        Ok((levels, sync_locked))
+        let resample_ranges = |src: &[f32], base: usize| {
+            let mut out = Vec::with_capacity(width * line_ranges.len());
+            for range in &line_ranges {
+                resample_line(&src[range.start - base..range.end - base], width, &mut out);
+            }
+            out
+        };
+
+        // --- DC restoration & per-line level extraction ---
+        // Compensate AC-coupling droop on the continuous waveform before line
+        // slicing so filter state carries smoothly across scan-line boundaries.
+        // Picture-row detection measures the raw (un-restored) levels so the
+        // inverse filter's low-frequency boost cannot raise leader activity
+        // above the noise floor.
+        let want_picture_rows = detect_picture_rows && sync_locked && params.mode == DecoderMode::Grayscale;
+        let (levels, picture_rows) = if params.dc_restore {
+            let picture_rows = if want_picture_rows {
+                let raw_levels = resample_ranges(samples, 0);
+                find_picture_rows(&raw_levels, width)
+            } else {
+                None
+            };
+            // Lines are read back only up to the last one decoded, and a
+            // whole-file decode stops at `max_lines`, well short of the buffer.
+            let decoded_end = line_ranges.last().map_or(0, |range| range.end);
+            let min_preroll = ((DC_RESTORE_MIN_PREROLL_SECS * sample_rate as f64) as usize).max(1);
+            let (restored, base) = if preroll.len() >= min_preroll {
+                (restore_dc_with_preroll(preroll, &samples[..decoded_end], sample_rate), 0)
+            } else if line_ranges.len() >= 2 && line_ranges[1].start == line_ranges[0].end {
+                // No usable pre-roll: warm up on two contiguous opening lines
+                // (one full 60 Hz hum cycle so alternating-line hum cancels out)
+                // repeated across `DC_RESTORE_PREROLL_SECS`.
+                let base = line_ranges[0].start;
+                let pair = &samples[base..line_ranges[1].end];
+                let repeats = if pair.is_empty() {
+                    0
+                } else {
+                    ((DC_RESTORE_PREROLL_SECS * sample_rate as f64) / pair.len() as f64)
+                        .ceil()
+                        .clamp(1.0, 16.0) as usize
+                };
+                (
+                    restore_dc_with_repeated_warmup(pair, repeats, &samples[base..decoded_end], sample_rate),
+                    base,
+                )
+            } else {
+                // No pair to warm up on either: whatever pre-roll there is
+                // still beats starting from rest.
+                (restore_dc_with_preroll(preroll, &samples[..decoded_end], sample_rate), 0)
+            };
+            (resample_ranges(&restored, base), picture_rows)
+        } else {
+            let levels = resample_ranges(samples, 0);
+            let picture_rows = want_picture_rows.then(|| find_picture_rows(&levels, width)).flatten();
+            (levels, picture_rows)
+        };
+
+        Ok(DecodedLevels {
+            levels,
+            sync_locked,
+            picture_rows,
+        })
     }
 
     /// Segment samples into per-line ranges. Prefers sync-locked boundaries;
@@ -481,6 +601,88 @@ impl SstvDecoder {
         }
         (ranges, false)
     }
+}
+
+/// Compensate the recording's AC-coupling droop with a stabilized 2nd-order
+/// Butterworth inverse high-pass filter (low-shelf):
+///
+/// `H(s) = (s² + (ω₀/Q)s + ω₀²) / (s² + (ωₗ/Q)s + ωₗ²)`
+///
+/// with `f₀ = 100 Hz`, `fₗ = 20 Hz`, `Q = 1/√2`, discretized via bilinear
+/// transform in `f64` so coefficients remain well-conditioned up to 384 kHz+.
+/// Non-finite input samples are treated as zero in the filter recursion so a
+/// single corrupt sample cannot poison the remainder of the buffer.
+pub fn restore_dc(samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    restore_dc_with_preroll(&[], samples, sample_rate)
+}
+
+/// [`restore_dc`], warmed up on preceding `preroll` samples (discarded from the
+/// output) so a mid-frame window starts in steady state instead of from rest.
+pub fn restore_dc_with_preroll(preroll: &[f32], samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    restore_dc_with_repeated_warmup(preroll, usize::from(!preroll.is_empty()), samples, sample_rate)
+}
+
+fn restore_dc_with_repeated_warmup(warmup: &[f32], repeats: usize, samples: &[f32], sample_rate: u32) -> Vec<f32> {
+    if samples.is_empty() || (sample_rate as f64) <= 2.0 * DC_RESTORE_CUTOFF_HZ {
+        return samples.to_vec();
+    }
+    let q = std::f64::consts::FRAC_1_SQRT_2;
+    let k = 2.0 * sample_rate as f64;
+    let w0 = std::f64::consts::TAU * DC_RESTORE_CUTOFF_HZ;
+    let wl = std::f64::consts::TAU * DC_RESTORE_LEAK_HZ;
+
+    let k2 = k * k;
+    let w0_2 = w0 * w0;
+    let wl_2 = wl * wl;
+    let a0 = k2 + k * wl / q + wl_2;
+    let b0 = (k2 + k * w0 / q + w0_2) / a0;
+    let b1 = (2.0 * w0_2 - 2.0 * k2) / a0;
+    let b2 = (k2 - k * w0 / q + w0_2) / a0;
+    let a1 = (2.0 * wl_2 - 2.0 * k2) / a0;
+    let a2 = (k2 - k * wl / q + wl_2) / a0;
+
+    // Remove any buffer-wide DC bias (e.g. ADC offset) before filtering so the
+    // 25x low-shelf DC gain cannot amplify a constant offset into a startup ramp.
+    let (mut sum, mut count) = (0.0f64, 0usize);
+    for &sample in samples {
+        if sample.is_finite() {
+            sum += f64::from(sample);
+            count += 1;
+        }
+    }
+    let dc_mean = if count > 0 { sum / count as f64 } else { 0.0 };
+
+    let (mut x1, mut x2, mut y1, mut y2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for _ in 0..repeats {
+        for &sample in warmup {
+            let x0 = if sample.is_finite() {
+                f64::from(sample) - dc_mean
+            } else {
+                0.0
+            };
+            let y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+            x2 = x1;
+            x1 = x0;
+            y2 = y1;
+            y1 = y0;
+        }
+    }
+
+    let mut out = Vec::with_capacity(samples.len());
+    for &sample in samples {
+        let x0 = if sample.is_finite() {
+            f64::from(sample) - dc_mean
+        } else {
+            0.0
+        };
+        let y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        out.push(y0 as f32);
+        x2 = x1;
+        x1 = x0;
+        y2 = y1;
+        y1 = y0;
+    }
+    out
 }
 
 /// Resample one line of samples to `width` luminance levels, appending to
@@ -607,6 +809,7 @@ mod tests {
         assert_eq!(params.gamma, 1.0);
         assert!(!params.invert);
         assert!(params.sync_lock);
+        assert!(params.dc_restore);
         assert_eq!(params.mode, DecoderMode::Grayscale);
     }
 
@@ -711,7 +914,10 @@ mod tests {
         // binary collapse — the defining regression test for the old
         // threshold "decoder".
         let decoder = SstvDecoder::new();
-        let params = DecoderParams::default();
+        let params = DecoderParams {
+            dc_restore: false, // synthetic encoder is direct-coupled
+            ..DecoderParams::default()
+        };
         let sample_rate = 48_000;
 
         let width = 512usize;
@@ -756,7 +962,10 @@ mod tests {
                 *p = (x * 255 / (width - 1)) as u8;
             }
         }
-        let params = DecoderParams::default();
+        let params = DecoderParams {
+            dc_restore: false, // synthetic encoder is direct-coupled
+            ..DecoderParams::default()
+        };
         let audio = crate::test_fixtures::encode_image_to_audio(&pixels, width, sample_rate, params.line_duration_ms);
 
         let normal = decoder.decode(&audio, &params, sample_rate).unwrap();
@@ -799,6 +1008,7 @@ mod tests {
         let params = DecoderParams {
             line_duration_ms: 1.0,
             mode: DecoderMode::PseudoColor,
+            dc_restore: false, // 3-sample DC-coupled synthetic test
             ..Default::default()
         };
 
@@ -1057,6 +1267,136 @@ mod tests {
         assert_eq!(ranges.len(), 3);
     }
 
+    #[test]
+    fn test_restore_dc_flattens_ac_coupled_square_wave() {
+        // Pass a periodic 120 Hz Voyager-like sync+black waveform through a
+        // 2nd-order 100 Hz Butterworth high-pass filter, then verify
+        // `restore_dc` flattens the resulting droop inside the black region.
+        let sr = 48_000u32;
+        let period = 400usize;
+        let n_lines = 40usize;
+        let mut original = Vec::with_capacity(period * n_lines);
+        for _ in 0..n_lines {
+            for i in 0..period {
+                // 40-sample sync plateau (+0.12), 360-sample constant black (-0.02)
+                original.push(if i < 40 { 0.12f32 } else { -0.02f32 });
+            }
+        }
+
+        // Forward 2nd-order Butterworth HPF at DC_RESTORE_CUTOFF_HZ.
+        let q = std::f64::consts::FRAC_1_SQRT_2;
+        let k = 2.0 * sr as f64;
+        let w0 = std::f64::consts::TAU * DC_RESTORE_CUTOFF_HZ;
+        let a0 = k * k + k * w0 / q + w0 * w0;
+        let b0 = (k * k) / a0;
+        let b1 = (-2.0 * k * k) / a0;
+        let b2 = (k * k) / a0;
+        let a1 = (2.0 * w0 * w0 - 2.0 * k * k) / a0;
+        let a2 = (k * k - k * w0 / q + w0 * w0) / a0;
+        let mut ac_coupled = Vec::with_capacity(original.len());
+        let (mut x1, mut x2, mut y1, mut y2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for &s in &original {
+            let x0 = f64::from(s);
+            let y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+            ac_coupled.push(y0 as f32);
+            x2 = x1;
+            x1 = x0;
+            y2 = y1;
+            y1 = y0;
+        }
+
+        let restored = restore_dc(&ac_coupled, sr);
+        assert_eq!(restored.len(), ac_coupled.len());
+
+        // Compare flatness across the steady-state black plateau of the last line.
+        let base = (n_lines - 1) * period;
+        let span = |buf: &[f32]| {
+            let slice = &buf[base + 48..base + 380];
+            let min = slice.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            max - min
+        };
+        let droop_before = span(&ac_coupled);
+        let droop_after = span(&restored);
+        assert!(droop_before > 0.08, "setup: expected strong AC droop, got {droop_before}");
+        // The stabilized 20 Hz leak corner leaves a small residual slope on a
+        // 120 Hz pulse while cutting peak-to-peak droop by ~5x.
+        assert!(
+            droop_after < droop_before * 0.3,
+            "DC restoration did not flatten droop: before={droop_before:.4} after={droop_after:.4}"
+        );
+    }
+
+    #[test]
+    fn test_restore_dc_edge_cases() {
+        assert!(restore_dc(&[], 48_000).is_empty());
+        // Sample rate too low for the 100 Hz filter passes through unchanged.
+        let low = vec![0.1, 0.2, 0.3];
+        assert_eq!(restore_dc(&low, 150), low);
+        // Constant ADC bias is removed without blowing up.
+        let biased = vec![0.5f32; 2000];
+        let out = restore_dc(&biased, 48_000);
+        assert!(out.iter().all(|v| v.is_finite() && v.abs() < 1e-5));
+        // Non-finite samples do not poison the filter recursion.
+        let mut with_nan = vec![0.0f32; 100];
+        with_nan[10] = f32::NAN;
+        with_nan[20] = f32::INFINITY;
+        let out = restore_dc(&with_nan, 48_000);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_restore_dc_with_preroll_matches_continuous_steady_state() {
+        // A slice taken mid-way through a periodic AC-coupled waveform must
+        // match the continuous full-buffer restore from sample 0 when warmed
+        // with DC_RESTORE_PREROLL_SECS of preceding audio.
+        let sr = 48_000u32;
+        let period = 400usize;
+        let n_lines = 40usize;
+        let mut sig = Vec::with_capacity(period * n_lines);
+        for _ in 0..n_lines {
+            for i in 0..period {
+                sig.push(if i < 40 { 0.10f32 } else { -0.0111f32 });
+            }
+        }
+        let full = restore_dc(&sig, sr);
+        let split = 25 * period;
+        let preroll_len = (sr as f64 * DC_RESTORE_PREROLL_SECS) as usize;
+        let windowed = restore_dc_with_preroll(&sig[split - preroll_len..split], &sig[split..], sr);
+        let max_err = windowed
+            .iter()
+            .zip(&full[split..])
+            .take(period * 4)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_err < 1e-3,
+            "preroll-warmed window diverged from continuous steady state: max_err={max_err}"
+        );
+    }
+
+    #[test]
+    fn test_short_preroll_decodes_like_a_standalone_slice() {
+        // A window that opens a few samples into the buffer has too little
+        // pre-roll to settle the filter. Run from it alone, the filter starts
+        // almost from rest and the opening lines keep their droop, so such a
+        // window must warm up on its first two lines as a standalone slice
+        // does.
+        let decoder = SstvDecoder::new();
+        let params = DecoderParams::default();
+        let sample_rate = 48_000;
+        let width = 64usize;
+        let pixels: Vec<u8> = (0..width * 40).map(|i| ((i * 37) % 256) as u8).collect();
+        let audio = crate::test_fixtures::encode_image_to_audio(&pixels, width, sample_rate, params.line_duration_ms);
+
+        let split = 40;
+        let standalone = decoder.decode_levels(&audio[split..], &params, sample_rate).unwrap();
+        let short = decoder
+            .decode_levels_with_preroll(&audio[..split], &audio[split..], &params, sample_rate)
+            .unwrap();
+        assert!(short == standalone, "a 40-sample pre-roll replaced the two-line warm-up");
+    }
+
     // Property-based tests using proptest
     #[cfg(test)]
     mod proptests {
@@ -1066,12 +1406,13 @@ mod tests {
 
         /// Generate valid decoder parameters for property testing
         fn valid_decoder_params() -> impl Strategy<Value = DecoderParams> {
-            (1.0f32..=100.0, 0.2f32..=3.0, any::<bool>(), any::<bool>()).prop_map(
-                |(line_duration_ms, gamma, invert, sync_lock)| DecoderParams {
+            (1.0f32..=100.0, 0.2f32..=3.0, any::<bool>(), any::<bool>(), any::<bool>()).prop_map(
+                |(line_duration_ms, gamma, invert, sync_lock, dc_restore)| DecoderParams {
                     line_duration_ms,
                     gamma,
                     invert,
                     sync_lock,
+                    dc_restore,
                     mode: DecoderMode::Grayscale,
                     ..Default::default()
                 },

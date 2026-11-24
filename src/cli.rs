@@ -48,6 +48,9 @@ pub enum DiagnosticsCommand {
         /// Disable per-line sync alignment (fixed-period slicing instead)
         #[arg(long, default_value_t = false)]
         no_sync_lock: bool,
+        /// Disable AC-coupling DC restoration (inverse high-pass filter)
+        #[arg(long, default_value_t = false)]
+        no_dc_restore: bool,
         /// Decoder mode
         #[arg(long, value_enum, default_value_t = CliMode::Grayscale)]
         mode: CliMode,
@@ -176,6 +179,9 @@ pub enum DiagnosticsCommand {
         /// Gamma applied after normalization (decode)
         #[arg(long, default_value_t = 1.0)]
         gamma: f32,
+        /// Disable AC-coupling DC restoration (decode)
+        #[arg(long, default_value_t = false)]
+        no_dc_restore: bool,
         /// Rotate output 90° clockwise (decode)
         #[arg(long, default_value_t = false)]
         rotate: bool,
@@ -258,22 +264,37 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
             invert,
             gamma,
             no_sync_lock,
+            no_dc_restore,
             mode,
             rotate,
             flip,
         } => {
-            let (samples, sample_rate) = load_window(&input, start, duration, channel)?;
+            let dc_restore = !no_dc_restore;
+            let (samples, sample_rate, split) = if dc_restore && start > 0.0 {
+                let preroll_start = (start - crate::sstv::DC_RESTORE_PREROLL_SECS).max(0.0);
+                let extended_duration = duration.map(|d| d + (start - preroll_start));
+                let (buf, sr) = load_window(&input, preroll_start, extended_duration, channel)?;
+                let start_frame = (start * sr as f64) as usize;
+                let preroll_frame = (preroll_start * sr as f64) as usize;
+                let split = start_frame.saturating_sub(preroll_frame).min(buf.len());
+                (buf, sr, split)
+            } else {
+                let (buf, sr) = load_window(&input, start, duration, channel)?;
+                (buf, sr, 0)
+            };
+            let (preroll, window) = samples.split_at(split);
             let params = DecoderParams {
                 line_duration_ms: line_ms,
                 invert,
                 gamma,
                 sync_lock: !no_sync_lock,
+                dc_restore,
                 mode: mode.into(),
                 width,
                 ..DecoderParams::default()
             };
             let result = DecodingPipeline::new()
-                .process(&samples, &params, sample_rate)
+                .process_with_preroll(preroll, window, &params, sample_rate)
                 .context("decode failed")?;
             let mut img = result.to_dynamic_image().context("building image")?;
             if rotate {
@@ -454,6 +475,7 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
             width,
             invert,
             gamma,
+            no_dc_restore,
             rotate,
             flip,
         } => {
@@ -494,6 +516,7 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                     invert,
                     gamma,
                     sync_lock: true,
+                    dc_restore: !no_dc_restore,
                     mode: DecoderMode::Grayscale,
                     width,
                     ..DecoderParams::default()
@@ -535,10 +558,11 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                 let plane_width = decode_params.effective_width();
                 // Dense by frame index; only triplet members keep their levels.
                 let mut member_levels: Vec<Option<Vec<f32>>> = vec![None; bounds.len()];
+                let preroll_len = (sample_rate as f64 * crate::sstv::DC_RESTORE_PREROLL_SECS) as usize;
                 for (idx, b) in bounds.iter().enumerate() {
+                    let preroll = &samples[b.start_sample.saturating_sub(preroll_len)..b.start_sample];
                     let window = &samples[b.start_sample..b.end_sample];
-                    let (levels, sync_locked) = match decoder.decode_levels_with_sync_status(window, &decode_params, sample_rate)
-                    {
+                    let decoded = match decoder.decode_levels_with_metadata(preroll, window, &decode_params, sample_rate) {
                         Ok(decoded) => decoded,
                         Err(e) => {
                             tracing::warn!("image {idx} at {:.3}s failed to decode: {e:#}", start + b.start_secs);
@@ -546,22 +570,18 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                         }
                     };
                     // The standalone PNG keeps per-frame contrast bounds.
-                    let (lo, hi) = crate::sstv::percentile_bounds(&levels, 0.01, 0.99);
+                    let (lo, hi) = crate::sstv::percentile_bounds(&decoded.levels, 0.01, 0.99);
                     let frame = crate::pipeline::PipelineResult {
-                        pixels: crate::sstv::normalize_levels(&levels, lo, hi, invert, gamma),
+                        pixels: crate::sstv::normalize_levels(&decoded.levels, lo, hi, invert, gamma),
                         width: plane_width as u32,
-                        height: (levels.len() / plane_width) as u32,
+                        height: (decoded.levels.len() / plane_width) as u32,
                         mode: DecoderMode::Grayscale,
                         segmented_image: true,
-                        sync_locked,
-                        // As in the GUI decode: picture rows are only
-                        // measurable on sync-aligned lines.
-                        picture_rows: sync_locked
-                            .then(|| crate::analysis::find_picture_rows(&levels, plane_width))
-                            .flatten(),
+                        sync_locked: decoded.sync_locked,
+                        picture_rows: decoded.picture_rows,
                     };
                     if triplets.iter().any(|t| t.contains(&idx)) {
-                        member_levels[idx] = Some(levels);
+                        member_levels[idx] = Some(decoded.levels);
                     }
                     let img = orient(frame.to_dynamic_image().context("building image")?);
                     let name = match catalog {

@@ -7,7 +7,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use crate::sstv::{DecoderMode, DecoderParams};
+use crate::sstv::DecoderParams;
 
 /// Processing state of a single batch queue entry.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,9 +44,9 @@ impl BatchRunner {
         self.worker.is_some()
     }
 
-    /// Spawn the batch worker over `queue`. Returns the cancellation flag so
-    /// the panel's Stop button can share it.
-    pub fn start(&mut self, queue: Vec<BatchItem>, output_dir: PathBuf, mode: DecoderMode) -> Arc<AtomicBool> {
+    /// Spawn the batch worker over `queue` using `params`. Returns the
+    /// cancellation flag so the panel's Stop button can share it.
+    pub fn start(&mut self, queue: Vec<BatchItem>, output_dir: PathBuf, params: DecoderParams) -> Arc<AtomicBool> {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         self.cancel = Some(cancel_flag.clone());
 
@@ -56,11 +56,6 @@ impl BatchRunner {
         let worker_cancel = cancel_flag.clone();
         self.worker = Some(std::thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let params = DecoderParams {
-                    mode,
-                    ..Default::default()
-                };
-
                 let total = queue.len();
 
                 for (index, item) in queue.iter().enumerate() {
@@ -154,5 +149,57 @@ mod tests {
         };
         assert_eq!(item.status, BatchStatus::Pending);
         assert_eq!(BatchStatus::Error("x".to_string()), BatchStatus::Error("x".to_string()));
+    }
+
+    #[test]
+    fn batch_runner_passes_decoder_params_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let sr = 48_000u32;
+        // A ramp along each line, so inverting it changes the picture.
+        let samples: Vec<f32> = (0..400 * 6).map(|i| (i % 400) as f32 / 400.0 - 0.5).collect();
+        let tmp = crate::test_fixtures::create_test_wav_file(&samples, sr, 1);
+        let wav_path = dir.path().join("in.wav");
+        std::fs::copy(tmp.path(), &wav_path).unwrap();
+
+        // Run one batch over the file and return the PNG it wrote.
+        let run = |name: &str, params: DecoderParams| -> Vec<u8> {
+            let out_dir = dir.path().join(name);
+            std::fs::create_dir_all(&out_dir).unwrap();
+            let mut runner = BatchRunner::default();
+            let _cancel = runner.start(
+                vec![BatchItem {
+                    path: wav_path.clone(),
+                    status: BatchStatus::Pending,
+                }],
+                out_dir.clone(),
+                params,
+            );
+
+            let is_done = |msg: &BatchProgressMsg| matches!(msg, BatchProgressMsg::ItemStatus(0, BatchStatus::Done));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut saw_done = false;
+            while std::time::Instant::now() < deadline {
+                saw_done |= runner.poll().iter().any(is_done);
+                if let Some(rest) = runner.reap_if_finished() {
+                    saw_done |= rest.iter().any(is_done);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(saw_done, "batch item did not complete");
+            std::fs::read(out_dir.join("in.png")).unwrap()
+        };
+
+        let plain = DecoderParams {
+            dc_restore: false,
+            sync_lock: false,
+            ..DecoderParams::default()
+        };
+        let inverted = DecoderParams { invert: true, ..plain };
+        assert_ne!(
+            run("plain", plain),
+            run("inverted", inverted),
+            "the runner decoded both runs with the same params"
+        );
     }
 }

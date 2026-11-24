@@ -87,8 +87,8 @@ const MAX_QUIET_OUTLIERS: usize = 2;
 
 /// Find the rows of a decoded frame that hold the picture.
 ///
-/// `levels` is row-major, `width` values per scan line, before
-/// normalization (see `SstvDecoder::decode_levels`). Returns `None` when no
+/// `levels` is row-major, `width` values per scan line, from the raw
+/// (un-restored, un-normalized) signal. Returns `None` when no
 /// picture can be told apart: too few lines, lines too narrow to resolve the
 /// burst, or no run of picture lines covering at least a quarter of the
 /// frame.

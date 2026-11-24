@@ -42,6 +42,9 @@ pub struct DecoderConfig {
     /// Default gamma applied after normalization (0.1-10.0)
     pub default_gamma: f32,
 
+    /// Default AC-coupling DC restoration (inverse high-pass filter)
+    pub default_dc_restore: bool,
+
     /// Decode window duration in seconds
     pub decode_window_secs: f32,
 
@@ -138,6 +141,7 @@ impl Default for DecoderConfig {
             default_line_duration_ms: 8.32,
             default_invert: false,
             default_gamma: 1.0,
+            default_dc_restore: true,
             decode_window_secs: 2.0,
             fft_chunk_size: 2048,
             sync_threshold_multiplier: 10.0,

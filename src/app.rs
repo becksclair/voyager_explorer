@@ -212,6 +212,7 @@ impl Default for VoyagerApp {
             line_duration_ms: config.decoder.default_line_duration_ms,
             invert: config.decoder.default_invert,
             gamma: config.decoder.default_gamma,
+            dc_restore: config.decoder.default_dc_restore,
             decode_window_secs: config.decoder.decode_window_secs as f64,
             mode: DecoderMode::Grayscale,
             ..Default::default()
@@ -360,15 +361,17 @@ impl VoyagerApp {
             return;
         };
         let all = reader.get_samples(self.selected_channel);
-        let (samples, image_start): (&[f32], Option<usize>) = match &range {
-            Some(r) if r.end <= all.len() => (&all[r.clone()], Some(r.start)),
+        let (slice_start, samples, image_start): (usize, &[f32], Option<usize>) = match &range {
+            Some(r) if r.end <= all.len() => (r.start, &all[r.clone()], Some(r.start)),
             _ => {
                 let pos = self.current_position_samples.min(all.len().saturating_sub(1));
                 let window = (reader.sample_rate as f64 * self.params.decode_window_secs) as usize;
                 let end = pos.saturating_add(window.max(1)).min(all.len());
-                (&all[pos..end], None)
+                (pos, &all[pos..end], None)
             }
         };
+        let preroll_len = (reader.sample_rate as f64 * crate::sstv::DC_RESTORE_PREROLL_SECS) as usize;
+        let preroll = &all[slice_start.saturating_sub(preroll_len)..slice_start];
 
         // A decode the user asked for starts from a clean status line. A
         // refresh is automatic, so it leaves an undismissed error alone.
@@ -378,7 +381,7 @@ impl VoyagerApp {
 
         // Perform decode with error handling using unified pipeline
         let pipeline = crate::pipeline::DecodingPipeline::new();
-        match pipeline.process(samples, &self.params, reader.sample_rate) {
+        match pipeline.process_with_preroll(preroll, samples, &self.params, reader.sample_rate) {
             Ok(mut result) => {
                 result.segmented_image = image_start.is_some();
                 self.pending_full_frame = (range.is_none() && self.image_bounds_rx.is_some()).then_some(WindowPreview::Manual);
@@ -958,8 +961,11 @@ impl eframe::App for VoyagerApp {
             match self.batch_panel.output_dir.clone() {
                 Some(output_dir) => {
                     let queue = self.batch_panel.queue.clone();
-                    let mode = self.batch_panel.selected_mode;
-                    let cancel_flag = self.batch_runner.start(queue, output_dir, mode);
+                    let params = DecoderParams {
+                        mode: self.batch_panel.selected_mode,
+                        ..self.params
+                    };
+                    let cancel_flag = self.batch_runner.start(queue, output_dir, params);
                     self.batch_panel.cancel_flag = Some(cancel_flag);
                     ctx.request_repaint();
                 }
@@ -1481,6 +1487,8 @@ impl eframe::App for VoyagerApp {
 
                     ui.checkbox(&mut self.params.invert, "Invert");
                     ui.checkbox(&mut self.params.sync_lock, "Sync lock");
+                    ui.checkbox(&mut self.params.dc_restore, "DC restore")
+                        .on_hover_text("Compensate the recording's AC-coupling droop with an inverse high-pass filter");
                     if self.params != params_before {
                         // The live preview decodes once per image; forget the
                         // current one so playback re-decodes it with the new
