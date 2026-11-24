@@ -242,8 +242,13 @@ functions surfaced as CLI subcommands, runnable against the real assets.
       stay unshifted.
       Plane offsets up to ~170 lines occur (Human Anatomy), so each pair's
       lag search spans a third of its shorter plane, capped at 256.
-      Solar Spectrum remains difficult to register because its planes
-      differ. Some composites look brighter than published decodes,
+      When unclipped `picture_rows` edges are available
+      (`composite_triplet_levels_with_picture_rows`), registration anchors
+      to the picture-boundary offset and refines locally (±8 lines) only
+      when 2D NCC has an interior peak above its search boundary —
+      registering Solar Spectrum cleanly despite its spectrally distinct
+      planes while preserving pixel-accurate refinement on all other
+      triplets. Some composites look brighter than published decodes,
       and the analog tape smear under glyphs is a source artifact.
 - [x] Full-frame desktop preview uses detected image bounds for manual
       decoding, playback, and seeking. A window preview made during the

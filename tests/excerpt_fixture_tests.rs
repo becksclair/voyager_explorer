@@ -12,7 +12,7 @@
 use voyager_explorer::analysis::sync::track_line_syncs;
 use voyager_explorer::analysis::{find_image_bounds, SegmentImagesParams, SyncParams};
 use voyager_explorer::audio::WavReader;
-use voyager_explorer::pipeline::{composite_triplet_levels, DecodingPipeline};
+use voyager_explorer::pipeline::{composite_triplet_levels, composite_triplet_levels_with_picture_rows, DecodingPipeline};
 use voyager_explorer::sstv::{DecoderMode, DecoderParams, SstvDecoder};
 
 const FIXTURE: &str = "assets/golden_record_excerpt_48k.wav";
@@ -179,6 +179,68 @@ fn excerpt_earth_triplet_composites() {
     assert!(
         varied,
         "composite is uniform gray — registration/compositing produced no color"
+    );
+}
+
+/// The Solar Spectrum triplet (left channel frames 7=blue, 8=green, 9=red)
+/// carries spectrally distinct absorption bands across its three planes, so
+/// global NCC slides the bands onto each other. Anchoring registration to each
+/// plane's detected `picture_rows` keeps the full picture intact and preserves
+/// the spatial separation of the red, green, and blue spectral bands.
+#[test]
+#[ignore = "requires assets/golden_record_excerpt_48k.wav (just fixtures)"]
+fn excerpt_solar_spectrum_triplet_registers_with_picture_rows() {
+    let reader = WavReader::from_file(FIXTURE).expect("load fixture");
+    let samples = reader.left_channel.as_ref();
+
+    let bounds = find_image_bounds(samples, reader.sample_rate, &SegmentImagesParams::default());
+    assert_eq!(bounds.len(), 16, "fixture must segment to 16 frames");
+
+    let params = DecoderParams {
+        mode: DecoderMode::Grayscale,
+        ..DecoderParams::default()
+    };
+    let decoder = SstvDecoder::new();
+    let width = params.effective_width();
+    let preroll_len = (reader.sample_rate as f64 * voyager_explorer::sstv::DC_RESTORE_PREROLL_SECS) as usize;
+    let decode = |idx: usize| {
+        let b = &bounds[idx];
+        let preroll = &samples[b.start_sample.saturating_sub(preroll_len)..b.start_sample];
+        decoder
+            .decode_levels_with_metadata(preroll, &samples[b.start_sample..b.end_sample], &params, reader.sample_rate)
+            .unwrap_or_else(|e| panic!("decode frame {idx}: {e:#}"))
+    };
+    let (red, grn, blu) = (decode(9), decode(8), decode(7));
+    let pic_rows = [red.picture_rows.clone(), grn.picture_rows.clone(), blu.picture_rows.clone()];
+
+    let img = composite_triplet_levels_with_picture_rows([&red.levels, &grn.levels, &blu.levels], &pic_rows, width, false, 1.0)
+        .expect("Solar Spectrum triplet composites");
+
+    // Global NCC shifts blue by ~192 lines and shrinks the overlap to ~386 rows;
+    // picture-row-anchored registration preserves almost the full ~578-row frame.
+    assert!(
+        img.height() >= 550,
+        "Solar Spectrum composite truncated to {} rows (likely misregistered)",
+        img.height()
+    );
+
+    // Inside the picture's central spectrum band (cols 45%..65%), each channel's
+    // absorption trough sits in a distinct region along the scan-line axis:
+    // red trough < green trough < blue trough, well separated (>40 rows apart).
+    let rgb = img.to_rgb8();
+    let c0 = (width * 45 / 100) as u32;
+    let c1 = (width * 65 / 100) as u32;
+    let trough_row = |ch: usize| -> usize {
+        (50..img.height() - 50)
+            .min_by_key(|&y| (c0..c1).map(|x| u32::from(rgb.get_pixel(x, y)[ch])).sum::<u32>())
+            .expect("non-empty row range") as usize
+    };
+    let r_trough = trough_row(0);
+    let g_trough = trough_row(1);
+    let b_trough = trough_row(2);
+    assert!(
+        g_trough > r_trough + 40 && b_trough > g_trough + 40,
+        "expected distinct ordered R/G/B spectral troughs, got R={r_trough} G={g_trough} B={b_trough}"
     );
 }
 

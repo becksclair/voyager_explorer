@@ -244,6 +244,22 @@ pub fn encode_image_to_audio_with(
     audio
 }
 
+/// Interleave equal-length left and right channel slices into a stereo
+/// `[L0, R0, L1, R1, ...]` buffer suitable for [`create_test_wav_file`] with
+/// `channels = 2`.
+///
+/// # Panics
+/// Panics if `left.len() != right.len()`.
+pub fn interleave_stereo(left: &[f32], right: &[f32]) -> Vec<f32> {
+    assert_eq!(left.len(), right.len(), "stereo channels must have equal length");
+    let mut interleaved = Vec::with_capacity(left.len() * 2);
+    for (&l, &r) in left.iter().zip(right.iter()) {
+        interleaved.push(l);
+        interleaved.push(r);
+    }
+    interleaved
+}
+
 /// Create a complete WAV file in memory for testing
 ///
 /// Returns a temporary file handle that can be used with WavReader.
@@ -406,5 +422,12 @@ mod tests {
         // Verify file exists and has content
         let metadata = std::fs::metadata(temp_file.path()).unwrap();
         assert!(metadata.len() > 100); // Has WAV header + data
+    }
+
+    #[test]
+    fn test_interleave_stereo() {
+        let left = [0.1, 0.2, 0.3];
+        let right = [-0.1, -0.2, -0.3];
+        assert_eq!(interleave_stereo(&left, &right), vec![0.1, -0.1, 0.2, -0.2, 0.3, -0.3]);
     }
 }

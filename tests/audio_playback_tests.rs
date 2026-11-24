@@ -182,21 +182,43 @@ fn test_chirp_signal_properties() {
 
 #[test]
 fn test_stereo_wav_generation() {
-    // Create stereo signal (different for each channel)
+    // Create stereo signal (different frequency per channel)
     let left_signal = generate_sine_wave(440.0, 0.2, 44100, 0.5);
     let right_signal = generate_sine_wave(880.0, 0.2, 44100, 0.5);
 
-    // Interleave for stereo
-    let mut stereo_samples = Vec::with_capacity(left_signal.len() * 2);
-    for i in 0..left_signal.len() {
-        stereo_samples.push((left_signal[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
-        stereo_samples.push((right_signal[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
-    }
+    let stereo_samples = interleave_stereo(&left_signal, &right_signal);
+    let stereo_wav = create_test_wav_file(&stereo_samples, 44100, 2);
 
-    // TODO: Add proper stereo WAV test when we have interleaving helper
-    // let _wav_file = create_test_wav_file(&stereo_samples, 44100, 2);
+    let stereo_reader = WavReader::from_file(stereo_wav.path()).expect("load stereo wav");
+    assert_eq!(stereo_reader.sample_rate, 44100);
+    assert_eq!(stereo_reader.channels, 2);
+    assert_eq!(stereo_reader.left_channel.len(), left_signal.len());
+    assert_eq!(stereo_reader.right_channel.len(), right_signal.len());
+    assert_ne!(stereo_reader.left_channel, stereo_reader.right_channel);
 
-    // For now, test mono → stereo duplication
+    // Each channel should round-trip through 16-bit PCM quantization intact
+    let max_left_err = stereo_reader
+        .left_channel
+        .iter()
+        .zip(&left_signal)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let max_right_err = stereo_reader
+        .right_channel
+        .iter()
+        .zip(&right_signal)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        max_left_err < 1e-3,
+        "left channel quantization error too high: {max_left_err}"
+    );
+    assert!(
+        max_right_err < 1e-3,
+        "right channel quantization error too high: {max_right_err}"
+    );
+
+    // Also verify mono → stereo duplication
     let mono_signal = generate_sine_wave(440.0, 0.1, 44100, 0.5);
     let mono_wav = create_test_wav_file(&mono_signal, 44100, 1);
 

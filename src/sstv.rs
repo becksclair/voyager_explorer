@@ -45,7 +45,8 @@ pub(crate) struct DecodedFrame {
 }
 
 /// Raw decoded luminance levels plus sync and picture-row metadata.
-pub(crate) struct DecodedLevels {
+#[derive(Debug, Clone)]
+pub struct DecodedLevels {
     pub levels: Vec<f32>,
     pub sync_locked: bool,
     pub picture_rows: Option<Range<usize>>,
@@ -395,7 +396,7 @@ impl SstvDecoder {
     /// [`Self::decode_levels`], plus sync-lock status and detected picture rows
     /// (measured on the un-restored signal so DC restoration cannot shift the
     /// leader noise-floor calibration).
-    pub(crate) fn decode_levels_with_metadata(
+    pub fn decode_levels_with_metadata(
         &self,
         preroll: &[f32],
         samples: &[f32],
