@@ -145,7 +145,9 @@ impl PipelineResult {
 /// offset from each other by tens of scan lines (rows). Registration:
 /// 2D normalized cross-correlation of per-scan-line-demeaned content
 /// blocks against the red plane; shift by the best lag before stacking,
-/// cropping to the common overlap.
+/// cropping to the common overlap. Frames marked `segmented_image` anchor
+/// the search to their `picture_rows` (see
+/// [`composite_triplet_levels_with_picture_rows`]).
 pub fn composite_rgb(red: &PipelineResult, grn: &PipelineResult, blu: &PipelineResult) -> Result<DynamicImage> {
     for (name, frame) in [("red", red), ("green", grn), ("blue", blu)] {
         anyhow::ensure!(
@@ -165,8 +167,10 @@ pub fn composite_rgb(red: &PipelineResult, grn: &PipelineResult, blu: &PipelineR
     let min_height = red.height.min(grn.height).min(blu.height);
     anyhow::ensure!(min_height > 0, "empty frame in triplet");
 
+    let picture_rows = [red, grn, blu].map(|f| f.segmented_image.then(|| f.picture_rows.clone()).flatten());
     let (lag_g, lag_b) = registration_lags(
         [red.pixels.as_slice(), grn.pixels.as_slice(), blu.pixels.as_slice()],
+        &picture_rows,
         red.width as usize,
     );
     stack_registered(red, grn, blu, lag_g, lag_b)
@@ -216,6 +220,31 @@ fn stack_registered(
 /// can flatten a plane and starve the correlation); the planes are then
 /// normalized with the shared transform and stacked at the found lags.
 pub fn composite_triplet_levels(planes: [&[f32]; 3], width: usize, invert: bool, gamma: f32) -> Result<DynamicImage> {
+    composite_triplet_levels_with_picture_rows(planes, &[None, None, None], width, invert, gamma)
+}
+
+/// [`composite_triplet_levels`], anchored by each plane's detected
+/// [`crate::analysis::find_picture_rows`] range when available.
+///
+/// When two planes share an unclipped picture edge, their boundary offset
+/// gives a tight prior (within ~2 lines on the Golden Record) so 2D NCC
+/// refines locally instead of sliding spectrally distinct planes onto each
+/// other (e.g., Solar Spectrum, where red/green/blue absorption bands sit
+/// at different positions across the frame). If the local correlation curve
+/// has no interior peak above its search boundary, registration keeps the
+/// picture-row prior.
+///
+/// The prior is trusted: nothing outside `prior ± PRIOR_REFINE_RADIUS` is
+/// searched. Pass `picture_rows` only from decodes of whole segmented
+/// images (the detector needs the full frame layout), and `None` for any
+/// plane whose rows are in doubt; that pair then registers by global NCC.
+pub fn composite_triplet_levels_with_picture_rows(
+    planes: [&[f32]; 3],
+    picture_rows: &[Option<std::ops::Range<usize>>; 3],
+    width: usize,
+    invert: bool,
+    gamma: f32,
+) -> Result<DynamicImage> {
     anyhow::ensure!(width > 0, "width must be non-zero");
     let mut joint: Vec<f32> = planes.iter().flat_map(|p| content_levels(p, width)).collect();
     if joint.is_empty() {
@@ -225,7 +254,7 @@ pub fn composite_triplet_levels(planes: [&[f32]; 3], width: usize, invert: bool,
 
     let min_height = planes.iter().map(|p| p.len() / width).min().unwrap_or(0);
     anyhow::ensure!(min_height > 0, "empty plane in triplet");
-    let (lag_g, lag_b) = registration_lags(planes, width);
+    let (lag_g, lag_b) = registration_lags(planes, picture_rows, width);
 
     let frames: Vec<PipelineResult> = planes
         .iter()
@@ -350,35 +379,112 @@ fn registration_block<T: Copy + Into<f64>>(levels: &[T], width: usize) -> Regist
 /// tighter cap silently pins the search at its bound.
 const REG_MAX_LAG_CAP: i64 = 256;
 
+/// Maximum difference in detected picture lengths between two planes when
+/// both edges are unclipped; a larger mismatch means at least one edge is
+/// unreliable, so registration falls back to global NCC.
+const MAX_PICTURE_LEN_DIFF: usize = 10;
+
+/// Local 2D NCC search radius (in scan lines) around a `picture_rows` prior.
+/// Across all 20 Golden Record triplets the prior lands within ±2 lines of
+/// the true offset; ±8 gives headroom for jitter while keeping distinct
+/// spectral bands (Solar Spectrum, ~80–190 lines apart) out of reach.
+/// The outer two lags on each side only guard the boundary (see
+/// [`best_block_lag`]), so a refinement lands at most 6 lines from the prior.
+const PRIOR_REFINE_RADIUS: i64 = 8;
+
+/// Estimate the row lag of plane `b` relative to plane `a` from their
+/// detected picture boundaries, using only unclipped edges (`start > 0`,
+/// `end < height`).
+fn picture_rows_prior_lag(
+    pic_a: Option<&std::ops::Range<usize>>,
+    height_a: usize,
+    pic_b: Option<&std::ops::Range<usize>>,
+    height_b: usize,
+) -> Option<i64> {
+    let (a, b) = (pic_a?, pic_b?);
+    if a.is_empty() || b.is_empty() || a.end > height_a || b.end > height_b {
+        return None;
+    }
+    let start_lag = (a.start > 0 && b.start > 0).then(|| b.start as i64 - a.start as i64);
+    let end_lag = (a.end < height_a && b.end < height_b).then(|| b.end as i64 - a.end as i64);
+    match (start_lag, end_lag) {
+        (Some(s), Some(e)) => {
+            if s.abs_diff(e) > MAX_PICTURE_LEN_DIFF as u64 {
+                return None;
+            }
+            let sum = s + e;
+            Some(if sum >= 0 { (sum + 1) / 2 } else { (sum - 1) / 2 })
+        }
+        (Some(s), None) => Some(s),
+        (None, Some(e)) => Some(e),
+        (None, None) => None,
+    }
+}
+
 /// Row offsets of the green and blue planes relative to the red plane,
-/// from 2D NCC over the planes' registration blocks.
-fn registration_lags<T: Copy + Into<f64>>(planes: [&[T]; 3], width: usize) -> (i64, i64) {
+/// from 2D NCC over the planes' registration blocks (anchored locally to
+/// `picture_rows` when unclipped picture edges are available).
+fn registration_lags<T: Copy + Into<f64>>(
+    planes: [&[T]; 3],
+    picture_rows: &[Option<std::ops::Range<usize>>; 3],
+    width: usize,
+) -> (i64, i64) {
     // The search radius is per pair: bounding it by the third plane's
     // height would shrink the red↔green search just because the blue
     // plane came out short.
+    let height_r = planes[0].len() / width;
     let pair_max_lag = |b: &[T]| {
-        let min_height = (planes[0].len() / width).min(b.len() / width);
+        let min_height = height_r.min(b.len() / width);
         ((min_height / 3) as i64).clamp(1, REG_MAX_LAG_CAP)
     };
     let block_r = registration_block(planes[0], width);
-    let lag_g = best_block_lag(&block_r, &registration_block(planes[1], width), pair_max_lag(planes[1]));
-    let lag_b = best_block_lag(&block_r, &registration_block(planes[2], width), pair_max_lag(planes[2]));
+    let prior_g = picture_rows_prior_lag(
+        picture_rows[0].as_ref(),
+        height_r,
+        picture_rows[1].as_ref(),
+        planes[1].len() / width,
+    );
+    let prior_b = picture_rows_prior_lag(
+        picture_rows[0].as_ref(),
+        height_r,
+        picture_rows[2].as_ref(),
+        planes[2].len() / width,
+    );
+    let lag_g = best_block_lag(
+        &block_r,
+        &registration_block(planes[1], width),
+        pair_max_lag(planes[1]),
+        prior_g,
+    );
+    let lag_b = best_block_lag(
+        &block_r,
+        &registration_block(planes[2], width),
+        pair_max_lag(planes[2]),
+        prior_b,
+    );
     (lag_g, lag_b)
 }
 
 /// How close to the correlation peak a lag must be to count as equivalent.
-/// Among equivalent lags the smallest |lag| wins (a tie between ±k
-/// resolves to -k): when the correlation curve is flat (featureless
-/// slides) the argmax is noise, and a small shift is always the safer
-/// choice.
+/// Among equivalent lags the one nearest the anchor wins: the
+/// `picture_rows` prior when there is one, lag 0 otherwise (a tie between
+/// anchor ± k resolves to anchor - k). When the correlation curve is flat
+/// (featureless slides) the argmax is noise, and the smallest departure
+/// from the anchor is the safer choice.
 const REG_PEAK_DELTA: f64 = 0.002;
 
 /// Row offset of `b` relative to `a` maximizing the 2D normalized
 /// cross-correlation of the registration blocks: a's row `i` aligns with
 /// b's row `i + lag`. Correlates only over the central 60% of `a`'s rows —
 /// the first/last rows of a segmented frame are inter-image leader junk.
-/// Returns 0 for degenerate (flat) blocks.
-fn best_block_lag(a: &RegistrationBlock, b: &RegistrationBlock, max_lag: i64) -> i64 {
+///
+/// When `prior` is given, searches only `prior ± PRIOR_REFINE_RADIUS`
+/// (`max_lag` bounds the prior-less search alone) and accepts an NCC
+/// refinement only when the interior peak rises strictly above the 2-line
+/// border on each side of the window (covering both odd and even line
+/// parities against 60 Hz hum ripple); monotonic ramps and flat curves keep
+/// `prior`. Returns 0 for degenerate blocks without a prior.
+fn best_block_lag(a: &RegistrationBlock, b: &RegistrationBlock, max_lag: i64, prior: Option<i64>) -> i64 {
     debug_assert_eq!(a.width, b.width);
     let a_lo = (a.rows() / 5) as i64;
     let a_hi = (a.rows() * 4 / 5) as i64;
@@ -392,8 +498,12 @@ fn best_block_lag(a: &RegistrationBlock, b: &RegistrationBlock, max_lag: i64) ->
     // forced misregistrations.
     let window_at_zero = a_hi.min(b.rows() as i64) - a_lo;
     let min_window = ((a_hi - a_lo).min(window_at_zero) / 2).max(16);
+    let (search_lo, search_hi) = match prior {
+        Some(p) => (p - PRIOR_REFINE_RADIUS, p + PRIOR_REFINE_RADIUS),
+        None => (-max_lag, max_lag),
+    };
     let mut curve: Vec<(i64, f64)> = Vec::new();
-    for lag in -max_lag..=max_lag {
+    for lag in search_lo..=search_hi {
         let start = a_lo.max(-lag);
         let end = a_hi.min(b.rows() as i64 - lag);
         if end - start < min_window {
@@ -413,15 +523,33 @@ fn best_block_lag(a: &RegistrationBlock, b: &RegistrationBlock, max_lag: i64) ->
         }
         curve.push((lag, num / (va * vb).sqrt()));
     }
+    let anchor = prior.unwrap_or(0);
     let Some(peak) = curve.iter().map(|&(_, c)| c).reduce(f64::max) else {
-        return 0;
+        return anchor;
     };
+    if let Some(p) = prior {
+        // Require a genuine interior peak: the 2-line border at each end of
+        // the evaluated window (both odd and even parities) must sit strictly
+        // below `peak - REG_PEAK_DELTA`. A monotonic ramp (spectrally distinct
+        // planes) or flat curve stays anchored at `p`.
+        let min_eval = curve.first().map(|&(l, _)| l).unwrap_or(p);
+        let max_eval = curve.last().map(|&(l, _)| l).unwrap_or(p);
+        let edge_max = curve
+            .iter()
+            .filter(|&&(l, _)| l <= min_eval + 1 || l >= max_eval - 1)
+            .map(|&(_, c)| c)
+            .reduce(f64::max)
+            .unwrap_or(f64::NEG_INFINITY);
+        if peak <= edge_max + REG_PEAK_DELTA {
+            return p;
+        }
+    }
     curve
         .iter()
         .filter(|&&(_, c)| c >= peak - REG_PEAK_DELTA)
         .map(|&(lag, _)| lag)
-        .min_by_key(|&lag| (lag.abs(), lag))
-        .unwrap_or(0)
+        .min_by_key(|&lag| ((lag - anchor).abs(), lag))
+        .unwrap_or(anchor)
 }
 
 pub struct DecodingPipeline {
@@ -621,6 +749,118 @@ mod tests {
                 assert_eq!(img.get_pixel(3, y), &image::Rgb([0, 0, 0]), "row {y}");
             }
         }
+    }
+
+    #[test]
+    fn picture_rows_prior_handles_unclipped_clipped_and_mismatched_edges() {
+        // Both edges unclipped: averages start and end offsets (symmetric rounding).
+        assert_eq!(
+            picture_rows_prior_lag(Some(&(29..555)), 593, Some(&(100..625)), 659),
+            Some(71)
+        );
+        assert_eq!(picture_rows_prior_lag(Some(&(29..555)), 593, Some(&(29..555)), 578), Some(0));
+        // Start clipped on `a` (Human Anatomy red plane): falls back to unclipped end.
+        assert_eq!(
+            picture_rows_prior_lag(Some(&(0..484)), 532, Some(&(124..649)), 707),
+            Some(165)
+        );
+        // End clipped on `b`: falls back to unclipped start.
+        assert_eq!(picture_rows_prior_lag(Some(&(20..120)), 140, Some(&(50..130)), 130), Some(30));
+        // Both edges clipped on one plane: no prior.
+        assert_eq!(picture_rows_prior_lag(Some(&(0..100)), 100, Some(&(20..120)), 140), None);
+        // Picture lengths disagree by > MAX_PICTURE_LEN_DIFF: distrust prior.
+        assert_eq!(picture_rows_prior_lag(Some(&(20..120)), 150, Some(&(20..140)), 160), None);
+    }
+
+    #[test]
+    fn picture_rows_prior_anchors_spectrally_distinct_planes() {
+        // Mirror Solar Spectrum: each plane carries a wide band at a different
+        // position inside its picture, with distinct leader lengths before it.
+        let width = 20usize;
+        let make_plane = |height: usize, pic_start: usize, band_rel: usize| -> Vec<f32> {
+            let mut levels = vec![0.5f32; height * width];
+            for r in (pic_start + band_rel)..(pic_start + band_rel + 16) {
+                for x in 6..14 {
+                    levels[r * width + x] = 0.0;
+                }
+            }
+            levels
+        };
+        let r = make_plane(160, 20, 20); // picture 20..120, band at picture-rel 20..36
+        let g = make_plane(190, 50, 50); // picture 50..150, band at picture-rel 50..66 (true lag +30)
+        let b = make_plane(150, 10, 80); // picture 10..110, band at picture-rel 80..96 (true lag -10)
+        let pic_rows = [Some(20..120), Some(50..150), Some(10..110)];
+
+        let (lag_g, lag_b) = registration_lags([r.as_slice(), g.as_slice(), b.as_slice()], &pic_rows, width);
+        assert_eq!((lag_g, lag_b), (30, -10));
+
+        // Verify the composite keeps the three spectral bands separated rather
+        // than stacking them into one neutral band.
+        let img = composite_triplet_levels_with_picture_rows([&r, &g, &b], &pic_rows, width, false, 1.0)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(img.height(), 150);
+        // In red-plane coords: red band is at y=40..56 (y_min=10 -> out y=30..46),
+        // green band at g=100..116 -> r=70..86 (out y=60..76),
+        // blue band at b=90..106 -> r=100..116 (out y=90..106).
+        let px_r = img.get_pixel(10, 38);
+        let px_g = img.get_pixel(10, 68);
+        let px_b = img.get_pixel(10, 98);
+        assert!(
+            px_r[0] < 30 && px_r[1] > 200 && px_r[2] > 200,
+            "red band misaligned: {px_r:?}"
+        );
+        assert!(
+            px_g[1] < 30 && px_g[0] > 200 && px_g[2] > 200,
+            "green band misaligned: {px_g:?}"
+        );
+        assert!(
+            px_b[2] < 30 && px_b[0] > 200 && px_b[1] > 200,
+            "blue band misaligned: {px_b:?}"
+        );
+    }
+
+    #[test]
+    fn picture_rows_prior_survives_ncc_ramp_toward_window_edge() {
+        // Distinct bands 12 lines apart once the planes are aligned: inside
+        // the refine window their overlap, and the NCC with it, climbs all the
+        // way to the window edge without peaking. Solar Spectrum's planes ramp
+        // like this; following the ramp slides the bands together, so the
+        // prior must stand.
+        let width = 20usize;
+        let band_plane = |height: usize, band_start: usize| -> Vec<f32> {
+            let mut levels = vec![0.5f32; height * width];
+            for r in band_start..band_start + 16 {
+                for x in 6..14 {
+                    levels[r * width + x] = 0.0;
+                }
+            }
+            levels
+        };
+        let r = band_plane(160, 40); // picture 20..120
+        let g = band_plane(190, 82); // picture 50..150: prior +30, bands coincide at +42
+        let b = band_plane(150, 18); // picture 10..110: prior -10, bands coincide at -22
+        let pic_rows = [Some(20..120), Some(50..150), Some(10..110)];
+
+        let (lag_g, lag_b) = registration_lags([r.as_slice(), g.as_slice(), b.as_slice()], &pic_rows, width);
+        assert_eq!((lag_g, lag_b), (30, -10));
+    }
+
+    #[test]
+    fn picture_rows_prior_refines_edge_jitter_with_local_ncc() {
+        // Shared feature at true lags (+20, -10), while picture_rows carries ±2
+        // lines of boundary jitter. Local NCC must refine to the exact feature lag.
+        let r = banded_frame(140, 60);
+        let g = banded_frame(160, 80); // true lag +20
+        let b = banded_frame(130, 50); // true lag -10
+        let pic_rows = [Some(20..120), Some(42..142), Some(11..111)]; // priors +22, -9
+
+        let (lag_g, lag_b) = registration_lags(
+            [r.pixels.as_slice(), g.pixels.as_slice(), b.pixels.as_slice()],
+            &pic_rows,
+            r.width as usize,
+        );
+        assert_eq!((lag_g, lag_b), (20, -10));
     }
 
     #[test]

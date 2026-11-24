@@ -556,8 +556,9 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
 
                 let decoder = crate::sstv::SstvDecoder::new();
                 let plane_width = decode_params.effective_width();
-                // Dense by frame index; only triplet members keep their levels.
-                let mut member_levels: Vec<Option<Vec<f32>>> = vec![None; bounds.len()];
+                // Dense by frame index; only triplet members keep their decoded
+                // levels and picture rows for registration.
+                let mut member_levels: Vec<Option<crate::sstv::DecodedLevels>> = vec![None; bounds.len()];
                 let preroll_len = (sample_rate as f64 * crate::sstv::DC_RESTORE_PREROLL_SECS) as usize;
                 for (idx, b) in bounds.iter().enumerate() {
                     let preroll = &samples[b.start_sample.saturating_sub(preroll_len)..b.start_sample];
@@ -578,10 +579,10 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                         mode: DecoderMode::Grayscale,
                         segmented_image: true,
                         sync_locked: decoded.sync_locked,
-                        picture_rows: decoded.picture_rows,
+                        picture_rows: decoded.picture_rows.clone(),
                     };
                     if triplets.iter().any(|t| t.contains(&idx)) {
-                        member_levels[idx] = Some(decoded.levels);
+                        member_levels[idx] = Some(decoded);
                     }
                     let img = orient(frame.to_dynamic_image().context("building image")?);
                     let name = match catalog {
@@ -600,12 +601,20 @@ pub fn run(command: DiagnosticsCommand) -> Result<()> {
                 if let Some(cat) = catalog {
                     for triplet in triplets {
                         let [r, _, bl] = triplet;
-                        let planes: Vec<&[f32]> = triplet.iter().filter_map(|&idx| member_levels[idx].as_deref()).collect();
-                        let [pr, pg, pb] = planes.as_slice() else {
+                        let members: Vec<&crate::sstv::DecodedLevels> =
+                            triplet.iter().filter_map(|&idx| member_levels[idx].as_ref()).collect();
+                        let [mr, mg, mb] = members.as_slice() else {
                             tracing::warn!("triplet {r}-{bl}: missing decoded frame, skipping composite");
                             continue;
                         };
-                        let img = match crate::pipeline::composite_triplet_levels([pr, pg, pb], plane_width, invert, gamma) {
+                        let pic_rows = [mr.picture_rows.clone(), mg.picture_rows.clone(), mb.picture_rows.clone()];
+                        let img = match crate::pipeline::composite_triplet_levels_with_picture_rows(
+                            [mr.levels.as_slice(), mg.levels.as_slice(), mb.levels.as_slice()],
+                            &pic_rows,
+                            plane_width,
+                            invert,
+                            gamma,
+                        ) {
                             Ok(img) => orient(img),
                             Err(e) => {
                                 tracing::warn!("triplet {r}-{bl}: composite failed: {e:#}");
