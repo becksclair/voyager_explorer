@@ -135,6 +135,14 @@ const REACQUIRE_RUN_SYNCS: usize = 8;
 /// Consecutive coasted lines before checking `detected` for a phase-shifted
 /// coherent run (an inter-image boundary in a multi-frame window).
 const REACQUIRE_COAST_LINES: usize = REACQUIRE_RUN_SYNCS;
+/// Lines to probe ahead along the tracked phase before replacing it on a
+/// phase-shifted candidate run. A weak-sync dark patch within one image
+/// resumes locking at the original phase once the patch ends; a real
+/// inter-image boundary does not.
+const REACQUIRE_OLD_PHASE_LOOKAHEAD: usize = 32;
+/// Consecutive strong, non-burst locks at the original phase within the
+/// lookahead window needed to confirm the old phase has not ended.
+const REACQUIRE_OLD_PHASE_RESUME_LOCKS: usize = 3;
 
 /// Track scan-line sync positions with a predictive lock.
 ///
@@ -253,6 +261,36 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
             && (start_idx..start_idx + REACQUIRE_RUN_SYNCS).all(|k| !is_burst_tone(samples, detected[k], period))
     };
 
+    // Probe ahead along the currently tracked phase to see if it resumes with
+    // consecutive strong, non-burst locks. A temporary weak-sync dark patch
+    // inside one image resumes at the old phase once the patch ends, whereas
+    // an inter-image boundary moves permanently to the new image's phase.
+    let old_phase_resumes_at = |from_pos: f64, period: f64| -> Option<f64> {
+        let mut probe = from_pos;
+        let mut streak = 0usize;
+        for _ in 0..REACQUIRE_OLD_PHASE_LOOKAHEAD {
+            let p = probe + period;
+            if p + period > samples.len() as f64 {
+                break;
+            }
+            if let Some((min_idx, strong)) = lock_near(p, probe, period) {
+                probe = min_idx as f64;
+                if strong && !is_burst_tone(samples, min_idx, period) {
+                    streak += 1;
+                    if streak >= REACQUIRE_OLD_PHASE_RESUME_LOCKS {
+                        return Some(probe);
+                    }
+                } else {
+                    streak = 0;
+                }
+            } else {
+                probe = p;
+                streak = 0;
+            }
+        }
+        None
+    };
+
     let mut locked = 0usize;
 
     // Lines before the seed, walked backward at the seed's period. Without
@@ -309,6 +347,7 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
     let mut last_locked_idx = positions.len() - 1;
     let mut coast_len = 0usize;
     let mut was_coasting = false;
+    let mut old_phase_resumes_before = 0.0f64;
     let mut detect_cursor = detected.partition_point(|&d| (d as f64) <= seed as f64 + period * 1.1);
     loop {
         let predict = pos + period;
@@ -335,6 +374,7 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
                 }
                 coast_len = 0;
                 was_coasting = false;
+                old_phase_resumes_before = 0.0;
             }
             None => {
                 // No credible sync (dark line, dropout, boundary junk): coast.
@@ -347,8 +387,9 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
                 // arrive at a new phase outside our ±6% tracking window. Wait
                 // until the coasting walk has passed an entire coherent
                 // non-burst run at a different phase with zero locks at the old
-                // phase, then drop only the shifted coasted lines and re-anchor.
-                if coast_len >= REACQUIRE_COAST_LINES {
+                // phase, and confirm the old phase does not resume ahead, then
+                // drop only the shifted coasted lines and re-anchor.
+                if coast_len >= REACQUIRE_COAST_LINES && pos >= old_phase_resumes_before {
                     let mut reacquired = None;
                     while detect_cursor + REACQUIRE_RUN_SYNCS <= detected.len()
                         && (detected[detect_cursor + REACQUIRE_RUN_SYNCS - 1] as f64) <= predict
@@ -363,7 +404,11 @@ pub fn track_line_syncs(samples: &[f32], sample_rate: u32, params: &SyncParams) 
                             if (candidate as f64) > last_locked_pos + period * 1.1
                                 && is_phase_jump(last_locked_pos, candidate, period)
                             {
-                                reacquired = Some(candidate);
+                                if let Some(resume_pos) = old_phase_resumes_at(pos, period) {
+                                    old_phase_resumes_before = resume_pos;
+                                } else {
+                                    reacquired = Some(candidate);
+                                }
                                 break;
                             }
                         }
@@ -1313,14 +1358,17 @@ mod tests {
 
     #[test]
     fn tracker_keeps_phase_past_weak_syncs_with_a_bright_mid_line_bar() {
-        // A dark region with a five-line weak-sync fade and a bright vertical
-        // picture feature at a fixed mid-line offset. The global detector picks
-        // the bright feature during the fade, creating a short coherent run at
-        // a shifted phase; the tracker must coast across the fade and stay on
-        // the real sync phase instead of jumping onto the picture feature.
+        // A dark region with a 12-line weak-sync fade (longer than
+        // REACQUIRE_RUN_SYNCS) and a bright vertical picture feature at a fixed
+        // mid-line offset. The weak syncs have swing 0.20 (< 0.27 anchor
+        // threshold), forcing the tracker to coast through all 12 lines while
+        // the global detector picks up 12 coherent detections on the bright
+        // feature. Because the original phase resumes after the fade, the
+        // tracker must keep the original phase instead of hijacking onto the
+        // picture feature.
         let period = 400usize;
         let lines = 180usize;
-        let (fade_start, fade_end) = (80usize, 85usize);
+        let (fade_start, fade_end) = (80usize, 92usize);
         let mut samples = vec![-0.1f32; lines * period];
         for line in 0..lines {
             let base = line * period;
@@ -1328,9 +1376,9 @@ mod tests {
                 samples[base + 26..=base + 29].fill(1.0);
                 samples[base + 30..=base + 33].fill(-0.8);
             } else {
-                // Weak sync below the anchor threshold.
-                samples[base + 26..=base + 29].fill(0.15);
-                samples[base + 30..=base + 33].fill(-0.15);
+                // Weak sync: swing 0.20, strictly below the 0.27 anchor threshold.
+                samples[base + 26..=base + 29].fill(0.10);
+                samples[base + 30..=base + 33].fill(-0.10);
             }
             // Bright vertical feature mid-line throughout the central region.
             if (50..140).contains(&line) {
@@ -1338,6 +1386,23 @@ mod tests {
                 samples[base + 221..=base + 225].fill(-0.5);
             }
         }
+
+        // Confirm the global detector actually produces a >=8-line coherent run
+        // on the bright mid-line feature during the fade so the test genuinely
+        // exercises the re-acquisition guard.
+        let raw = detect_line_syncs(&samples, 48_000, &SyncParams::default());
+        let bar_hits = raw
+            .iter()
+            .filter(|&&p| {
+                let line = p / period;
+                let off = p % period;
+                (fade_start..fade_end).contains(&line) && (215..=230).contains(&off)
+            })
+            .count();
+        assert!(
+            bar_hits >= REACQUIRE_RUN_SYNCS,
+            "fixture should produce >= {REACQUIRE_RUN_SYNCS} bright-bar detections during fade, got {bar_hits}"
+        );
 
         let tracked = track_line_syncs(&samples, 48_000, &SyncParams::default());
         assert!(
